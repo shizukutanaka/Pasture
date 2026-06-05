@@ -1,0 +1,11 @@
+# Copy to wrangler.toml and fill in. Secrets are NOT stored here — set them with:
+#   wrangler secret put STRIPE_SECRET_KEY      # use sk_test_* until going live
+#   wrangler secret put STRIPE_PRICE_ID
+#   wrangler secret put STRIPE_WEBHOOK_SECRET
+name = "pasture-donate"
+main = "donate-worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+SUCCESS_URL = "https://example.com/thanks"
+CANCEL_URL  = "https://example.com/"

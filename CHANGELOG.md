@@ -1,0 +1,461 @@
+# Changelog
+
+All notable changes to this project are documented here.
+Format follows Keep a Changelog; versioning follows SemVer.
+
+## [0.26.0] - 2026-06-05
+
+### Changed — concurrent proxy (throughput)
+- `serve` now handles connections concurrently with a bounded worker pool
+  (size = available CPU parallelism, clamped 2..=32) instead of one connection at
+  a time. The accept loop feeds a bounded queue, so a connection flood applies
+  backpressure rather than spawning unbounded threads. Shared state (the cache)
+  is already behind a mutex; std-only, zero new dependencies.
+- Verified: 8 concurrent requests against a 150 ms/req backend finish in ~615 ms
+  (serial would be ~1200 ms), all correct.
+
+### Docs
+- Added publication docs for open-sourcing: SECURITY.md, CONTRIBUTING.md,
+  CODE_OF_CONDUCT.md, and GitHub issue/PR templates. Cargo.lock is committed
+  (binary crate).
+
+### Notes
+- The default listen address stays 127.0.0.1, so the proxy is not network-exposed
+  by default. (Auth/rate-limiting for exposed deployments remain future work.)
+
+## [0.25.0] - 2026-06-05
+
+### Added
+- `pasture stats` now shows the cascade confidence distribution when logged:
+  n, mean, min, p10 and median of the local mean log-probability, plus a hint to
+  tune escalation with `calibrate --logprob`. Lets you see your local model's
+  confidence spread before choosing `PASTURE_CASCADE_LOGPROB`. New pure
+  `logprob_summary` / `LogprobStats`, unit-tested. Numbers only, never content (I5).
+
+## [0.24.0] - 2026-06-04
+
+### Added — calibrate the cascade confidence threshold from your own data
+- `pasture calibrate --logprob [--target R]`: recommends `PASTURE_CASCADE_LOGPROB`
+  from the distribution of local-answer mean log-probabilities recorded during
+  cascade, so about R of answers escalate (default 0.2). Replaces the hand-set
+  default with a value derived from your own model's behaviour.
+- The cascade now records the local mean log-probability to the cost log
+  (`"logprob"` field) — a single number, never content (I5). New pure
+  `calibrate_logprob_threshold` (lower-tail quantile), unit-tested.
+
+### Why
+- The routing literature (UCCI arXiv 2605.18796; "Is Escalation Worth It?"
+  arXiv 2605.06350) stresses that cascade confidence scores are uncalibrated and
+  their thresholds must be tuned per workload — hand-tuning is the status quo
+  pain point. Full calibration (isotonic regression) needs correctness labels a
+  single local user lacks; calibrating to an escalation *budget* from the user's
+  own logprob distribution is the honest label-free analogue. Verified
+  end-to-end: 20 logged samples yield distinct thresholds for 30% vs 50% targets.
+
+## [0.23.0] - 2026-06-04
+
+### Added — research-backed cascade confidence (core routing)
+- The FrugalGPT-style cascade now escalates on the local model's **mean token
+  log-probability** when the backend can report it (OpenAI-compatible / LM Studio
+  via `logprobs`), falling back to the text heuristic otherwise. Grounded in
+  arXiv 2605.02241 (May 2026), which finds average log-probability a
+  training-free signal that matches or beats supervised routers (RouteLLM) for
+  local->cloud routing in-distribution — exactly Pasture's use case.
+- `Backend::complete_scored` (default: no signal); `OpenAiCompatBackend`
+  requests `logprobs` and returns the mean. `cascade::should_escalate`,
+  `cloud::mean_logprob_from_openai`, `Provider::build_body_logprobs`,
+  `JsonValue::as_f64` — all pure and unit-tested.
+- `PASTURE_CASCADE_LOGPROB` (default -1.0): escalate when mean logprob drops
+  below this. Surfaced in `pasture config`. Verified end-to-end: a low-logprob
+  local answer escalates, a high-logprob one stays local.
+
+### Notes
+- The default threshold (-1.0) is a sensible starting point; the paper notes the
+  optimal cutoff is model-dependent, so it is env-tunable. Sensitive content is
+  still never cascaded (privacy).
+
+## [0.22.1] - 2026-06-04
+
+### Added / Changed
+- CI: added a `gitleaks` secret-scanning job (I4) alongside fmt/clippy/test/build
+  and `cargo audit`.
+- Docs: `RELEASE_CHECKLIST.md` mapping the §8 release gate to current state and
+  flagging the irreversible publish steps that require maintainer approval.
+
+### Fixed
+- Removed stray runtime cost-log files (`*-cost.jsonl`) that had leaked into the
+  working tree from local demos (already `.gitignore`d; now also excluded from
+  release tarballs).
+
+## [0.22.0] - 2026-06-04
+
+### Added
+- `pasture config`: prints the effective configuration (resolved env vars and
+  defaults) — listen address, local backend/model, routing threshold and its
+  source, cloud provider/model, cascade/cache settings, cost-log path and
+  language. Complements `doctor` for debugging setup after the `PASTURE_*`
+  rename. API keys are never printed — only whether each is set (I5; verified a
+  secret value never appears in the output).
+
+## [0.21.1] - 2026-06-04
+
+### Security (independent review pass: parser hardening)
+- The zero-dependency JSON parser now bounds recursion (MAX_DEPTH = 128).
+  `parse_value -> parse_object/array -> parse_value` was unbounded, so a client
+  could send deeply nested JSON (e.g. `[[[[...`) to the proxy and overflow the
+  stack, aborting the process — a remote denial of service. Over-deep input now
+  returns a graceful parse error. Verified: a 200k-deep body is rejected with
+  "maximum nesting depth exceeded" and the server stays up. Legitimate chat
+  payloads nest only a few levels.
+
+## [0.21.0] - 2026-06-04
+
+### Changed — BREAKING: project renamed Kabosu -> Pasture
+- Crate, binary, and repo renamed to `pasture`
+  (github.com/shizukutanaka/pasture). Invoke as `pasture ...`.
+- Environment variables renamed `KABOSU_*` -> `PASTURE_*` (e.g.
+  `PASTURE_THRESHOLD`, `PASTURE_LOCAL_BACKEND`, `PASTURE_OPENAI_API_KEY`).
+  Old `KABOSU_*` variables are no longer read — update your config.
+- Proxy response: `x_kabosu_route` header field -> `x_pasture_route`; response
+  `id` -> `"pasture"`.
+- No behavioural changes beyond the rename: routing, privacy, streaming, cache,
+  cascade, calibration and all CLI commands are unchanged. 185 tests pass
+  (default + cloud), clippy/fmt clean.
+
+## [0.20.0] - 2026-06-04
+
+### Added
+- True SSE streaming for the cloud backend (feature = "cloud"), completing
+  streaming across every route: Ollama, LM Studio/OpenAI-compatible, cloud
+  OpenAI, and cloud Anthropic. `HttpsCloudBackend::stream_complete` sends
+  `stream: true` and forwards deltas as they arrive.
+- Provider-agnostic, transport-agnostic `read_sse_body` (works over any `Read`)
+  with `parse_anthropic_stream_line` and `Provider::parse_stream_line`. The
+  streaming-assembly logic is unit-tested offline over in-memory cursors
+  (OpenAI multi-delta, Anthropic text deltas, chunked size-lines ignored, error
+  status). Chunked-transfer size lines are skipped because they never start with
+  `data:` (one SSE event per chunk, which OpenAI and Anthropic honour).
+
+### Verified
+- The TLS streaming transport was exercised live against api.anthropic.com:
+  connect, handshake, write, header parse and the non-2xx path all work (a dummy
+  key surfaces the real `HTTP 401: invalid x-api-key`). Happy-path deltas are
+  covered by the offline unit tests above.
+
+## [0.19.0] - 2026-06-04
+
+### Security (independent review pass: privacy classification gaps)
+- Japanese domestic phone numbers are now detected. Previously `looks_like_phone`
+  required a leading `+` (international form), so common JP numbers like
+  `090-1234-5678` or `03-1234-5678` were classified non-sensitive and could be
+  routed to the cloud — a real PII leak for a Japanese-first product (I5/I10).
+  Now matches JP mobile (070/080/090 + 8 digits) and hyphenated domestic
+  numbers, while bare non-phone digit runs are not tripped.
+- JWT / bearer tokens (`eyJ.........`) are now detected (new `jwt` category).
+- Added Slack user (`xoxp-`) and GitLab (`glpat-`) token prefixes.
+
+### Notes
+- Detection emits category labels only — never the matched value (I5). Sensitive
+  content stays local even under a forced `--cloud`, unless the operator opts in
+  with `PASTURE_ALLOW_SENSITIVE_CLOUD`.
+
+## [0.18.0] - 2026-06-04
+
+### Added — IMP-2 data-driven threshold calibration
+- `pasture calibrate [--target <rate>]`: recommends a `PASTURE_THRESHOLD` from the
+  distribution of prompt sizes in your own cost log, so that roughly `<rate>` of
+  similar prompts route to the cloud (default 0.2). Uses only token counts
+  already logged (no prompts, no PII — I5). New `calibrate` module with a pure,
+  unit-tested `calibrate_threshold(tokens, target) -> (threshold, achieved)`.
+- `PASTURE_THRESHOLD` (config key `threshold`) overrides the hardware-derived
+  routing threshold; `RoutingEngine::with_threshold`. Engine construction for
+  route/serve/chat now goes through one `make_engine` helper.
+
+### Notes
+- This is an honest, offline, zero-dependency analogue of cost/quality
+  calibration (RouterBench, UCCI). Learned routers (RouteLLM, Hybrid LLM) achieve
+  more but require preference/quality-gap labels a single local user lacks. The
+  recommendation is length-only; content signals (reasoning/code/privacy)
+  escalate further, so the realised cloud rate is at least the reported figure.
+
+## [0.17.0] - 2026-06-04
+
+### Changed (independent review pass: cross-lingual routing fix)
+- Token estimation is now script-aware. CJK (Chinese/Japanese kana & ideographs)
+  and Hangul tokenize at roughly one token per character, while Latin text
+  averages ~4 chars/token. The previous chars/4 estimate undercounted Japanese
+  ~4x, so long non-Latin prompts wrongly stayed on the local model. Now they
+  escalate appropriately. Verified: a 350-char Japanese prompt is estimated at
+  ~332 tokens (was ~88) and correctly routes to cloud at threshold 300. Latin
+  estimates are unchanged. This matters for a Japanese-first product (I10).
+
+## [0.16.0] - 2026-06-04
+
+### Added
+- True SSE streaming for the OpenAI-compatible local backend (LM Studio,
+  llama.cpp server, vLLM, ...). `OpenAiCompatBackend::stream_complete` sends
+  `stream: true` and forwards each `delta.content` as it arrives, instead of
+  buffering the whole answer. Verified end-to-end: LM Studio-style SSE deltas
+  are re-emitted incrementally as pasture `chat.completion.chunk` frames.
+- `cloud` helpers `build_body_stream` and `parse_openai_stream_line` (pure,
+  unit-tested); `OpenAiStreamEvent`.
+
+## [0.15.1] - 2026-06-04
+
+### Fixed (independent review pass)
+- Server-reported errors from OpenAI-compatible backends are now surfaced
+  verbatim. Previously a provider/LM Studio error body (e.g. a 500 for a model
+  id that doesn't match a loaded model) was flattened into a generic "missing
+  content" message; now the response carries `server error: <message>` so the
+  cause is obvious. Applies to both cloud and LM Studio paths.
+
+### Reviewed (no change needed)
+- Audited proxy request reading: `Content-Length` bodies are fully read across
+  multiple TCP reads (large prompts are not truncated), with a 1 MiB header
+  guard.
+
+## [0.15.0] - 2026-06-04
+
+### Added
+- LM Studio support (and any OpenAI-compatible local server: llama.cpp server,
+  vLLM, LocalAI). New `OpenAiCompatBackend` (plain HTTP, reuses the OpenAI
+  request/response shaping) lets pasture use such a server as its local engine.
+  Select with `PASTURE_LOCAL_BACKEND=lmstudio` (or `openai`); endpoint via
+  `PASTURE_LOCAL_OPENAI_URL` (default http://127.0.0.1:1234/v1).
+- `connect lmstudio`: explains LM Studio's role and how to use it as pasture's
+  engine. `doctor` and `up` now understand the OpenAI-compatible engine
+  (probe `/v1/models`, no Ollama-specific auto-pull). Localised (EN + JA).
+- `doctor` helpers `parse_base_url`, `probe_openai`, `parse_openai_model_names`
+  (pure, unit-tested).
+
+### Notes
+- Ollama remains the default local backend. Verified end-to-end: with
+  `PASTURE_LOCAL_BACKEND=lmstudio`, a request is forwarded to the local OpenAI
+  server and returned with `x_pasture_route: "local"`.
+
+## [0.14.0] - 2026-06-04
+
+### Added (grounded in current research, June 2026)
+- `connect [app]` command: exact, localized setup steps to point a client at
+  the proxy. Apps: Open WebUI, Continue (VS Code), Cursor, and generic OpenAI
+  SDK/curl — each verified against current docs. No arg lists the apps and
+  prints the generic snippet.
+- `models` command: recommends current local models by RAM tier and highlights
+  the tier matching the detected RAM (8 GB: llama3.2 / gemma3:4b / qwen3:4b;
+  16 GB: llama3.1:8b / qwen2.5-coder:7b; multilingual: Qwen family).
+- i18n keys for `connect.*` / `models.*` (EN + JA), key parity enforced.
+
+### Changed
+- Default local model is now `llama3.2` (3B, runs on 8 GB, the current small
+  general default) instead of `llama3`. Override with `PASTURE_LOCAL_MODEL`.
+
+### Notes
+- Ollama already exposes an OpenAI-compatible endpoint; pasture's value is the
+  routing layer (local<->cloud, privacy gating, cascade, cache) and a single
+  base_url in front of both — reflected in the connect guidance.
+
+## [0.13.0] - 2026-06-04
+
+### Added (fewer steps for beginners)
+- `up` now auto-starts Ollama: if the daemon is not running it spawns
+  `ollama serve`, waits for it to come up, then continues. If Ollama is not
+  installed it falls back to the clear install message.
+- On startup, `serve`/`up` print a localised "connect your app" banner showing
+  the base_url and an `OPENAI_BASE_URL`/`OPENAI_API_KEY` example — closing the
+  last gap ("now how do I point my app at it?"). New i18n keys
+  `connect.help`, `up.starting_ollama`, `up.ollama_started` (EN + JA).
+
+## [0.12.0] - 2026-06-04
+
+### Added
+- Internationalisation (I10): zero-dependency `i18n` module with Japanese and
+  English catalogs (`namespace.component.key`), `{name}` interpolation, and
+  English fallback. Language auto-detected from `PASTURE_LANG`/`LC_ALL`/`LANG`.
+  The welcome screen and all `doctor`/`up` output are now localised; a test
+  enforces key parity between the two catalogs.
+- `up` command: the minimal-steps path to running. Verifies Ollama is up,
+  auto-pulls the configured model if missing (`ollama pull`), then starts the
+  proxy — one command from "Ollama installed" to "serving".
+- Bootstrap scripts `install.sh` / `install.ps1`: build and place the binary on
+  PATH, then point the user at `pasture up`.
+
+## [0.11.0] - 2026-06-04
+
+### Added (beginner-friendly)
+- `doctor` command: one-shot environment check. Probes whether Ollama is
+  running, whether the configured model is installed, whether the proxy port is
+  free, and (cloud build) whether an API key is set — each failure prints the
+  exact fix command. `doctor` module (`probe_ollama`, `parse_model_names`,
+  `has_model`, `port_available`); JSON parsing pure & unit-tested.
+- `setup` command: friendly welcome + the environment check.
+- Running `pasture` with no arguments now prints a 3-step welcome (and exits 0)
+  instead of a terse usage dump.
+- `GETTING_STARTED.md`: a thorough zero-to-running guide in Japanese (glossary,
+  3-step quickstart, troubleshooting mapped to `doctor` output, optional cloud,
+  FAQ).
+
+## [0.10.0] - 2026-06-04
+
+### Added
+- `stats` command and cost-log analysis (`cost::read_log`, `parse_log_line`,
+  `summarize`). Summarizes the JSONL cost log: request counts per route
+  (local/cloud/cache), cloud rate, cache hit rate, token totals, cloud spend,
+  and backend calls saved by the cache. Offline, zero-dependency; observed
+  cloud rate is the empirical basis for tuning the routing threshold (IMP-2
+  groundwork). Malformed lines are skipped; a missing log is reported cleanly.
+
+## [0.9.1] - 2026-06-04
+
+### CI / Build
+- GitHub Actions CI (`ci.yml`): fmt + clippy (`-D warnings`) + test + release
+  build across a `default` / `cloud` feature matrix, plus `cargo audit`. Pinned
+  to MSRV 1.75.0 via `rust-toolchain.toml` (catches edition2024 regressions).
+- Tag-triggered `release.yml`: builds the zero-dependency binary for
+  linux/macOS/windows and attaches it to the GitHub Release. No registry
+  publish, no secrets. Automates the §8 release gate up to (manual) signing.
+
+## [0.9.0] - 2026-06-04
+
+### Added
+- Exact-match response cache (IMP-6). Opt-in via `PASTURE_CACHE=<n>` (cache
+  size; 0 disables). Identical non-sensitive requests return a stored answer
+  without calling any backend, saving cloud cost; cache hits are labelled
+  `x_pasture_route: "cache"` and logged at zero cost. Bounded FIFO eviction,
+  zero-dependency (std hasher). Verified end-to-end: a repeated request routes
+  `local` then `cache`.
+- `cache` module (`request_key`, `ResponseCache`); `Proxy::with_cache`;
+  `Config::cache_size`.
+
+### Changed
+- Response/route labels are now strings, allowing `local` / `cloud` / `cache`
+  in `x_pasture_route` for both buffered and streaming responses.
+
+### Notes
+- Sensitive prompts are never cached (I5).
+
+## [0.8.0] - 2026-06-04
+
+### Added
+- Routing evaluation harness (IMP-5, RouterBench-style). New `eval` command and
+  `eval` module: runs an 18-case labelled set (EN+JA: plain->local,
+  hard->cloud, sensitive->local) reporting accuracy, cloud rate, and false/
+  missed escalations; plus a token-threshold sweep showing the cost/locality
+  trade-off. Offline, deterministic, zero-dependency.
+- Baseline: 100% routing accuracy on the labelled set; sweep cloud-rate ranges
+  from 75% (threshold 50) to 0% (threshold 2000).
+
+## [0.7.0] - 2026-06-04
+
+### Added
+- Cascade routing (IMP-1, FrugalGPT arXiv:2305.05176 / Confident-or-Seek
+  arXiv:2502.04428). Opt-in via `PASTURE_CASCADE=1`: the request is answered by
+  the local model first, and only escalated to the cloud when the local answer
+  looks low-confidence (v0 heuristics: empty/near-empty or EN/JA uncertainty &
+  refusal markers). If the cloud call fails, the local answer is returned
+  (graceful fallback).
+- `cascade` module (`is_low_confidence`, pure & tested); `Proxy::with_cascade`;
+  `Config::cascade`.
+
+### Notes
+- Cascade never escalates sensitive content (privacy wins) and is skipped for
+  streaming requests (the local answer cannot be un-sent). It requires a cloud
+  backend (`--features cloud` + API key) to escalate.
+
+## [0.6.0] - 2026-06-04
+
+### Added
+- Cloud backends over real HTTPS (ADR-005 resolved), gated behind the opt-in
+  `cloud` feature. Providers: OpenAI and Anthropic. Request/response shaping
+  and HTTP framing (Content-Length + chunked) are pure and unit-tested;
+  verified end-to-end against api.anthropic.com (TLS handshake + 401 path).
+- `cloud` module; `chat`/`serve` use the cloud backend when the feature is
+  built and an API key is present, enabling real local<->cloud routing.
+- Config: `cloud_model` (+ `PASTURE_CLOUD_MODEL`). BYOK keys from
+  `PASTURE_OPENAI_API_KEY` / `PASTURE_ANTHROPIC_API_KEY` (never logged, I5).
+
+### Changed
+- The default build remains zero-dependency and MSRV 1.75. The `cloud` feature
+  adds a pinned, MSRV-1.75-compatible TLS stack (native-tls 0.2.12 /
+  openssl 0.10.64 / openssl-sys 0.9.102) using the system OpenSSL.
+
+### Security / Governance
+- Dependency addition is feature-gated and pinned (supply-chain review, G7).
+  No live keys used; verification used a dummy key only.
+
+## [0.5.0] - 2026-06-04
+
+### Added
+- Server-Sent Events streaming (IMP-7, competitor parity). The proxy now
+  honours `"stream": true`, converting the local Ollama NDJSON stream into
+  OpenAI `chat.completion.chunk` frames terminated by `data: [DONE]`. Non-
+  streaming requests are unchanged.
+- `Backend::stream_complete` (default emits the full answer as one chunk;
+  Ollama overrides with true token streaming).
+- `pasture chat` now streams output to the terminal as it arrives.
+- Pure helpers `build_openai_chunk`, `sse_frame`, `parse_ollama_stream_line`.
+
+## [0.4.0] - 2026-06-04
+
+### Added
+- Richer difficulty features (IMP-4, grounded in survey arXiv:2506.06579):
+  routing now escalates to cloud on reasoning-depth markers, strict-format /
+  code-generation requests, math-symbol density, and multiple questions
+  (>= 3) — not just code fences and length. EN + JA markers. Decision reason
+  lists the matched signals (labels only).
+- `hard_signals`, `question_count`, `looks_mathy` (pure, tested).
+
+## [0.3.0] - 2026-06-04
+
+### Added
+- Privacy-classification routing (IMP-3): prompts containing likely sensitive
+  content (email, IPv4, credit-card via Luhn, phone, API-key prefixes, EN/JA
+  keywords) are kept on the local model and never sent to the cloud. Overrides
+  even a forced `--cloud`; errors instead of leaking when no local backend
+  exists. Opt out with `PASTURE_ALLOW_SENSITIVE_CLOUD`.
+- `privacy` module; `route`/`chat` now report sensitivity (labels only).
+- Routing: `decide_with_sensitivity`, `with_allow_sensitive_cloud`, new
+  `SensitiveButNoLocal` error.
+- Config: `allow_sensitive_cloud`.
+
+### Security
+- Only category labels are surfaced or logged — never matched values (I5).
+
+### References
+- PRISM (arXiv:2511.22788); "sensitive data stays local" pattern in peers.
+
+## [0.2.0] - 2026-06-04
+
+### Added
+- `donate` command and gentle, infrequent donation nudge (every 25 runs,
+  stderr only, opt-out via `PASTURE_NO_NUDGE`).
+- `refer [provider]` command surfacing operator-configurable cloud-provider
+  affiliate links (`PASTURE_REF_<KEY>`); no codes shipped, no user identifiers.
+- `monetize` module (donation/referral surfaces, run-count state).
+- Cloudflare Worker (`worker/`) for a $1/month Stripe donation Checkout with
+  webhook signature verification. Secrets via Worker bindings; stores no PII.
+- Config: `donate_url`, `no_nudge`, `state_path` (+ `PASTURE_*` env).
+
+### Security
+- No Stripe keys in source; test-mode-first. Live mode / deploy gated behind
+  explicit human approval (release-approval skill, Class C).
+
+## [0.1.0] - 2026-06-04
+
+### Added
+- Hardware detection (RAM / CPU threads / GPU + VRAM) with safe fallbacks.
+- Deterministic, hardware-adaptive routing engine (local vs cloud) with
+  explicit `--local` / `--cloud` overrides.
+- OpenAI-compatible proxy server (`POST /v1/chat/completions`, `GET /health`)
+  built on the standard library only.
+- Local inference backend over Ollama (plain HTTP).
+- Minimal zero-dependency JSON parser/serializer.
+- Structured JSONL cost logging (no PII).
+- CLI: `hw`, `route`, `chat`, `serve`, `version`, `help`.
+- 71 unit tests; clippy `-D warnings` clean; rustfmt clean.
+
+### Security
+- BYOK cloud credentials are not yet handled (cloud backend stubbed).
+
+### Notes
+- Cloud backend requires HTTPS/TLS and is deferred to a future release
+  (ARCHITECTURE.md, ADR-005).

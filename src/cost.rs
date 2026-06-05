@@ -1,0 +1,370 @@
+//! Cost accounting. Each completion appends one structured JSONL line
+//! (§9.1). No PII is recorded (I5): only route, model, token counts, cost.
+
+use crate::json::escape_string;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// One cost record. Local routes always cost 0.0 USD.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostRecord {
+    pub ts_secs: u64,
+    pub route: &'static str,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cost_usd: f64,
+    pub logprob: Option<f64>,
+}
+
+impl CostRecord {
+    /// Build a record, stamping the current time.
+    pub fn new(
+        route: &'static str,
+        model: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cost_usd: f64,
+    ) -> Self {
+        Self {
+            ts_secs: now_secs(),
+            route,
+            model: model.to_string(),
+            prompt_tokens,
+            completion_tokens,
+            cost_usd,
+            logprob: None,
+        }
+    }
+
+    /// Attach the local-answer mean log-probability (cascade confidence signal),
+    /// used by `calibrate --logprob`. It is a single number, never content (I5).
+    pub fn with_logprob(mut self, logprob: Option<f64>) -> Self {
+        self.logprob = logprob;
+        self
+    }
+
+    /// Serialize to a single JSONL line (no trailing newline).
+    pub fn to_jsonl(&self) -> String {
+        let lp = match self.logprob {
+            Some(v) => format!(",\"logprob\":{}", format_logprob(v)),
+            None => String::new(),
+        };
+        format!(
+            "{{\"ts\":{},\"route\":\"{}\",\"model\":\"{}\",\"prompt_tokens\":{},\"completion_tokens\":{},\"cost_usd\":{}{}}}",
+            self.ts_secs,
+            escape_string(self.route),
+            escape_string(&self.model),
+            self.prompt_tokens,
+            self.completion_tokens,
+            format_cost(self.cost_usd),
+            lp,
+        )
+    }
+
+    /// Append this record to the given log file, creating it if needed.
+    pub fn append_to(&self, path: &str) -> std::io::Result<()> {
+        let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(f, "{}", self.to_jsonl())
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A record read back from the JSONL log (route is owned, unlike `CostRecord`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoggedRecord {
+    pub route: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cost_usd: f64,
+    pub logprob: Option<f64>,
+}
+
+/// Parse a single JSONL cost line; returns None for blank/malformed lines.
+pub fn parse_log_line(line: &str) -> Option<LoggedRecord> {
+    let v = crate::json::parse(line.trim()).ok()?;
+    let route = v.get("route")?.as_str()?.to_string();
+    Some(LoggedRecord {
+        route,
+        prompt_tokens: num(&v, "prompt_tokens").unwrap_or(0.0) as u64,
+        completion_tokens: num(&v, "completion_tokens").unwrap_or(0.0) as u64,
+        cost_usd: num(&v, "cost_usd").unwrap_or(0.0),
+        logprob: num(&v, "logprob"),
+    })
+}
+
+fn num(v: &crate::json::JsonValue, key: &str) -> Option<f64> {
+    match v.get(key) {
+        Some(crate::json::JsonValue::Number(f)) => Some(*f),
+        _ => None,
+    }
+}
+
+/// Read and parse all records from a cost log file (missing file -> empty).
+pub fn read_log(path: &str) -> std::io::Result<Vec<LoggedRecord>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(content.lines().filter_map(parse_log_line).collect())
+}
+
+/// Aggregate view of a cost log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostSummary {
+    pub total: u64,
+    pub local: u64,
+    pub cloud: u64,
+    pub cache: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cloud_cost_usd: f64,
+}
+
+impl CostSummary {
+    pub fn cloud_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.cloud as f64 / self.total as f64
+        }
+    }
+
+    pub fn cache_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.cache as f64 / self.total as f64
+        }
+    }
+}
+
+/// Summarise parsed records by route, tokens, and spend.
+/// Distribution of the cascade confidence signal (local mean log-probability).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogprobStats {
+    pub count: usize,
+    pub mean: f64,
+    pub min: f64,
+    pub p10: f64,
+    pub median: f64,
+}
+
+/// Summarize the logged local mean log-probabilities, if any are present.
+/// Lower values mean the local model was less confident; the low percentiles
+/// are what `calibrate --logprob` uses to pick an escalation threshold.
+pub fn logprob_summary(records: &[LoggedRecord]) -> Option<LogprobStats> {
+    let mut lps: Vec<f64> = records.iter().filter_map(|r| r.logprob).collect();
+    if lps.is_empty() {
+        return None;
+    }
+    lps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = lps.len();
+    let quantile = |q: f64| lps[((q * n as f64).floor() as usize).min(n - 1)];
+    Some(LogprobStats {
+        count: n,
+        mean: lps.iter().sum::<f64>() / n as f64,
+        min: lps[0],
+        p10: quantile(0.10),
+        median: quantile(0.50),
+    })
+}
+
+pub fn summarize(records: &[LoggedRecord]) -> CostSummary {
+    let mut s = CostSummary {
+        total: records.len() as u64,
+        local: 0,
+        cloud: 0,
+        cache: 0,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cloud_cost_usd: 0.0,
+    };
+    for r in records {
+        match r.route.as_str() {
+            "local" => s.local += 1,
+            "cloud" => s.cloud += 1,
+            "cache" => s.cache += 1,
+            _ => {}
+        }
+        s.prompt_tokens += r.prompt_tokens;
+        s.completion_tokens += r.completion_tokens;
+        s.cloud_cost_usd += r.cost_usd;
+    }
+    s
+}
+
+/// Format a USD cost with up to 6 decimal places, trimming trailing zeros.
+fn format_cost(cost: f64) -> String {
+    let s = format!("{cost:.6}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Format a (typically negative) log-probability with up to 4 decimals,
+/// trimming trailing zeros, as a valid JSON number.
+fn format_logprob(v: f64) -> String {
+    let s = format!("{v:.4}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-" {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_jsonl_local_zero_cost() {
+        let r = CostRecord {
+            ts_secs: 100,
+            route: "local",
+            model: "llama3".to_string(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cost_usd: 0.0,
+            logprob: None,
+        };
+        let line = r.to_jsonl();
+        assert!(line.contains("\"route\":\"local\""));
+        assert!(line.contains("\"cost_usd\":0"));
+        assert!(line.contains("\"prompt_tokens\":10"));
+    }
+
+    #[test]
+    fn test_to_jsonl_cloud_cost_formatted() {
+        let r = CostRecord {
+            ts_secs: 1,
+            route: "cloud",
+            model: "gpt".to_string(),
+            prompt_tokens: 1000,
+            completion_tokens: 200,
+            cost_usd: 0.0125,
+            logprob: None,
+        };
+        assert!(r.to_jsonl().contains("\"cost_usd\":0.0125"));
+    }
+
+    #[test]
+    fn test_format_cost_trims_zeros() {
+        assert_eq!(format_cost(0.0), "0");
+        assert_eq!(format_cost(1.5), "1.5");
+        assert_eq!(format_cost(0.010000), "0.01");
+    }
+
+    #[test]
+    fn test_to_jsonl_is_valid_json() {
+        let r = CostRecord::new("cloud", "m\"odel", 1, 1, 0.001);
+        let parsed = crate::json::parse(&r.to_jsonl());
+        assert!(parsed.is_ok(), "JSONL line should parse: {}", r.to_jsonl());
+    }
+
+    #[test]
+    fn test_append_to_writes_line() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("pasture-cost-test-{}.jsonl", now_secs()));
+        let p = path.to_str().unwrap();
+        let r = CostRecord::new("local", "llama3", 3, 2, 0.0);
+        r.append_to(p).unwrap();
+        let content = std::fs::read_to_string(p).unwrap();
+        assert!(content.trim().ends_with('}'));
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn test_parse_log_line_roundtrip() {
+        let line = CostRecord::new("cloud", "gpt", 10, 4, 0.002).to_jsonl();
+        let parsed = parse_log_line(&line).unwrap();
+        assert_eq!(parsed.route, "cloud");
+        assert_eq!(parsed.prompt_tokens, 10);
+        assert_eq!(parsed.completion_tokens, 4);
+        assert!((parsed.cost_usd - 0.002).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_log_line_rejects_garbage() {
+        assert!(parse_log_line("not json").is_none());
+        assert!(parse_log_line("").is_none());
+    }
+
+    #[test]
+    fn test_summarize_counts_and_rates() {
+        let recs = vec![
+            LoggedRecord {
+                route: "local".into(),
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cost_usd: 0.0,
+                logprob: None,
+            },
+            LoggedRecord {
+                route: "cloud".into(),
+                prompt_tokens: 20,
+                completion_tokens: 8,
+                cost_usd: 0.01,
+                logprob: None,
+            },
+            LoggedRecord {
+                route: "cache".into(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cost_usd: 0.0,
+                logprob: None,
+            },
+            LoggedRecord {
+                route: "cloud".into(),
+                prompt_tokens: 30,
+                completion_tokens: 2,
+                cost_usd: 0.02,
+                logprob: None,
+            },
+        ];
+        let s = summarize(&recs);
+        assert_eq!((s.total, s.local, s.cloud, s.cache), (4, 1, 2, 1));
+        assert_eq!(s.prompt_tokens, 60);
+        assert_eq!(s.completion_tokens, 15);
+        assert!((s.cloud_cost_usd - 0.03).abs() < 1e-9);
+        assert!((s.cloud_rate() - 0.5).abs() < 1e-9);
+        assert!((s.cache_rate() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_summarize_empty() {
+        let s = summarize(&[]);
+        assert_eq!(s.total, 0);
+        assert_eq!(s.cloud_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_logprob_summary() {
+        let mk = |lp: Option<f64>| LoggedRecord {
+            route: "local".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cost_usd: 0.0,
+            logprob: lp,
+        };
+        assert!(logprob_summary(&[mk(None), mk(None)]).is_none());
+        let recs: Vec<LoggedRecord> = (1..=10).map(|i| mk(Some(-(i as f64) / 10.0))).collect();
+        let st = logprob_summary(&recs).unwrap();
+        assert_eq!(st.count, 10);
+        assert!((st.mean - (-0.55)).abs() < 1e-9, "{}", st.mean);
+        assert!((st.min - (-1.0)).abs() < 1e-9);
+        assert!(st.p10 <= st.median);
+    }
+}

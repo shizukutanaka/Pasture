@@ -1,0 +1,33 @@
+[package]
+name = "pasture"
+version = "0.26.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "MIT"
+description = "OpenAI-compatible local/cloud LLM routing proxy with hardware-adaptive thresholds. Zero dependencies."
+repository = "https://github.com/shizukutanaka/pasture"
+
+[features]
+# Default build is zero-dependency. Cloud/TLS is opt-in (ADR-005) and pulls a
+# pinned TLS stack (native-tls / system OpenSSL), MSRV-1.75 compatible.
+default = []
+cloud = ["dep:native-tls", "dep:openssl", "dep:openssl-sys"]
+
+[dependencies]
+native-tls = { version = "=0.2.12", optional = true }
+openssl = { version = "=0.10.64", optional = true }
+openssl-sys = { version = "=0.9.102", optional = true }
+
+[[bin]]
+name = "pasture"
+path = "src/main.rs"
+
+[lib]
+name = "pasture"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"
