@@ -337,6 +337,110 @@ PII-free）＋ `stats`（cloud率・cacheヒット率・spend・logprob分布）
 
 ---
 
+## Round 2 — 深掘りと実装ロードマップ
+
+> ループ第2巡。第1巡の網羅調査を受け、**最優先5項目を設計レベルに落とし込む**。
+> 各項目に「設計 / env / ファイル接点 / テスト / ゼロ依存維持」を付す。新規出典は
+> 下の Sources にも追記。
+
+### R2-1. IMP-13 — UCCI流の正誤較正（isotonic, std-only）
+
+**追加根拠:** PAVA（Pool Adjacent Violators）は **O(n)・パラメトリック仮定なし**で
+単調写像を学習でき、データが小さい時はPlattより過学習しやすい点に注意（→少数
+ラベルでは保守的に）。PDAS変種はwarm-start可能でオンライン更新向き。
+
+**設計:**
+- `calibrate.rs` に `fit_isotonic(samples: &[(f64 /*logprob*/, bool /*correct*/)]) -> Vec<(f64,f64)>`
+  を追加。PAVAでlogprob昇順→P(correct)の単調増加ブロックを生成（std::のみ、約40行）。
+- 推論時: `p_error(logprob)` を区分線形補間で評価。`should_escalate = p_error > budget`。
+- ラベル源: 既存18ケース eval（`eval.rs`）＋任意のユーザ提供 `pasture-labels.jsonl`。
+- 出力は**助言**（現行 `calibrate` と同じ）: `PASTURE_CASCADE_LOGPROB` の代わりに
+  `PASTURE_CASCADE_ERR_BUDGET=0.1` を推奨値として提示。
+
+**env:** `PASTURE_CASCADE_ERR_BUDGET`（新）。既存 `PASTURE_CASCADE_LOGPROB` は後方互換で残置。
+**ファイル接点:** `calibrate.rs`（PAVA＋補間）, `cascade.rs`（閾値判定の分岐）, `cli.rs`（`calibrate --error-budget`）。
+**テスト:** 単調性（出力が非減少）、既知点で正答率一致、ラベル0件で安全フォールバック（現行率較正へ）。
+**ゼロ依存:** ✅ オフライン・std数値のみ。
+
+### R2-2. IMP-12 — ローカル埋め込みのセマンティックキャッシュ（opt-in）
+
+**追加根拠:** 本番知見は **閾値0.90–0.95、0.92が定番**、FP上限は埋め込み性能で
+**3–5%**。閾値は**実トラフィックで曲線を引いて**決める（合成不可）。vCache
+(2502.03771) は「検証付き」キャッシュでFPを抑制、ドメイン特化埋め込み
+(2504.02268) でヒット率改善。
+
+**設計:**
+- `cache.rs` に第2層 `SemanticCache`（opt-in）。キー＝local backendの `/v1/embeddings`
+  で得たベクトル。cos類似 ≥ `threshold` でヒット。境界付き（FIFO）でベクトルを保持。
+- **検証ステップ**（vCache準拠）: ヒット時に近傍距離を `cost log` に記録し、`stats` で
+  FP代理指標（near-miss分布）を提示→ユーザが閾値を調整可能に。
+- 機微プロンプトは**埋め込みもキャッシュもしない**（`privacy.rs` の既存規則を踏襲）。
+- デフォルト無効＝既定ビルドはゼロ依存のまま（埋め込みはlocal HTTP、新crate不要）。
+
+**env:** `PASTURE_SEMANTIC_CACHE=<n>`（容量, 0=無効）, `PASTURE_SEMANTIC_THRESHOLD=0.92`。
+**ファイル接点:** `cache.rs`（cos類似・境界保持）, `backend.rs`（embeddings呼出）, `cost.rs`（near-miss記録）, `proxy.rs`（ルックアップ順序: exact→semantic→backend）。
+**テスト:** cos計算の正確性、閾値境界（0.92で言い換えヒット/別意図ミス）、機微非キャッシュ、容量退避。
+**ゼロ依存:** ✅（opt-in; localのみ; ベクタDB非使用）。
+
+### R2-3. IMP-18 — プレフィックス保全＋プロバイダ・プロンプトキャッシュ活用
+
+**追加根拠:** Anthropic は `cache_control:{type:"ephemeral"}`、参照順は
+**tools→system→messages**、**読取=入力の0.1x / 書込=1.25x（1h TTLは2x）**、
+**breakpoint最大4**。OpenAIは自動プレフィックスキャッシュ。安定プレフィックスを
+壊さない要求整形が最大のコスト梃子。
+
+**設計:**
+- cloud送信時、`cloud.rs` の Anthropic shaping に `cache_control` を付与（system＋
+  長い共通前置にbreakpoint, 最大4）。OpenAIは順序維持で自動キャッシュに委ねる。
+- マルチターンで system/tools を**安定順序**に正規化（揮発的メタを末尾へ）。
+- `stats` に「cache_creation/cache_read トークン」を集計（Anthropicレスポンスの
+  `cache_creation` を解析）。
+
+**env:** `PASTURE_PROVIDER_PROMPT_CACHE=1`（既定オン推奨, cloud feature時）。
+**ファイル接点:** `cloud.rs`（リクエスト整形＋レスポンス使用量解析）, `cost.rs`（キャッシュ系トークン）, `proxy.rs`（メッセージ順序正規化）。
+**テスト:** ペイロード整形のゴールデンテスト（breakpoint位置）、使用量解析、非cloudビルドで無効。
+**ゼロ依存:** ✅（cloud featureゲート内のみ; 既定ビルド不変）。
+
+### R2-4. IMP-20 — 軽量プロンプトインジェクション・ガード（公開時のみ, opt-in）
+
+**追加根拠:** 字句/正規表現層は **~0.1ms**、PCFIは ALLOW/SANITIZE/BLOCK を
+バックエンド到達前に判定し全攻撃遮断/FP0%/0.04ms。ただし**regex単独はFP 8–15%**
+なので「第一層」に留め、強制ではなく**警告/ラベル**運用が無難。ゼロショット
+埋め込みドリフト(2601.12359)や混合判定(2603.25176)は重い→既定は字句のみ。
+
+**設計:**
+- 非localhostバインド時のみ有効化（IMP-15と連動）。`proxy.rs` 入口に
+  `classify_injection(text) -> Allow|Flag` の決定論的字句判定（"ignore previous",
+  "respond as system", role切替, 既知エンコード/homoglyph）。
+- 既定は**Flagをログ＋ヘッダ表示**（BLOCKは opt-in）。FP過多を避け、cost logに
+  カテゴリのみ記録（本文は非ログ, I5踏襲）。
+
+**env:** `PASTURE_INJECTION_GUARD=off|flag|block`（既定off; 公開時flag推奨）。
+**ファイル接点:** 新規 `src/guard.rs`（純パターン＋テスト）, `proxy.rs`（入口フック）, `i18n.rs`（警告文言）。
+**テスト:** 既知攻撃の検出、正常文のFP測定、off時ゼロオーバヘッド。
+**ゼロ依存:** ✅（std正規表現相当を手書きパターンで; 新crate不要）。
+
+### R2-5. 即効クイックウィン（IMP-8/9/10）の接点詳細
+
+- **IMP-8 `/v1/models`・`/v1/embeddings`:** `proxy.rs:319` 付近のルート分岐に2本追加。
+  `/v1/models` は config のlocal/cloudモデルIDを OpenAI list形で返す。`/v1/embeddings`
+  は local backend にパススルー（`backend.rs`）。テスト: 形状・404解消。
+- **IMP-9 リトライ＋フォールバック:** `cloud.rs` 送信を `retry(max=3, backoff=2^n, jitter)`
+  でラップ。5xx/timeout/接続失敗のみ再試行。最終失敗で現行の local フォールバック。
+  env `PASTURE_CLOUD_RETRY=3`。テスト: 一過性5xx→成功、恒久失敗→local。
+- **IMP-10 tool calling:** `proxy.rs` のリクエスト解析で `tools`/`tool_choice` 検出→
+  `routing.rs` の `add_hard_signal` 呼出（cloud寄せ）＋フィールド忠実転送。
+  テスト: tools有り→cloud、フィールド保全。
+
+### Round 2 まとめ
+- **着手順の推奨:** IMP-8 → IMP-10 → IMP-9（クイックウィン, std-only, 1–2日規模）
+  → IMP-22（推定誤差是正）→ IMP-13/12（研究的価値）→ IMP-18（コスト梃子）
+  → IMP-15/20/16（公開運用）。
+- すべて **既定のゼロ依存・単一バイナリ・プライバシー優先**を不変に保つ opt-in 設計。
+- 閾値・予算は**ユーザの実ログで較正**する方針（合成データに依存しない）で一貫。
+
+---
+
 ## Sources（主要URL）
 
 **ルーティング:** arxiv.org/abs/2603.20895, /2601.07206, /2601.17814, /2601.06220,
@@ -361,3 +465,12 @@ OpenTelemetry GenAI ・ github.com/traceloop/openllmetry, /langfuse/langfuse, He
 /2602.07878 ・ github.com/protectai/llm-guard, /protectai/rebuff, /NVIDIA/NeMo-Guardrails ・ OWASP
 **UX/i18n/トークン:** arxiv.org/abs/2509.05486, /2510.09947, /2401.10660, /2511.03237 ・
 github.com/i18next/i18next-cli, /better-i18n, /bradAGI/awesome-cli-coding-agents
+
+**Round 2 追加出典:**
+- *isotonic/PAVA較正:* arxiv.org/abs/2006.05527（PAVA高速化）, /1508.02452（primal-dual active-set）
+- *プロバイダ・プロンプトキャッシュ:* platform.claude.com/docs（cache_control ephemeral, 0.1x read）,
+  openrouter.ai/docs（prompt caching）, docs.litellm.ai/docs/completion/prompt_caching
+- *セマンティックキャッシュ閾値:* arxiv.org/abs/2502.03771（vCache 検証付き）, /2504.02268（ドメイン特化埋め込み）,
+  portkey.ai/blog/semantic-caching-thresholds（0.92/FP3-5%）
+- *インジェクション軽量防御:* arxiv.org/abs/2603.18433（PCFI）, /2605.06669（security-usability-latency）,
+  /2601.12359（zero-shot embedding drift）, /2506.06384（pretrained+heuristic）, /2603.25176（LLM-as-Judge+MoM）
