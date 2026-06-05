@@ -441,6 +441,114 @@ PII-free）＋ `stats`（cloud率・cacheヒット率・spend・logprob分布）
 
 ---
 
+## Round 3 — 残り候補の設計レベル深掘り
+
+> ループ第3巡。Round 2 で扱わなかった候補（IMP-19 / 26 / 23 / 27）を設計化し、
+> IMP-21/22/24/25 を短く締める。新規出典は下の Sources に追記。
+
+### R3-1. IMP-19 — 任意の可逆擬名化（reversible pseudonymization）送信モード
+
+**追加根拠:** MemPrivacy は端末側で機微スパンを**型付きプレースホルダ**
+（`<Email_1>`, `<Health_Info_1>`）に置換、原値↔プレースホルダの対応は**ローカル保存**し
+セッション跨ぎで安定。PII Shield 方式は detect→redact→**restore**で、LLM が前後を
+書換え/翻訳/要約してもプレースホルダ位置で原値を復元できる。Anonymous-by-Construction
+(2603.17217) は型整合な代理値で流暢性を保つ。
+
+**設計（Pastureの第3経路）:** 現状は「機微→**強制local**」が既定。これを保ちつつ、
+local非搭載 or 明示opt-in時のみ次を提供：
+1. `privacy.rs` の検出スパンを**型付きプレースホルダ**へ置換（既存7カテゴリを再利用）。
+2. 原値マップは**プロセス内/ローカルのみ**（cost logにもディスクにも原値は書かない, I5）。
+3. cloud応答受信後、プレースホルダを原値へ**復元**してクライアントへ返す。
+4. クラウドには**原値が一切出ない**ことを不変条件としてテストで保証。
+
+**env:** `PASTURE_PII_MODE=local|pseudonymize`（既定 `local`）。
+**ファイル接点:** `privacy.rs`（span→placeholder, restore）, `proxy.rs`（送信前置換・応答後復元）, `cascade.rs`（擬名化時のみcloud許可）。
+**テスト:** 往復で原値復元、cloudペイロードに原値非出現（負例検査）、マップ非永続、既定モードは挙動不変。
+**ゼロ依存:** ✅（std文字列処理のみ）。**注意:** 復元は文字列マッチ依存→プレースホルダ命名を衝突しにくい形に。
+
+### R3-2. IMP-26 — 予算アウェアな動的しきい値（cost-velocity breaker）
+
+**追加根拠:** 2026の定石は **(1) TPM/TPD・日次/月次の累積spend上限、(2) 予算「率」に対する
+ブレーカ**（絶対ドルでなく**ワークロード予算比**で発火＝価格改定に強い）、**(3) スパイク検知**
+（単発が平均コストの50–100×ならパターン無しでも発火）、**(4) フォールバックで安価モデルへ**。
+
+**設計:** Pasture は単一ユーザなので階層予算は不要。cost log（PII-free）を入力に：
+- `PASTURE_BUDGET_DAILY_USD` を設定すると、当日の累積spendに対し**消化率**を算出。
+- 消化率が上がるほど**ルーティング閾値を引上げ**（=より local 寄り）。線形 or 区分で。
+- **スパイク検知:** 推定プロンプトが平均の N×（既定50×）超なら、その1件を local へ寄せる
+  （文脈溢れの暴発を防ぐ）。
+- 上限到達時は `block|local-only|warn` を選択（既定 `local-only`：cloudを止めても動作継続）。
+
+**env:** `PASTURE_BUDGET_DAILY_USD`, `PASTURE_BUDGET_ACTION=local-only|warn|block`, `PASTURE_SPIKE_FACTOR=50`。
+**ファイル接点:** `cost.rs`（当日集計・平均算出）, `routing.rs`（消化率→閾値補正・スパイク判定）, `cli.rs`（`stats` に予算消化率表示）。
+**テスト:** 消化率0/50/100%での閾値変化、スパイク単発の local 化、上限到達時アクション、予算未設定で挙動不変。
+**ゼロ依存:** ✅（cost logのみ・オフライン）。**ADR-015/023 と整合**（観測ログを較正に使う既存方針の延長）。
+
+### R3-3. IMP-23 — OpenTelemetry GenAI 準拠の任意メトリクス出力
+
+**追加根拠:** GenAI semconv の **client spans/metrics は2026初頭にstable化**。
+標準メトリクス: `gen_ai.client.token.usage` / `operation.duration` /
+`time_to_first_chunk` / `time_per_output_chunk`。属性: `gen_ai.request.model` /
+`gen_ai.usage.input_tokens` / `output_tokens` / `gen_ai.response.finish_reasons`。
+`input_tokens` は**cachedトークンを含む**。PII: **プロンプト本文をspanに載せない**。
+
+**設計（ゼロ依存維持の肝）:** OTel SDK は依存になるため**採らない**。代わりに：
+- **(既定)** IMP-16 の `/metrics`（Prometheus text）を **`gen_ai.*` 命名**で出力。
+  既存 cost log の計数（route, model, tokens, spend, logprob分布）を写像。
+- **(opt-in)** 手書きの **OTLP/HTTP(JSON) エクスポータ**を std HTTP で実装し、
+  collector へ push（新crate不要）。属性は上記stable集合のみ、**本文は載せない**（I5）。
+
+**env:** `PASTURE_OTEL_ENDPOINT`（未設定なら無効）, `PASTURE_METRICS=prometheus|otlp|off`。
+**ファイル接点:** `cost.rs`（集計の単一ソース）, 新規 `src/metrics.rs`（Prometheus/OTLP整形）, `proxy.rs`（`/metrics` ルート, IMP-16と統合）。
+**テスト:** 命名・型の準拠（gen_ai.*）、本文非出力、off時ゼロオーバヘッド、OTLP JSON整形のゴールデン。
+**ゼロ依存:** ✅（既定Prometheusはstd; OTLPもstd HTTP・opt-in）。
+
+### R3-4. IMP-27 — サプライチェーン強化（CI/リリース）
+
+**追加根拠:** 2026のRust定石: **cargo audit + cargo deny を CI に**（脆弱性＋ライセンス方針）、
+**cargo-auditable** で依存を実バイナリに埋込、**SBOM**（CycloneDX/SPDX, Syft）を毎ビルド発行、
+**cosign キーレス署名**（Fulcio/Rekor）＋ **SLSA provenance**、`Cargo.lock` コミット
+（**Pastureは実施済**）、Cargo.lockによる**再現ビルド**。
+
+**設計:** 既定ビルドはゼロ依存ゆえ依存監査面は最小だが、`cloud` feature の TLS スタックが対象。
+- `.github/workflows/ci.yml` に `cargo deny check` と `cargo audit` を追加（zero-dep と cloud の両 feature）。
+- リリース job で `cargo auditable build`＋SBOM(CycloneDX) 添付、`cosign` キーレス署名（SLSA L1→L2）。
+- ADR-010（依存ピン留め）・RELEASE_CHECKLIST と統合し、release-approval を人手ゲートのまま維持。
+
+**ファイル接点:** `.github/workflows/ci.yml` / `release.yml`, `deny.toml`（新）, `RELEASE_CHECKLIST.md`。
+**テスト/検証:** CIで deny/audit が赤を出すこと、SBOM 添付、署名検証手順を SECURITY.md に明記。
+**ゼロ依存:** ✅（成果物には影響せず, CIのみ）。
+> 注: 本リポの取込時、GitHub App権限の制約で `.github/workflows/*.yml` は push 不可だったため、
+> 本項は**メンテナが手動適用**する前提（workflows権限付与 or 手動コミット）。
+
+### R3-5. 残り候補の要約クローズ
+
+- **IMP-21 レイテンシDoS硬化:** `proxy.rs` に本文サイズ上限（既定~1MB）、接続あたり処理時間上限、
+  Content-Length検証、接続レート制限を追加。ADR-026（再帰深さ128）を本文長/レートへ拡張。env
+  `PASTURE_MAX_BODY_BYTES` / `PASTURE_REQ_TIMEOUT_MS`。std-only。
+- **IMP-22 fertility推定:** `routing.rs:estimate_tokens` を「スクリプト別係数表＋句読点/数字補正」へ。
+  CJK=1.0、ラテン≈0.25/char、記号/空白別係数。係数は env でも上書き可。決定論維持・テスト追加。
+- **IMP-24 出力長予測:** 軽量proxyモデルは依存増＝**現時点では非採用（deferred）**。代替として
+  プロンプト長・タスク種別からの**ヒューリスティック見積り**のみ cost 予測に使用。
+- **IMP-25 スキルプロフィール:** `config` に `[skills]` 表（例 `code = cloud`, `summarize = local`,
+  `translate.ja = local`）を追加し、ハード信号より前段で参照。決定論・設定駆動。`routing.rs` に
+  プロフィール照合を1段挿入。
+
+### Round 3 まとめ（全候補の状態）
+| IMP | 状態 | 既定ゼロ依存 |
+|-----|------|:---:|
+| 8/9/10/11 | 設計＋接点明記（Round2） | ✅ |
+| 12/13/18/20 | 設計化（Round2） | ✅ |
+| 19/23/26 | 設計化（Round3） | ✅ |
+| 27 | CI設計（手動適用前提） | ✅ |
+| 21/22/25 | 要約設計（Round3） | ✅ |
+| 24 | 非採用（deferred） | ⚠️ |
+
+全項目が **opt-in もしくは std-only** で、既定の単一・ゼロ依存・プライバシー優先バイナリを不変に保つ。
+閾値・予算・較正は一貫して**ユーザの実 cost log**から導く（合成データ非依存）。
+
+---
+
 ## Sources（主要URL）
 
 **ルーティング:** arxiv.org/abs/2603.20895, /2601.07206, /2601.17814, /2601.06220,
@@ -474,3 +582,12 @@ github.com/i18next/i18next-cli, /better-i18n, /bradAGI/awesome-cli-coding-agents
   portkey.ai/blog/semantic-caching-thresholds（0.92/FP3-5%）
 - *インジェクション軽量防御:* arxiv.org/abs/2603.18433（PCFI）, /2605.06669（security-usability-latency）,
   /2601.12359（zero-shot embedding drift）, /2506.06384（pretrained+heuristic）, /2603.25176（LLM-as-Judge+MoM）
+
+**Round 3 追加出典:**
+- *可逆擬名化:* arxiv.org/abs/2603.17217（Anonymous-by-Construction）, MemPrivacy（edge-cloud reversible pseudonymization, 2026-05）,
+  PII Shield（detect-redact-restore proxy）, dev.to/mukundakatta/llm-pii-redact
+- *予算/コスト制御:* docs.litellm.ai/docs/proxy/users（budgets/rate limits）, portkey.ai/blog/rate-limiting-for-llm-applications,
+  virtido.com/blog/ai-gateway-patterns-production-guide（cost-velocity breaker, spike detection）
+- *OpenTelemetry GenAI:* opentelemetry.io/docs/specs/semconv/gen-ai/（spans/metrics stable）, gen-ai-metrics, gen-ai-spans
+- *Rustサプライチェーン:* github.com/rust-secure-code/cargo-auditable, embarkstudios/cargo-deny, sigstore/cosign（keyless）,
+  Syft SBOM（CycloneDX/SPDX）, SLSA provenance
