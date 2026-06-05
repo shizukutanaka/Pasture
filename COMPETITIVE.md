@@ -4,6 +4,10 @@
 > (e.g. ADR-006 "COMPETITIVE.md §6", ADR-007). It maps Pasture against peer tools
 > and recent literature, and tracks the **forward improvement backlog (IMP-8 →)**.
 > IMP-1…IMP-7 are already shipped — see `CHANGELOG.md` and the ADRs.
+>
+> The upstream, category-by-category source survey behind this backlog (10 product
+> areas × ~10 arXiv/GitHub sources, plus the new candidates IMP-18 → IMP-27) lives
+> in **[RESEARCH.md](RESEARCH.md)**.
 
 This analysis answers one question: *given everything similar software and recent
 arXiv work do, what should Pasture do next — without betraying what makes it
