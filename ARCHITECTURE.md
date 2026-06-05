@@ -3,6 +3,9 @@
 Pasture is a single Rust binary (std-library only) following a
 performance-first, minimal-dependency philosophy (Carmack / Pike).
 
+> Competitive landscape, arXiv grounding, and the forward improvement backlog
+> (IMP-8 →) live in **[COMPETITIVE.md](COMPETITIVE.md)**.
+
 ## Module map
 
 | Module | Responsibility |

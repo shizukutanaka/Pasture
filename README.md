@@ -88,6 +88,13 @@ This is an early release (v0.9.0). Working today: hardware detection, determinis
 
 Pasture records no personal data. The cost log contains only timestamps, route, model name, token counts, and cost. Local requests never leave your machine. Prompts that look sensitive (emails, keys, card numbers, etc.) are detected and kept local automatically; only category labels are ever logged, never the values.
 
+## How Pasture compares
+
+See **[COMPETITIVE.md](COMPETITIVE.md)** for how Pasture compares to peer tools
+(LiteLLM, RouteLLM, vLLM Semantic Router, GPTCache, Portkey, OpenRouter), the
+recent arXiv work behind its routing/cascade/cache design, and the prioritized
+improvement backlog.
+
 ## License
 
 MIT. See `LICENSE`.
