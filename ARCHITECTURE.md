@@ -3,6 +3,7 @@
 Pasture is a single Rust binary (std-library only) following a
 performance-first, minimal-dependency philosophy (Carmack / Pike).
 
+> The normative API/routing contract is in **[SPEC.md](SPEC.md)**.
 > Competitive landscape, arXiv grounding, and the forward improvement backlog
 > (IMP-8 →) live in **[COMPETITIVE.md](COMPETITIVE.md)**.
 
@@ -212,3 +213,11 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   (`PASTURE_CLOUD_RETRY`, default 2), and on final failure falls back to local when a
   local backend exists rather than erroring. The retry decision is unit-tested with a
   flaky mock (no sleeps); std-only, and the cloud HTTPS path stays feature-gated.
+- **ADR-033 Spec conformance hardening (SPEC.md §3.5/§7).** Writing the formal spec
+  surfaced three conformance gaps, now closed: (1) error bodies use the OpenAI
+  envelope `{"error":{"message,type}}` instead of a flat string, via a single
+  `build_error_response` + `ProxyError::kind`; (2) chat responses and stream chunks
+  carry the OpenAI `created` timestamp; (3) `read_request` returns a `ReadOutcome`
+  that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
+  unbounded read — closing a remote-DoS vector beyond the existing header/recursion
+  caps (IMP-21, partial). All std-only; covered by socket round-trip tests.

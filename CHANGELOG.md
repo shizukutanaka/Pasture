@@ -18,6 +18,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
   std-only. Tests: tool detection, cloud escalation, privacy precedence, rule-off.
 - Grounded in the peer/API-surface and routing analysis (COMPETITIVE.md / RESEARCH.md).
 
+### Added — specification & conformance hardening
+- New **SPEC.md**: the normative HTTP API + routing contract (endpoints, request/
+  response schemas, error model, routing order, privacy, limits, config, cost log).
+- Writing the spec surfaced three gaps, now fixed (ADR-033):
+  - Error responses use the OpenAI envelope `{"error":{"message","type"}}` (were a
+    flat `{"error":"…"}`), via `build_error_response` + `ProxyError::kind`.
+  - Chat responses and SSE chunks now include the OpenAI `created` timestamp.
+  - The request reader rejects oversized bodies with **413** (`MAX_BODY_BYTES`,
+    16 MiB) instead of an unbounded read — a remote-DoS guard (IMP-21, partial).
+  - Covered by socket round-trip tests (200/400/404/413 + envelope + `created`).
+
 ### Added — cloud resilience (IMP-9)
 - Cloud requests now retry transient failures (connection/timeout, and provider
   **5xx**, newly classified as retryable `Transport` vs non-retryable 4xx) with

@@ -38,6 +38,15 @@ impl ProxyError {
             ProxyError::BadRequest(m) | ProxyError::Routing(m) | ProxyError::Backend(m) => m,
         }
     }
+
+    /// OpenAI-style error `type` for the error envelope (SPEC §3.5).
+    fn kind(&self) -> &'static str {
+        match self {
+            ProxyError::BadRequest(_) => "invalid_request_error",
+            ProxyError::Routing(_) => "routing_error",
+            ProxyError::Backend(_) => "upstream_error",
+        }
+    }
 }
 
 impl std::fmt::Display for ProxyError {
@@ -374,9 +383,19 @@ impl Proxy {
     }
 
     fn handle_connection(&self, stream: &mut std::net::TcpStream) -> std::io::Result<()> {
-        let Some((method, path, body)) = read_request(stream)? else {
-            write_response(stream, 400, "{\"error\":\"malformed request\"}")?;
-            return Ok(());
+        let (method, path, body) = match read_request(stream)? {
+            ReadOutcome::Request { method, path, body } => (method, path, body),
+            ReadOutcome::TooLarge => {
+                let payload =
+                    build_error_response("request body too large", "invalid_request_error");
+                write_response(stream, 413, &payload)?;
+                return Ok(());
+            }
+            ReadOutcome::Closed => {
+                let payload = build_error_response("malformed request", "invalid_request_error");
+                write_response(stream, 400, &payload)?;
+                return Ok(());
+            }
         };
         if method == "POST" && path.starts_with("/v1/chat/completions") {
             match Self::parse_request(&body) {
@@ -384,13 +403,19 @@ impl Proxy {
                 Ok(req) => match self.complete_buffered(&req) {
                     Ok(resp) => write_response(stream, 200, &resp)?,
                     Err(e) => {
-                        let payload = format!("{{\"error\":\"{}\"}}", escape_string(e.message()));
-                        write_response(stream, e.status(), &payload)?;
+                        write_response(
+                            stream,
+                            e.status(),
+                            &build_error_response(e.message(), e.kind()),
+                        )?;
                     }
                 },
                 Err(e) => {
-                    let payload = format!("{{\"error\":\"{}\"}}", escape_string(e.message()));
-                    write_response(stream, e.status(), &payload)?;
+                    write_response(
+                        stream,
+                        e.status(),
+                        &build_error_response(e.message(), e.kind()),
+                    )?;
                 }
             }
         } else if method == "GET" && path.starts_with("/v1/models") {
@@ -398,7 +423,11 @@ impl Proxy {
         } else if method == "GET" && path.starts_with("/health") {
             write_response(stream, 200, "{\"status\":\"ok\"}")?;
         } else {
-            write_response(stream, 404, "{\"error\":\"not found\"}")?;
+            write_response(
+                stream,
+                404,
+                &build_error_response("not found", "invalid_request_error"),
+            )?;
         }
         Ok(())
     }
@@ -421,15 +450,21 @@ impl Proxy {
         let decision = match self.classify_and_decide(req) {
             Ok((d, _)) => d,
             Err(e) => {
-                let payload = format!("{{\"error\":\"{}\"}}", escape_string(e.message()));
-                return write_response(sock, e.status(), &payload);
+                return write_response(
+                    sock,
+                    e.status(),
+                    &build_error_response(e.message(), e.kind()),
+                );
             }
         };
         let backend = match self.backend_for(decision.route) {
             Ok(b) => b,
             Err(e) => {
-                let payload = format!("{{\"error\":\"{}\"}}", escape_string(e.message()));
-                return write_response(sock, e.status(), &payload);
+                return write_response(
+                    sock,
+                    e.status(),
+                    &build_error_response(e.message(), e.kind()),
+                );
             }
         };
 
@@ -455,10 +490,7 @@ impl Proxy {
                 sock.write_all(stop.as_bytes())?;
             }
             Err(e) => {
-                let err = sse_frame(&format!(
-                    "{{\"error\":\"{}\"}}",
-                    escape_string(&e.to_string())
-                ));
+                let err = sse_frame(&build_error_response(&e.to_string(), "upstream_error"));
                 sock.write_all(err.as_bytes())?;
             }
         }
@@ -493,6 +525,24 @@ fn complete_with_retry(
     }
 }
 
+/// Current Unix time in seconds (for the OpenAI `created` field).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Build an OpenAI-compatible error body: `{"error":{"message":..,"type":..}}`
+/// (SPEC §3.5). Both fields are JSON-escaped.
+pub fn build_error_response(message: &str, kind: &str) -> String {
+    format!(
+        "{{\"error\":{{\"message\":\"{}\",\"type\":\"{}\"}}}}",
+        escape_string(message),
+        escape_string(kind),
+    )
+}
+
 /// Build an OpenAI-compatible `GET /v1/models` list response (IMP-8).
 /// Each model id is emitted as an `object: "model"` entry owned by "pasture".
 pub fn build_models_response(models: &[String]) -> String {
@@ -512,7 +562,8 @@ pub fn build_models_response(models: &[String]) -> String {
 pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> String {
     let total = resp.prompt_tokens + resp.completion_tokens;
     format!(
-        "{{\"id\":\"pasture\",\"object\":\"chat.completion\",\"model\":\"{}\",\"x_pasture_route\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        "{{\"id\":\"pasture\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"x_pasture_route\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        unix_now(),
         escape_string(&resp.model),
         route_label,
         escape_string(&resp.content),
@@ -534,7 +585,8 @@ pub fn build_openai_chunk(delta: &str, route_label: &str, finish: Option<&str>) 
         None => "null".to_string(),
     };
     format!(
-        "{{\"id\":\"pasture\",\"object\":\"chat.completion.chunk\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}"
+        "{{\"id\":\"pasture\",\"object\":\"chat.completion.chunk\",\"created\":{},\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}",
+        unix_now()
     )
 }
 
@@ -547,9 +599,25 @@ fn write_sse_headers(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
     let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     stream.write_all(headers.as_bytes())
 }
-fn read_request(
-    stream: &mut std::net::TcpStream,
-) -> std::io::Result<Option<(String, String, String)>> {
+/// Maximum request body the proxy will read (SPEC §7). Far above any real chat
+/// payload; a larger `Content-Length`, or a body that grows past it, yields 413
+/// instead of an unbounded read (DoS guard, IMP-21).
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Outcome of reading one HTTP request off the socket.
+enum ReadOutcome {
+    Request {
+        method: String,
+        path: String,
+        body: String,
+    },
+    /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413.
+    TooLarge,
+    /// Connection closed early or headers were malformed/oversized → 400.
+    Closed,
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     // Read until headers are complete.
@@ -559,11 +627,11 @@ fn read_request(
         }
         let n = stream.read(&mut chunk)?;
         if n == 0 {
-            return Ok(None);
+            return Ok(ReadOutcome::Closed);
         }
         buf.extend_from_slice(&chunk[..n]);
         if buf.len() > 1_048_576 {
-            return Ok(None); // 1 MiB header guard
+            return Ok(ReadOutcome::Closed); // 1 MiB header guard
         }
     };
 
@@ -581,6 +649,11 @@ fn read_request(
         }
     }
 
+    // Reject oversized bodies before reading them (DoS guard, SPEC §7).
+    if content_length > MAX_BODY_BYTES {
+        return Ok(ReadOutcome::TooLarge);
+    }
+
     let body_start = header_end + 4;
     let mut body = buf[body_start..].to_vec();
     while body.len() < content_length {
@@ -589,13 +662,16 @@ fn read_request(
             break;
         }
         body.extend_from_slice(&chunk[..n]);
+        if body.len() > MAX_BODY_BYTES {
+            return Ok(ReadOutcome::TooLarge);
+        }
     }
     body.truncate(content_length);
-    Ok(Some((
+    Ok(ReadOutcome::Request {
         method,
         path,
-        String::from_utf8_lossy(&body).into_owned(),
-    )))
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
 }
 
 fn write_response(
@@ -607,6 +683,7 @@ fn write_response(
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Payload Too Large",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Error",
@@ -708,6 +785,114 @@ mod tests {
     fn test_build_models_response_empty_is_valid() {
         let body = build_models_response(&[]);
         assert_eq!(body, "{\"object\":\"list\",\"data\":[]}");
+    }
+
+    #[test]
+    fn test_build_error_response_envelope() {
+        // SPEC §3.5: nested {"error":{"message","type"}}, escaped.
+        let body = build_error_response("bad \"thing\"", "invalid_request_error");
+        assert_eq!(
+            body,
+            "{\"error\":{\"message\":\"bad \\\"thing\\\"\",\"type\":\"invalid_request_error\"}}"
+        );
+    }
+
+    #[test]
+    fn test_response_includes_created() {
+        let resp = CompletionResponse {
+            content: "hi".into(),
+            model: "m".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        assert!(build_openai_response(&resp, "local").contains("\"created\":"));
+        assert!(build_openai_chunk("hi", "local", None).contains("\"created\":"));
+    }
+
+    /// Send `raw_request` to a one-shot server backed by `proxy`; return
+    /// (status_code, body) of the HTTP response.
+    fn roundtrip(proxy: Proxy, raw_request: String) -> (u16, String) {
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(raw_request.as_bytes()).unwrap();
+            c.shutdown(Shutdown::Write).ok();
+            let mut resp = String::new();
+            c.read_to_string(&mut resp).unwrap();
+            resp
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        proxy.handle_connection(&mut server).unwrap();
+        drop(server);
+        let resp = client.join().unwrap();
+        let status = resp
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
+    fn http_post(path: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn test_roundtrip_chat_ok_has_created_and_route() {
+        let log = tmp_log();
+        let p = proxy_with(true, true, 100, &log);
+        let req = http_post(
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let (status, body) = roundtrip(p, req);
+        assert_eq!(status, 200);
+        assert!(body.contains("\"created\":"), "{body}");
+        assert!(body.contains("\"x_pasture_route\":\"local\""), "{body}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn test_roundtrip_bad_json_is_400_envelope() {
+        let p = proxy_with(true, true, 100, "unused");
+        let (status, body) = roundtrip(p, http_post("/v1/chat/completions", "{not json"));
+        assert_eq!(status, 400);
+        assert!(body.contains("\"error\":{"), "{body}");
+        assert!(
+            body.contains("\"type\":\"invalid_request_error\""),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_oversized_body_is_413() {
+        let p = proxy_with(true, true, 100, "unused");
+        // Declare a Content-Length far beyond MAX_BODY_BYTES; no body sent.
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let (status, body) = roundtrip(p, req);
+        assert_eq!(status, 413);
+        assert!(
+            body.contains("\"type\":\"invalid_request_error\""),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_unknown_path_is_404_envelope() {
+        let p = proxy_with(true, true, 100, "unused");
+        let (status, body) = roundtrip(p, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n".to_string());
+        assert_eq!(status, 404);
+        assert!(body.contains("\"error\":{"), "{body}");
     }
 
     /// Backend that fails with a transient error `fail_n` times, then succeeds.

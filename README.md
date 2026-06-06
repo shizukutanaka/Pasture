@@ -67,6 +67,8 @@ base_url = http://127.0.0.1:8645/v1
 - `GET /health` — liveness check.
 
 The response includes an `x_pasture_route` field telling you which way the request went.
+Errors use the OpenAI envelope `{"error":{"message","type"}}`. The full API/routing
+contract is specified in **[SPEC.md](SPEC.md)**.
 
 ## Configuration
 
