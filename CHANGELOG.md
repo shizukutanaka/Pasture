@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 Format follows Keep a Changelog; versioning follows SemVer.
 
+## [Unreleased]
+
+### Added — API-surface parity & tool-aware routing
+- `GET /v1/models` (IMP-8): OpenAI-compatible list of the configured local (and
+  cloud) model ids. Many clients probe this on connect; it previously 404'd. Purely
+  additive, std-only. New `build_models_response` + `Proxy::with_models` (de-dups,
+  drops empties), unit-tested; empty list still returns a valid `{"object":"list",…}`.
+- Tool/function-calling awareness (IMP-10): requests with a non-empty
+  `tools`/`functions` array are detected in `parse_request` and treated as a hard
+  routing signal, escalating to cloud where tool use is reliable. Gated by the same
+  `code_to_cloud` rule and still overridden by privacy (sensitive stays local).
+  Fields pass through unchanged. New `RoutingEngine::decide_full`; deterministic,
+  std-only. Tests: tool detection, cloud escalation, privacy precedence, rule-off.
+- Grounded in the peer/API-surface and routing analysis (COMPETITIVE.md / RESEARCH.md).
+
 ## [0.26.0] - 2026-06-05
 
 ### Changed — concurrent proxy (throughput)

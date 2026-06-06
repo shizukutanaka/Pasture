@@ -516,6 +516,7 @@ mod tests {
                 content: "hi".to_string(),
             }],
             stream: false,
+            has_tools: false,
         }
     }
 

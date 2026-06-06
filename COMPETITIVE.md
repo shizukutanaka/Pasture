@@ -99,11 +99,11 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 
 ### Tier 1 — Low-risk API parity, fits the philosophy (std-only)
 
-#### IMP-8 — `/v1/models` and `/v1/embeddings` endpoints
-- **What:** Add `GET /v1/models` (return the configured local + cloud model ids in
-  OpenAI list shape) and `POST /v1/embeddings` (pass through to the local backend's
-  embeddings endpoint). Today `proxy.rs` serves only `/v1/chat/completions` and
-  `/health` (`proxy.rs:319`, `:334`).
+#### IMP-8 — `/v1/models` and `/v1/embeddings` endpoints  — `/v1/models` ✅ SHIPPED
+- **What:** `GET /v1/models` (return the configured local + cloud model ids in
+  OpenAI list shape) is **implemented** (ADR-030; `build_models_response` +
+  `Proxy::with_models`). `POST /v1/embeddings` (pass through to the local backend's
+  embeddings endpoint) remains the follow-up.
 - **Why:** Many OpenAI clients probe `/v1/models` on connect and **fail or hide
   Pasture** when it 404s; `/v1/embeddings` is the most-requested non-chat call.
   Pure API-surface parity, no routing logic.
@@ -123,13 +123,14 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 - **arXiv:** — (reliability).
 - **Effort:** S–M · **Risk:** low · **Zero-dep default?** ✅ (std-only timers/loops).
 
-#### IMP-10 — Tool / function-calling awareness
-- **What:** Detect `tools` / `functions` / `tool_choice` in the request, treat their
-  presence as a **hard signal** (escalate to cloud, where tool-use is reliable), and
-  pass the fields through unchanged on both routes.
-- **Why:** These fields are currently unparsed, so a tool-calling request can be
-  routed to a small local model that ignores them → broken agentic clients. Reuses
-  the existing `add_hard_signal` step in `routing.rs`.
+#### IMP-10 — Tool / function-calling awareness  — ✅ SHIPPED
+- **What:** **Implemented** (ADR-031). A non-empty `tools`/`functions` array is
+  detected in `parse_request` and treated as a **hard signal** (escalate to cloud,
+  where tool-use is reliable) via `RoutingEngine::decide_full`; the fields pass
+  through unchanged. Privacy still wins (sensitive stays local) and the signal is
+  gated by the `code_to_cloud` rule.
+- **Why:** These fields were previously unparsed, so a tool-calling request could be
+  routed to a small local model that ignores them → broken agentic clients.
 - **Peer:** LiteLLM, Portkey, OpenRouter.
 - **arXiv:** 2603.04445 (difficulty paradigm); 2602.02823 (reasoning-aware).
 - **Effort:** S · **Risk:** low–med (must pass fields through faithfully) ·

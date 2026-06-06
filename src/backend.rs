@@ -26,6 +26,10 @@ pub struct CompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
     pub stream: bool,
+    /// True when the request carries tool/function-calling fields
+    /// (`tools` / `functions` / a non-"none" `tool_choice`). Used as a hard
+    /// routing signal — tool use is reliable on the stronger model (IMP-10).
+    pub has_tools: bool,
 }
 
 impl CompletionRequest {
@@ -543,6 +547,7 @@ mod tests {
                 },
             ],
             stream: false,
+            has_tools: false,
         }
     }
 

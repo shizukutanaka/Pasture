@@ -263,6 +263,20 @@ impl RoutingEngine {
         forced: Option<Route>,
         sensitive: bool,
     ) -> Result<Decision, RoutingError> {
+        self.decide_full(text, forced, sensitive, false)
+    }
+
+    /// Decide routing with full context: the sensitivity flag plus whether the
+    /// request carries tool/function-calling fields (IMP-10). Tool use is a
+    /// hard signal — it escalates to cloud alongside the content-based signals
+    /// (and, like them, is gated by the `code_to_cloud` rule).
+    pub fn decide_full(
+        &self,
+        text: &str,
+        forced: Option<Route>,
+        sensitive: bool,
+        has_tools: bool,
+    ) -> Result<Decision, RoutingError> {
         if sensitive && !self.allow_sensitive_cloud {
             return if self.local_available {
                 Ok(Decision {
@@ -296,7 +310,10 @@ impl RoutingEngine {
         }
 
         if self.code_to_cloud {
-            let signals = hard_signals(text);
+            let mut signals = hard_signals(text);
+            if has_tools {
+                signals.push("tools");
+            }
             if !signals.is_empty() {
                 return Ok(Decision {
                     route: Route::Cloud,
@@ -383,6 +400,35 @@ mod tests {
     #[test]
     fn test_decide_short_query_goes_local() {
         let d = both().decide("hello", None).unwrap();
+        assert_eq!(d.route, Route::Local);
+    }
+
+    #[test]
+    fn test_tools_escalate_to_cloud() {
+        // IMP-10: tool/function calling is a hard signal even for a short prompt.
+        let d = both().decide_full("hi", None, false, true).unwrap();
+        assert_eq!(d.route, Route::Cloud);
+        assert!(d.reason.contains("tools"), "reason was: {}", d.reason);
+    }
+
+    #[test]
+    fn test_no_tools_short_stays_local() {
+        let d = both().decide_full("hi", None, false, false).unwrap();
+        assert_eq!(d.route, Route::Local);
+    }
+
+    #[test]
+    fn test_tools_do_not_override_privacy() {
+        // Privacy wins over the tools signal: sensitive stays local (IMP-3).
+        let d = both().decide_full("secret", None, true, true).unwrap();
+        assert_eq!(d.route, Route::Local);
+    }
+
+    #[test]
+    fn test_tools_respect_code_to_cloud_disabled() {
+        // With the hard-signal rule off, tools no longer force cloud.
+        let e = both().with_code_to_cloud(false);
+        let d = e.decide_full("hi", None, false, true).unwrap();
         assert_eq!(d.route, Route::Local);
     }
 

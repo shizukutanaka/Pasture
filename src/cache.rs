@@ -83,6 +83,7 @@ mod tests {
                 content: content.to_string(),
             }],
             stream: false,
+            has_tools: false,
         }
     }
 

@@ -53,6 +53,9 @@ pub struct Proxy {
     cascade: bool,
     cascade_logprob_threshold: f64,
     cache: Option<std::sync::Mutex<crate::cache::ResponseCache>>,
+    /// Model ids advertised on `GET /v1/models` (IMP-8). Clients commonly probe
+    /// this endpoint on connect; an empty list still returns a valid response.
+    models: Vec<String>,
 }
 
 impl Proxy {
@@ -70,7 +73,21 @@ impl Proxy {
             cascade: false,
             cascade_logprob_threshold: -1.0,
             cache: None,
+            models: Vec::new(),
         }
+    }
+
+    /// Advertise the given model ids on `GET /v1/models` (IMP-8). Duplicates
+    /// and empties are dropped so the list is clean.
+    pub fn with_models(mut self, models: Vec<String>) -> Self {
+        let mut seen = Vec::new();
+        for m in models {
+            if !m.is_empty() && !seen.contains(&m) {
+                seen.push(m);
+            }
+        }
+        self.models = seen;
+        self
     }
 
     /// Enable FrugalGPT-style cascade (try local, escalate on low confidence).
@@ -128,17 +145,29 @@ impl Proxy {
         if parsed.is_empty() {
             return Err(ProxyError::BadRequest("no messages provided".to_string()));
         }
+        // Tool/function-calling presence is a hard routing signal (IMP-10):
+        // a non-empty `tools` or `functions` array means the client expects
+        // reliable tool use, which the stronger (cloud) model handles best.
+        let non_empty_array = |key: &str| {
+            v.get(key)
+                .and_then(JsonValue::as_array)
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        };
+        let has_tools = non_empty_array("tools") || non_empty_array("functions");
         Ok(CompletionRequest {
             model,
             messages: parsed,
             stream,
+            has_tools,
         })
     }
 
     /// Classify, then decide routing (keeps sensitive content local).
     /// Returns the decision and whether the content was sensitive.
-    fn classify_and_decide(&self, text: &str) -> Result<(Decision, bool), ProxyError> {
-        let report = crate::privacy::classify(text);
+    fn classify_and_decide(&self, req: &CompletionRequest) -> Result<(Decision, bool), ProxyError> {
+        let text = req.routing_text();
+        let report = crate::privacy::classify(&text);
         let sensitive = report.is_sensitive();
         if sensitive {
             eprintln!(
@@ -148,7 +177,7 @@ impl Proxy {
         }
         let decision = self
             .engine
-            .decide_with_sensitivity(text, None, sensitive)
+            .decide_full(&text, None, sensitive, req.has_tools)
             .map_err(|e| ProxyError::Routing(e.to_string()))?;
         Ok((decision, sensitive))
     }
@@ -183,7 +212,7 @@ impl Proxy {
         &self,
         req: &CompletionRequest,
     ) -> Result<(CompletionResponse, &'static str, Option<f64>), ProxyError> {
-        let (decision, sensitive) = self.classify_and_decide(&req.routing_text())?;
+        let (decision, sensitive) = self.classify_and_decide(req)?;
 
         // Exact-match cache (never for sensitive content; I5).
         let cache_key = if !sensitive {
@@ -264,7 +293,7 @@ impl Proxy {
             .unwrap_or(4)
             .clamp(2, 32);
         eprintln!(
-            "pasture: listening on http://{addr} ({workers} workers, POST /v1/chat/completions)"
+            "pasture: listening on http://{addr} ({workers} workers, POST /v1/chat/completions, GET /v1/models)"
         );
 
         let proxy = Arc::new(self);
@@ -331,6 +360,8 @@ impl Proxy {
                     write_response(stream, e.status(), &payload)?;
                 }
             }
+        } else if method == "GET" && path.starts_with("/v1/models") {
+            write_response(stream, 200, &build_models_response(&self.models))?;
         } else if method == "GET" && path.starts_with("/health") {
             write_response(stream, 200, "{\"status\":\"ok\"}")?;
         } else {
@@ -354,7 +385,7 @@ impl Proxy {
         sock: &mut std::net::TcpStream,
         req: &CompletionRequest,
     ) -> std::io::Result<()> {
-        let decision = match self.classify_and_decide(&req.routing_text()) {
+        let decision = match self.classify_and_decide(req) {
             Ok((d, _)) => d,
             Err(e) => {
                 let payload = format!("{{\"error\":\"{}\"}}", escape_string(e.message()));
@@ -400,6 +431,21 @@ impl Proxy {
         }
         sock.write_all(b"data: [DONE]\n\n")
     }
+}
+
+/// Build an OpenAI-compatible `GET /v1/models` list response (IMP-8).
+/// Each model id is emitted as an `object: "model"` entry owned by "pasture".
+pub fn build_models_response(models: &[String]) -> String {
+    let entries: Vec<String> = models
+        .iter()
+        .map(|m| {
+            format!(
+                "{{\"id\":\"{}\",\"object\":\"model\",\"owned_by\":\"pasture\"}}",
+                escape_string(m)
+            )
+        })
+        .collect();
+    format!("{{\"object\":\"list\",\"data\":[{}]}}", entries.join(","))
 }
 
 /// Build an OpenAI-compatible chat-completion response JSON string.
@@ -554,6 +600,54 @@ mod tests {
         assert_eq!(req.model, "m");
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].content, "hi");
+    }
+
+    #[test]
+    fn test_parse_request_detects_tools() {
+        // IMP-10: a non-empty tools/functions array sets has_tools.
+        let with_tools = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#;
+        assert!(Proxy::parse_request(with_tools).unwrap().has_tools);
+        let with_functions = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"functions":[{"name":"f"}]}"#;
+        assert!(Proxy::parse_request(with_functions).unwrap().has_tools);
+        let empty_tools = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[]}"#;
+        assert!(!Proxy::parse_request(empty_tools).unwrap().has_tools);
+        let no_tools = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        assert!(!Proxy::parse_request(no_tools).unwrap().has_tools);
+    }
+
+    #[test]
+    fn test_handle_chat_with_tools_goes_cloud() {
+        // IMP-10: even a short prompt routes to cloud when tools are present.
+        let log = tmp_log();
+        let p = proxy_with(true, true, 100, &log);
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#;
+        let resp = p.handle_chat(body).unwrap();
+        assert!(resp.contains("\"x_pasture_route\":\"cloud\""));
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn test_build_models_response_shape() {
+        // IMP-8: OpenAI-compatible list shape, de-duplicated and non-empty.
+        let p = proxy_with(true, false, 100, "unused").with_models(vec![
+            "llama3".into(),
+            "llama3".into(),
+            "".into(),
+            "gpt-4o-mini".into(),
+        ]);
+        let body = build_models_response(&p.models);
+        assert!(body.starts_with("{\"object\":\"list\",\"data\":["));
+        assert!(body.contains("\"id\":\"llama3\""));
+        assert!(body.contains("\"id\":\"gpt-4o-mini\""));
+        assert!(body.contains("\"object\":\"model\""));
+        // de-duplicated llama3, dropped empty -> exactly two entries.
+        assert_eq!(body.matches("\"object\":\"model\"").count(), 2);
+    }
+
+    #[test]
+    fn test_build_models_response_empty_is_valid() {
+        let body = build_models_response(&[]);
+        assert_eq!(body, "{\"object\":\"list\",\"data\":[]}");
     }
 
     #[test]

@@ -366,6 +366,7 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
                 content: text.to_string(),
             }],
             stream: false,
+            has_tools: false,
         };
         return match backend.complete(&req) {
             Ok(resp) => {
@@ -388,6 +389,7 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
             content: text.to_string(),
         }],
         stream: true,
+        has_tools: false,
     };
     use std::io::Write as _;
     let mut out = std::io::stdout();
@@ -931,6 +933,7 @@ fn chat_request(model: &str, text: &str) -> CompletionRequest {
             content: text.to_string(),
         }],
         stream: false,
+        has_tools: false,
     }
 }
 
@@ -970,10 +973,16 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
             config.cache_size
         );
     }
+    // Advertise the configured model ids on GET /v1/models (IMP-8).
+    let mut models = vec![config.local_model.clone()];
+    if cloud.is_some() {
+        models.push(config.cloud_model.clone());
+    }
     let proxy = Proxy::new(engine, local, cloud, &config.cost_log_path)
         .with_cascade(config.cascade)
         .with_cascade_logprob(config.cascade_logprob_threshold)
-        .with_cache(config.cache_size);
+        .with_cache(config.cache_size)
+        .with_models(models);
     print!(
         "{}",
         crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])

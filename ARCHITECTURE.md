@@ -193,3 +193,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   `sync_channel`. Bounded (not unbounded `spawn`) so a connection flood applies
   backpressure instead of exhausting threads/memory. The cache mutex already
   made shared state safe; backends are `Send + Sync`. Stays zero-dependency.
+- **ADR-030 `/v1/models` endpoint (IMP-8).** Many OpenAI-compatible clients probe
+  `GET /v1/models` on connect and fail or hide the server when it 404s. The proxy
+  now answers with an OpenAI-shaped list of the configured local (and cloud) model
+  ids. Purely additive — no routing behaviour changes — and std-only. Grounded in
+  the peer/API-surface gap analysis (COMPETITIVE.md, RESEARCH.md cat.7).
+- **ADR-031 Tool/function-calling as a hard signal (IMP-10).** A request carrying a
+  non-empty `tools`/`functions` array means the client expects reliable tool use,
+  which the stronger (cloud) model handles best. `parse_request` detects it and
+  `decide_full` treats it as a hard signal alongside the content-based ones — gated
+  by the same `code_to_cloud` rule, and still overridden by privacy (sensitive stays
+  local). The fields are passed through unchanged. Deterministic and std-only.

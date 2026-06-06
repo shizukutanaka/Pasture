@@ -62,6 +62,8 @@ base_url = http://127.0.0.1:8645/v1
 ### Endpoints
 
 - `POST /v1/chat/completions` — routed chat completion. Supports `"stream": true` (SSE).
+  Requests carrying `tools`/`functions` are treated as a hard signal and escalate to cloud.
+- `GET /v1/models` — list the configured local (and cloud) model ids, OpenAI-compatible.
 - `GET /health` — liveness check.
 
 The response includes an `x_pasture_route` field telling you which way the request went.
