@@ -204,3 +204,11 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   `decide_full` treats it as a hard signal alongside the content-based ones — gated
   by the same `code_to_cloud` rule, and still overridden by privacy (sensitive stays
   local). The fields are passed through unchanged. Deterministic and std-only.
+- **ADR-032 Cloud retry + local fallback (IMP-9).** A single transient cloud error
+  (timeout, connection reset, provider 5xx) previously failed the request or silently
+  dropped to a weaker local answer only on the cascade path. The cloud backend now
+  classifies 5xx as `Transport` (retryable) vs 4xx as `Protocol` (not); a pure
+  `complete_with_retry` retries retryable failures with exponential backoff
+  (`PASTURE_CLOUD_RETRY`, default 2), and on final failure falls back to local when a
+  local backend exists rather than erroring. The retry decision is unit-tested with a
+  flaky mock (no sleeps); std-only, and the cloud HTTPS path stays feature-gated.

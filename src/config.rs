@@ -21,6 +21,8 @@ pub struct Config {
     pub cache_size: usize,
     pub threshold: Option<usize>,
     pub cascade_logprob_threshold: f64,
+    /// Cloud transient-failure retry count before falling back to local (IMP-9).
+    pub cloud_retry: u32,
 }
 
 impl Default for Config {
@@ -43,6 +45,7 @@ impl Default for Config {
             cache_size: 0,
             threshold: None,
             cascade_logprob_threshold: -1.0,
+            cloud_retry: 2,
         }
     }
 }
@@ -128,6 +131,11 @@ impl Config {
                 self.cascade_logprob_threshold = n;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_CLOUD_RETRY") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.cloud_retry = n;
+            }
+        }
         self
     }
 
@@ -162,6 +170,11 @@ impl Config {
             "cascade_logprob_threshold" => {
                 if let Ok(n) = val.parse::<f64>() {
                     self.cascade_logprob_threshold = n;
+                }
+            }
+            "cloud_retry" => {
+                if let Ok(n) = val.parse::<u32>() {
+                    self.cloud_retry = n;
                 }
             }
             _ => {}

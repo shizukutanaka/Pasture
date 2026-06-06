@@ -18,6 +18,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
   std-only. Tests: tool detection, cloud escalation, privacy precedence, rule-off.
 - Grounded in the peer/API-surface and routing analysis (COMPETITIVE.md / RESEARCH.md).
 
+### Added — cloud resilience (IMP-9)
+- Cloud requests now retry transient failures (connection/timeout, and provider
+  **5xx**, newly classified as retryable `Transport` vs non-retryable 4xx) with
+  exponential backoff (`PASTURE_CLOUD_RETRY`, default 2), and on final failure fall
+  back to the local backend when available instead of erroring the request. New pure
+  `complete_with_retry` + `is_retryable` + `http_status_error`, unit-tested with a
+  flaky mock (no sleeps). std-only; the HTTPS path stays behind the `cloud` feature.
+
 ## [0.26.0] - 2026-06-05
 
 ### Changed — concurrent proxy (throughput)

@@ -4,7 +4,9 @@
 //! so it is unit-tested with mock backends. `serve` adds a minimal blocking
 //! HTTP/1.1 server loop over `std::net` (plain HTTP, localhost).
 
-use crate::backend::{Backend, CompletionRequest, CompletionResponse, Message};
+use crate::backend::{
+    is_retryable, Backend, BackendError, CompletionRequest, CompletionResponse, Message,
+};
 use crate::cost::CostRecord;
 use crate::json::{escape_string, parse, JsonValue};
 use crate::routing::{Decision, Route, RoutingEngine};
@@ -56,7 +58,13 @@ pub struct Proxy {
     /// Model ids advertised on `GET /v1/models` (IMP-8). Clients commonly probe
     /// this endpoint on connect; an empty list still returns a valid response.
     models: Vec<String>,
+    /// Number of times to retry a transient cloud failure before falling back
+    /// to local (IMP-9). 0 disables retries (a single attempt).
+    cloud_retry: u32,
 }
+
+/// Base backoff (doubled each attempt) for cloud retries (IMP-9).
+const CLOUD_RETRY_BASE_MS: u64 = 200;
 
 impl Proxy {
     pub fn new(
@@ -74,7 +82,15 @@ impl Proxy {
             cascade_logprob_threshold: -1.0,
             cache: None,
             models: Vec::new(),
+            cloud_retry: 0,
         }
+    }
+
+    /// Retry a transient cloud failure up to `n` times (exponential backoff)
+    /// before falling back to local (IMP-9).
+    pub fn with_cloud_retry(mut self, n: u32) -> Self {
+        self.cloud_retry = n;
+        self
     }
 
     /// Advertise the given model ids on `GET /v1/models` (IMP-8). Duplicates
@@ -246,13 +262,30 @@ impl Proxy {
                 self.cascade_logprob_threshold,
             ) {
                 let cloud = self.backend_for(Route::Cloud)?;
-                match cloud.complete(req) {
+                match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
                     Ok(cloud_resp) => (cloud_resp, Route::Cloud, confidence),
                     // Cloud failed: fall back to the local answer rather than error.
                     Err(_) => (local_resp, Route::Local, confidence),
                 }
             } else {
                 (local_resp, Route::Local, confidence)
+            }
+        } else if decision.route == Route::Cloud {
+            // Cloud route: retry transient failures, then fall back to local if
+            // one is available rather than erroring the request (IMP-9).
+            let cloud = self.backend_for(Route::Cloud)?;
+            match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
+                Ok(resp) => (resp, Route::Cloud, None),
+                Err(e) => match self.local.as_deref() {
+                    Some(local) => {
+                        eprintln!("pasture: cloud failed ({e}); falling back to local");
+                        let resp = local
+                            .complete(req)
+                            .map_err(|e| ProxyError::Backend(e.to_string()))?;
+                        (resp, Route::Local, None)
+                    }
+                    None => return Err(ProxyError::Backend(e.to_string())),
+                },
             }
         } else {
             let backend = self.backend_for(decision.route)?;
@@ -430,6 +463,33 @@ impl Proxy {
             }
         }
         sock.write_all(b"data: [DONE]\n\n")
+    }
+}
+
+/// Attempt a completion, retrying transient failures with exponential backoff
+/// (IMP-9). Non-retryable errors (protocol/auth) return immediately. A
+/// `base_delay_ms` of 0 skips sleeping — used by tests to stay fast.
+fn complete_with_retry(
+    backend: &dyn Backend,
+    req: &CompletionRequest,
+    retries: u32,
+    base_delay_ms: u64,
+) -> Result<CompletionResponse, BackendError> {
+    let mut attempt = 0u32;
+    loop {
+        match backend.complete(req) {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                if attempt >= retries || !is_retryable(&e) {
+                    return Err(e);
+                }
+                if base_delay_ms > 0 {
+                    let backoff = base_delay_ms.saturating_mul(1u64 << attempt.min(16));
+                    std::thread::sleep(std::time::Duration::from_millis(backoff));
+                }
+                attempt += 1;
+            }
+        }
     }
 }
 
@@ -648,6 +708,91 @@ mod tests {
     fn test_build_models_response_empty_is_valid() {
         let body = build_models_response(&[]);
         assert_eq!(body, "{\"object\":\"list\",\"data\":[]}");
+    }
+
+    /// Backend that fails with a transient error `fail_n` times, then succeeds.
+    struct FlakyBackend {
+        remaining: std::sync::atomic::AtomicU32,
+        attempts: std::sync::atomic::AtomicU32,
+        retryable: bool,
+    }
+    impl FlakyBackend {
+        fn new(fail_n: u32, retryable: bool) -> Self {
+            Self {
+                remaining: std::sync::atomic::AtomicU32::new(fail_n),
+                attempts: std::sync::atomic::AtomicU32::new(0),
+                retryable,
+            }
+        }
+    }
+    impl Backend for FlakyBackend {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
+            use std::sync::atomic::Ordering;
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.remaining.load(Ordering::SeqCst) > 0 {
+                self.remaining.fetch_sub(1, Ordering::SeqCst);
+                return Err(if self.retryable {
+                    BackendError::Transport("temporary".into())
+                } else {
+                    BackendError::Protocol("permanent".into())
+                });
+            }
+            Ok(CompletionResponse {
+                content: "cloud-ok".into(),
+                model: "flaky".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+    }
+
+    #[test]
+    fn test_retry_succeeds_after_transient() {
+        let b = FlakyBackend::new(2, true);
+        let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        let resp = complete_with_retry(&b, &req, 3, 0).unwrap();
+        assert_eq!(resp.content, "cloud-ok");
+        assert_eq!(b.attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_retry_gives_up_after_limit() {
+        let b = FlakyBackend::new(5, true);
+        let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert!(complete_with_retry(&b, &req, 2, 0).is_err());
+        // 1 initial + 2 retries = 3 attempts.
+        assert_eq!(b.attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_retry_skips_non_retryable() {
+        let b = FlakyBackend::new(1, false); // Protocol error -> not retryable
+        let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert!(complete_with_retry(&b, &req, 5, 0).is_err());
+        assert_eq!(b.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_cloud_failure_falls_back_to_local() {
+        // IMP-9: a persistently failing cloud falls back to the local answer.
+        let log = tmp_log();
+        let engine = RoutingEngine::new(100, true, true);
+        let proxy = Proxy::new(
+            engine,
+            Some(Box::new(MockBackend::new("local", "local-reply"))),
+            Some(Box::new(FlakyBackend::new(99, true))), // always fails (transient)
+            &log,
+        )
+        .with_cloud_retry(0); // no backoff sleeps in the test
+                              // tools force the cloud route (IMP-10); cloud fails -> fall back to local.
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#;
+        let resp = proxy.handle_chat(body).unwrap();
+        assert!(resp.contains("\"x_pasture_route\":\"local\""));
+        assert!(resp.contains("local-reply"));
+        let _ = std::fs::remove_file(&log);
     }
 
     #[test]

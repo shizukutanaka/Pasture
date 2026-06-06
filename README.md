@@ -79,6 +79,7 @@ Defaults are sensible; override via environment variables:
 | `PASTURE_OLLAMA_PORT` | `11434` | local Ollama port |
 | `PASTURE_LOCAL_MODEL` | `llama3` | local model name |
 | `PASTURE_COST_LOG` | `pasture-cost.jsonl` | cost log path |
+| `PASTURE_CLOUD_RETRY` | `2` | retry transient cloud failures (5xx/timeouts) this many times, then fall back to local |
 
 The local backend talks to [Ollama](https://ollama.com) over plain HTTP. GPU acceleration (CUDA/Metal/ROCm) is handled by Ollama; Pasture writes no GPU code itself.
 

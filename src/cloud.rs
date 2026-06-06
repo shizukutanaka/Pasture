@@ -226,6 +226,17 @@ impl Provider {
     }
 }
 
+/// Map a non-2xx HTTP status to a backend error. A 5xx is a server-side,
+/// typically transient failure → `Transport` (retryable, IMP-9); other codes
+/// (e.g. 4xx auth/bad-request) are not retryable → `Protocol`.
+pub fn http_status_error(status: u16, message: String) -> BackendError {
+    if (500..600).contains(&status) {
+        BackendError::Transport(message)
+    } else {
+        BackendError::Protocol(message)
+    }
+}
+
 /// Read an HTTP SSE response from `reader`, invoking `on_delta` for each text
 /// delta as it arrives, and return the assembled content. Provider-agnostic and
 /// transport-agnostic (works over any `Read`, so the same logic is unit-tested
@@ -268,7 +279,10 @@ pub fn read_sse_body<R: std::io::Read>(
         let mut rest = pending;
         let _ = reader.read_to_end(&mut rest);
         let snippet: String = String::from_utf8_lossy(&rest).chars().take(200).collect();
-        return Err(BackendError::Protocol(format!("HTTP {status}: {snippet}")));
+        return Err(http_status_error(
+            status,
+            format!("HTTP {status}: {snippet}"),
+        ));
     }
 
     let mut content = String::new();
@@ -433,7 +447,10 @@ mod transport {
             let (status, resp_body) = parse_http_response(&raw)?;
             if !(200..300).contains(&status) {
                 let snippet: String = resp_body.chars().take(200).collect();
-                return Err(BackendError::Protocol(format!("HTTP {status}: {snippet}")));
+                return Err(http_status_error(
+                    status,
+                    format!("HTTP {status}: {snippet}"),
+                ));
             }
             let (content, prompt_tokens, completion_tokens) =
                 self.provider.parse_response(&resp_body)?;
@@ -680,6 +697,25 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
         let err = read_sse_body(&mut cur, Provider::OpenAI, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("401"), "{err}");
+    }
+
+    #[test]
+    fn test_http_status_error_5xx_is_retryable() {
+        use crate::backend::is_retryable;
+        // 5xx -> Transport (retryable, IMP-9); 4xx -> Protocol (not).
+        assert!(is_retryable(&http_status_error(503, "x".into())));
+        assert!(is_retryable(&http_status_error(500, "x".into())));
+        assert!(!is_retryable(&http_status_error(401, "x".into())));
+        assert!(!is_retryable(&http_status_error(400, "x".into())));
+    }
+
+    #[test]
+    fn test_read_sse_body_5xx_is_transport() {
+        use crate::backend::is_retryable;
+        let resp = "HTTP/1.1 503 Service Unavailable\r\n\r\n{\"error\":\"busy\"}";
+        let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
+        let err = read_sse_body(&mut cur, Provider::OpenAI, &mut |_| {}).unwrap_err();
+        assert!(is_retryable(&err), "503 should be retryable: {err}");
     }
 
     #[test]

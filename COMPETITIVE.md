@@ -112,10 +112,11 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 - **Effort:** S · **Risk:** low · **Zero-dep default?** ✅ (std-only; embeddings
   proxy reuses the existing local-HTTP path).
 
-#### IMP-9 — Cloud transient-error retry + provider fallback chain
-- **What:** On a cloud 5xx/timeout/connection error, retry with bounded exponential
-  backoff; optionally fall through an ordered provider list before giving up. Keep
-  the existing "cloud failure → local answer" as the final safety net.
+#### IMP-9 — Cloud transient-error retry + provider fallback chain  — retry+fallback ✅ SHIPPED
+- **What:** **Implemented** (ADR-032). On a cloud 5xx/timeout/connection error, retry
+  with bounded exponential backoff (`PASTURE_CLOUD_RETRY`, default 2), then fall back
+  to the local backend when available. 5xx is now classified retryable; 4xx is not.
+  The **multi-provider** fallback chain (ordered cloud providers) remains the follow-up.
 - **Why:** Today a single transient cloud hiccup silently degrades a cloud-routed
   request to the weaker local model (`cascade`/`backend` paths), which is invisible
   to the user and hurts quality. Robustness, not new routing.

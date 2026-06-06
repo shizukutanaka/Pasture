@@ -75,6 +75,13 @@ impl std::fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// Whether a backend failure is worth retrying (IMP-9). Transport/IO failures
+/// are typically transient (timeouts, connection resets, 5xx); protocol errors
+/// and unsupported-build errors are not — retrying them just wastes time.
+pub fn is_retryable(err: &BackendError) -> bool {
+    matches!(err, BackendError::Transport(_))
+}
+
 /// An inference backend.
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
