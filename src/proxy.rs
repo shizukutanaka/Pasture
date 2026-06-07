@@ -5,7 +5,8 @@
 //! HTTP/1.1 server loop over `std::net` (plain HTTP, localhost).
 
 use crate::backend::{
-    is_retryable, Backend, BackendError, CompletionRequest, CompletionResponse, Message,
+    is_retryable, Backend, BackendError, CompletionRequest, CompletionResponse, EmbeddingsResponse,
+    Message,
 };
 use crate::cost::CostRecord;
 use crate::json::{escape_string, parse, JsonValue};
@@ -323,6 +324,55 @@ impl Proxy {
         Ok(build_openai_response(&resp, label))
     }
 
+    /// Handle `POST /v1/embeddings` (IMP-8). Inputs are embedded by the **local**
+    /// backend (embeddings stay on the machine — privacy/local-first); without a
+    /// local backend this is a `503`.
+    pub fn handle_embeddings(&self, body: &str) -> Result<String, ProxyError> {
+        let inputs = Self::parse_embeddings_request(body)?;
+        let local = self
+            .local
+            .as_deref()
+            .ok_or_else(|| ProxyError::Routing("no local backend for embeddings".to_string()))?;
+        let resp = local
+            .embeddings(&inputs)
+            .map_err(|e| ProxyError::Backend(e.to_string()))?;
+        Ok(build_embeddings_response(&resp))
+    }
+
+    /// Parse an OpenAI embeddings `input`: a string or an array of strings.
+    fn parse_embeddings_request(body: &str) -> Result<Vec<String>, ProxyError> {
+        let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
+        let input = v
+            .get("input")
+            .ok_or_else(|| ProxyError::BadRequest("missing 'input'".to_string()))?;
+        let inputs = match input {
+            JsonValue::Str(s) => vec![s.clone()],
+            JsonValue::Array(a) => {
+                let mut out = Vec::with_capacity(a.len());
+                for item in a {
+                    match item.as_str() {
+                        Some(s) => out.push(s.to_string()),
+                        None => {
+                            return Err(ProxyError::BadRequest(
+                                "'input' array must contain strings".to_string(),
+                            ))
+                        }
+                    }
+                }
+                out
+            }
+            _ => {
+                return Err(ProxyError::BadRequest(
+                    "'input' must be a string or array of strings".to_string(),
+                ))
+            }
+        };
+        if inputs.is_empty() {
+            return Err(ProxyError::BadRequest("empty 'input'".to_string()));
+        }
+        Ok(inputs)
+    }
+
     /// Run the blocking HTTP server until the process is stopped.
     /// Serve requests concurrently with a bounded worker pool. Each connection
     /// is handled on a worker thread; the accept loop feeds a bounded queue so a
@@ -410,6 +460,17 @@ impl Proxy {
                         )?;
                     }
                 },
+                Err(e) => {
+                    write_response(
+                        stream,
+                        e.status(),
+                        &build_error_response(e.message(), e.kind()),
+                    )?;
+                }
+            }
+        } else if method == "POST" && path.starts_with("/v1/embeddings") {
+            match self.handle_embeddings(&body) {
+                Ok(resp) => write_response(stream, 200, &resp)?,
                 Err(e) => {
                     write_response(
                         stream,
@@ -556,6 +617,43 @@ pub fn build_models_response(models: &[String]) -> String {
         })
         .collect();
     format!("{{\"object\":\"list\",\"data\":[{}]}}", entries.join(","))
+}
+
+/// Format a float vector as a JSON array (finite values; non-finite → 0).
+fn fmt_float_array(v: &[f64]) -> String {
+    let nums: Vec<String> = v
+        .iter()
+        .map(|x| {
+            if x.is_finite() {
+                format!("{x}")
+            } else {
+                "0".to_string()
+            }
+        })
+        .collect();
+    format!("[{}]", nums.join(","))
+}
+
+/// Build an OpenAI-compatible `POST /v1/embeddings` response (IMP-8).
+pub fn build_embeddings_response(resp: &EmbeddingsResponse) -> String {
+    let data: Vec<String> = resp
+        .vectors
+        .iter()
+        .enumerate()
+        .map(|(i, vec)| {
+            format!(
+                "{{\"object\":\"embedding\",\"index\":{i},\"embedding\":{}}}",
+                fmt_float_array(vec)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"object\":\"list\",\"data\":[{}],\"model\":\"{}\",\"usage\":{{\"prompt_tokens\":{},\"total_tokens\":{}}}}}",
+        data.join(","),
+        escape_string(&resp.model),
+        resp.prompt_tokens,
+        resp.prompt_tokens
+    )
 }
 
 /// Build an OpenAI-compatible chat-completion response JSON string.
@@ -893,6 +991,64 @@ mod tests {
         let (status, body) = roundtrip(p, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n".to_string());
         assert_eq!(status, 404);
         assert!(body.contains("\"error\":{"), "{body}");
+    }
+
+    #[test]
+    fn test_parse_embeddings_string_and_array() {
+        assert_eq!(
+            Proxy::parse_embeddings_request(r#"{"input":"hello"}"#).unwrap(),
+            vec!["hello".to_string()]
+        );
+        assert_eq!(
+            Proxy::parse_embeddings_request(r#"{"input":["a","bb"]}"#).unwrap(),
+            vec!["a".to_string(), "bb".to_string()]
+        );
+        assert!(Proxy::parse_embeddings_request(r#"{"model":"m"}"#).is_err());
+        assert!(Proxy::parse_embeddings_request(r#"{"input":[1,2]}"#).is_err());
+        assert!(Proxy::parse_embeddings_request(r#"{"input":[]}"#).is_err());
+    }
+
+    #[test]
+    fn test_build_embeddings_response_shape() {
+        let resp = EmbeddingsResponse {
+            model: "m".into(),
+            vectors: vec![vec![0.5, 1.0], vec![2.0, 3.0]],
+            prompt_tokens: 4,
+        };
+        let body = build_embeddings_response(&resp);
+        assert!(body.starts_with("{\"object\":\"list\",\"data\":["));
+        assert!(body.contains("\"embedding\":[0.5,1]"), "{body}");
+        assert!(body.contains("\"index\":1"), "{body}");
+        assert!(body.contains("\"model\":\"m\""), "{body}");
+        assert!(body.contains("\"total_tokens\":4"), "{body}");
+    }
+
+    #[test]
+    fn test_handle_embeddings_local() {
+        // Mock embeddings return [char_count, 0.0]; "hello"=5, "hi"=2.
+        let p = proxy_with(true, false, 100, "unused");
+        let body = p.handle_embeddings(r#"{"input":["hello","hi"]}"#).unwrap();
+        assert!(body.contains("\"embedding\":[5,0]"), "{body}");
+        assert!(body.contains("\"embedding\":[2,0]"), "{body}");
+    }
+
+    #[test]
+    fn test_handle_embeddings_no_local_is_503() {
+        let p = proxy_with(false, true, 100, "unused");
+        assert_eq!(
+            p.handle_embeddings(r#"{"input":"x"}"#)
+                .unwrap_err()
+                .status(),
+            503
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_embeddings_ok() {
+        let p = proxy_with(true, true, 100, "unused");
+        let (status, body) = roundtrip(p, http_post("/v1/embeddings", r#"{"input":"hello"}"#));
+        assert_eq!(status, 200);
+        assert!(body.contains("\"object\":\"embedding\""), "{body}");
     }
 
     /// Backend that fails with a transient error `fail_n` times, then succeeds.

@@ -221,3 +221,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-034 `POST /v1/embeddings` pass-through (IMP-8 completion).** Several clients
+  (including LlamaIndex, LangChain, and semantic-cache implementations) call
+  `/v1/embeddings` before or alongside chat. The proxy now routes this to the local
+  backend only — Ollama `/api/embed` or the OpenAI-compat `/v1/embeddings` sibling —
+  and returns the standard OpenAI embeddings shape. Cloud escalation is not applied
+  (embeddings are local-only; grounded in IMP-12 semantic-cache infra, RESEARCH.md
+  cat.3). A new `Backend::embeddings` trait method (default = `Unsupported`) keeps
+  the `MockBackend` deterministic (char-count vectors); `OllamaBackend` and
+  `OpenAiCompatBackend` implement it. `handle_embeddings`, `parse_embeddings_request`,
+  `build_embeddings_response`, and `fmt_float_array` (finite-safe) live in `proxy.rs`.
+  Std-only, zero new dependencies. SPEC.md §3.2b now normative for this endpoint.

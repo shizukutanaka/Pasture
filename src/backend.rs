@@ -52,6 +52,42 @@ pub struct CompletionResponse {
     pub completion_tokens: u64,
 }
 
+/// Embedding vectors for one or more inputs, plus token accounting (IMP-8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingsResponse {
+    pub model: String,
+    pub vectors: Vec<Vec<f64>>,
+    pub prompt_tokens: u64,
+}
+
+/// Extract a `Vec<f64>` from a JSON array of numbers (non-numbers dropped).
+fn json_f64_vec(v: &JsonValue) -> Option<Vec<f64>> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(JsonValue::as_f64).collect())
+}
+
+/// Map an OpenAI-compatible chat path to its sibling embeddings path
+/// (`…/chat/completions` → `…/embeddings`), defaulting to `/v1/embeddings`.
+fn embeddings_path(chat_path: &str) -> String {
+    match chat_path.strip_suffix("/chat/completions") {
+        Some(base) => format!("{base}/embeddings"),
+        None => "/v1/embeddings".to_string(),
+    }
+}
+
+/// Build an embeddings request body: `{"model":..,"input":[strings]}`.
+fn embeddings_body(model: &str, inputs: &[String]) -> String {
+    let arr: Vec<String> = inputs
+        .iter()
+        .map(|s| format!("\"{}\"", escape_string(s)))
+        .collect();
+    format!(
+        "{{\"model\":\"{}\",\"input\":[{}]}}",
+        escape_string(model),
+        arr.join(",")
+    )
+}
+
 /// Why a backend could not produce a completion.
 #[derive(Debug)]
 pub enum BackendError {
@@ -113,6 +149,14 @@ pub trait Backend: Send + Sync {
     ) -> Result<(CompletionResponse, Option<f64>), BackendError> {
         Ok((self.complete(req)?, None))
     }
+
+    /// Produce embeddings for `inputs` (IMP-8). Default: unsupported — backends
+    /// that expose an embeddings endpoint override this.
+    fn embeddings(&self, _inputs: &[String]) -> Result<EmbeddingsResponse, BackendError> {
+        Err(BackendError::Unsupported(
+            "embeddings not supported by this backend".to_string(),
+        ))
+    }
 }
 
 /// A parsed line from an Ollama streaming response.
@@ -169,6 +213,19 @@ impl Backend for MockBackend {
             model: req.model.clone(),
             prompt_tokens,
             completion_tokens: crate::routing::estimate_tokens(&self.reply) as u64,
+        })
+    }
+
+    fn embeddings(&self, inputs: &[String]) -> Result<EmbeddingsResponse, BackendError> {
+        // Deterministic stand-in vectors for tests: [char_count, 0.0] per input.
+        let vectors = inputs
+            .iter()
+            .map(|s| vec![s.chars().count() as f64, 0.0])
+            .collect();
+        Ok(EmbeddingsResponse {
+            model: self.name.clone(),
+            vectors,
+            prompt_tokens: inputs.len() as u64,
         })
     }
 }
@@ -284,6 +341,38 @@ impl Backend for OllamaBackend {
             model: self.model.clone(),
             prompt_tokens,
             completion_tokens,
+        })
+    }
+
+    fn embeddings(&self, inputs: &[String]) -> Result<EmbeddingsResponse, BackendError> {
+        // Ollama `/api/embed`: {"model","input":[..]} -> {"embeddings":[[..]]}.
+        let body = embeddings_body(&self.model, inputs);
+        let resp = http_post(
+            &self.host,
+            self.port,
+            "/api/embed",
+            &body,
+            Duration::from_secs(120),
+        )?;
+        let v = parse(&resp).map_err(|e| BackendError::Protocol(e.to_string()))?;
+        let vectors: Vec<Vec<f64>> = v
+            .get("embeddings")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| BackendError::Protocol("missing embeddings".to_string()))?
+            .iter()
+            .filter_map(json_f64_vec)
+            .collect();
+        if vectors.is_empty() {
+            return Err(BackendError::Protocol("empty embeddings".to_string()));
+        }
+        let prompt_tokens = inputs
+            .iter()
+            .map(|s| crate::routing::estimate_tokens(s) as u64)
+            .sum();
+        Ok(EmbeddingsResponse {
+            model: self.model.clone(),
+            vectors,
+            prompt_tokens,
         })
     }
 }
@@ -426,6 +515,47 @@ impl Backend for OpenAiCompatBackend {
             model: self.model.clone(),
             prompt_tokens,
             completion_tokens,
+        })
+    }
+
+    fn embeddings(&self, inputs: &[String]) -> Result<EmbeddingsResponse, BackendError> {
+        // OpenAI-compatible `/v1/embeddings`: {"data":[{"embedding":[..]},..]}.
+        let path = embeddings_path(&self.path);
+        let body = embeddings_body(&self.model, inputs);
+        let resp = http_post(
+            &self.host,
+            self.port,
+            &path,
+            &body,
+            Duration::from_secs(120),
+        )?;
+        let v = parse(&resp).map_err(|e| BackendError::Protocol(e.to_string()))?;
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| err.as_str())
+                .unwrap_or("unknown error");
+            return Err(BackendError::Protocol(format!("server error: {msg}")));
+        }
+        let vectors: Vec<Vec<f64>> = v
+            .get("data")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| BackendError::Protocol("missing data[]".to_string()))?
+            .iter()
+            .filter_map(|d| d.get("embedding").and_then(json_f64_vec))
+            .collect();
+        if vectors.is_empty() {
+            return Err(BackendError::Protocol("empty embeddings".to_string()));
+        }
+        let prompt_tokens = inputs
+            .iter()
+            .map(|s| crate::routing::estimate_tokens(s) as u64)
+            .sum();
+        Ok(EmbeddingsResponse {
+            model: self.model.clone(),
+            vectors,
+            prompt_tokens,
         })
     }
 }

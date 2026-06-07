@@ -10,6 +10,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
   cloud) model ids. Many clients probe this on connect; it previously 404'd. Purely
   additive, std-only. New `build_models_response` + `Proxy::with_models` (de-dups,
   drops empties), unit-tested; empty list still returns a valid `{"object":"list",…}`.
+- **`POST /v1/embeddings` (IMP-8 completion, ADR-034):** clients such as LlamaIndex,
+  LangChain, and semantic-cache implementations call this endpoint; it now routes to
+  the local backend (Ollama `/api/embed` or OpenAI-compat `/v1/embeddings`) and
+  returns the standard OpenAI embeddings shape. Cloud escalation does not apply.
+  New `Backend::embeddings` trait method with `Ollama` + `OpenAiCompat` impls and a
+  deterministic `MockBackend`; `handle_embeddings`, `parse_embeddings_request`,
+  `build_embeddings_response`, `fmt_float_array` (finite-safe) in `proxy.rs`.
+  Std-only, zero new dependencies. SPEC.md §3.2b is now normative for this endpoint.
 - Tool/function-calling awareness (IMP-10): requests with a non-empty
   `tools`/`functions` array are detected in `parse_request` and treated as a hard
   routing signal, escalating to cloud where tool use is reliable. Gated by the same

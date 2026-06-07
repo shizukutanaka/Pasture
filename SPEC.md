@@ -87,6 +87,21 @@ Success (non-stream): `200`, body is an OpenAI `chat.completion` object containi
 listing the configured local (and, if enabled, cloud) model ids; de-duplicated. An
 empty list is still valid (IMP-8).
 
+### 3.2b `POST /v1/embeddings`
+Request body: `{"model":<string>,"input":<string|string[]>}`. `input` MUST be a
+non-empty string or a non-empty array of non-empty strings. Missing or invalid
+`input` ⇒ `400`.
+
+Success: `200`, OpenAI embeddings shape:
+`{"object":"list","data":[{"object":"embedding","index":<n>,"embedding":[…]}…],`
+`"model":<string>,"usage":{"prompt_tokens":<n>,"total_tokens":<n>}}`.
+
+Routing: embeddings are forwarded to the **local backend only** (Ollama `/api/embed`
+or OpenAI-compat `/v1/embeddings`). Cloud escalation does not apply. If no local
+backend is reachable the proxy returns `502` with the OpenAI error envelope (§3.5).
+Privacy rules do not apply to embeddings (the vector is returned to the caller, not
+logged). Implemented by `handle_embeddings` (IMP-8 completion).
+
 ### 3.3 `GET /health`
 `200`, `{"status":"ok"}`.
 
@@ -228,9 +243,9 @@ or via `PASTURE_LANG`. A test enforces EN/JA key parity.
 ## 12. Conformance & gaps
 
 **Satisfied by the current implementation:** §2 CLI; §3.1–3.3 (incl. `/v1/models`,
-IMP-8); §4 routing incl. tools (IMP-10); §5 privacy; §6 cascade/cache/backends incl.
-cloud retry+fallback (IMP-9); §8 config; §9 cost log; §10 eval; §11 i18n; §7 header
-cap + parser depth.
+IMP-8) **+ §3.2b `/v1/embeddings` (IMP-8 completion, ADR-034)**; §4 routing incl.
+tools (IMP-10); §5 privacy; §6 cascade/cache/backends incl. cloud retry+fallback
+(IMP-9); §8 config; §9 cost log; §10 eval; §11 i18n; §7 header cap + parser depth.
 
 **Gaps closed in this round (to satisfy this spec):**
 - **§3.5 error envelope.** Errors now emit `{"error":{"message,type}}` (were flat
@@ -239,9 +254,12 @@ cap + parser depth.
   `created` timestamp.
 - **§7 body cap.** `read_request` now rejects oversized bodies with `413`
   (`MAX_BODY_BYTES`), closing the unbounded-body DoS (IMP-21, partial).
+- **§3.2b `POST /v1/embeddings`.** Local-backend embeddings pass-through now
+  implemented: `Backend::embeddings` trait method, `OllamaBackend` + `OpenAiCompatBackend`
+  implementations, `handle_embeddings` in the proxy, `parse_embeddings_request` +
+  `build_embeddings_response` + `fmt_float_array` helpers (ADR-034).
 
 **Deferred (tracked in COMPETITIVE.md / RESEARCH.md):**
-- `POST /v1/embeddings` pass-through (IMP-8 remainder) — needs a backend-trait method.
 - `tool_choice` is not separately inspected (only `tools`/`functions` arrays).
 - Multi-provider cloud fallback chain (IMP-9 remainder); auth + rate-limit (IMP-15);
   live metrics endpoint (IMP-16); semantic cache (IMP-12); calibrated-uncertainty
