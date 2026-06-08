@@ -151,6 +151,7 @@ All error responses MUST use the OpenAI envelope:
 |-----------|-------:|--------|
 | malformed request / bad JSON / missing messages | `400` | `invalid_request_error` |
 | missing/invalid bearer token when auth is enabled (§7) | `401` | `invalid_request_error` |
+| a socket read times out before the request completes (§7) | `408` | `invalid_request_error` |
 | request body exceeds the size cap (§7) | `413` | `invalid_request_error` |
 | rate limit exceeded when a limit is set (§7) | `429` | `rate_limit_error` |
 | unknown route/path or method | `404` | `invalid_request_error` |
@@ -238,6 +239,10 @@ false negative = data leak (unacceptable).
   (`MAX_BODY_BYTES`, 16 MiB). A `Content-Length` over the cap, or a body that grows
   past it, MUST yield `413` (not unbounded reads) — DoS hardening (IMP-21).
 - The JSON parser MUST bound recursion depth (128) (ADR-026).
+- **Connection timeout (IMP-timeout).** Each connection SHOULD have a read/write
+  timeout (`PASTURE_REQUEST_TIMEOUT`, default 30s; 0 disables) so a slow/dead client
+  cannot pin a worker (slow-loris). A read that times out before the request completes
+  yields `408`.
 - **Auth (opt-in, IMP-15).** When `PASTURE_AUTH_TOKEN` is set, every `/v1/*` request
   MUST carry `Authorization: Bearer <token>` (compared in constant time); a missing or
   wrong token yields `401`. `/health` is exempt. Default (unset) = no auth, matching the
@@ -277,6 +282,7 @@ wins). Variables:
 | `PASTURE_AUTH_TOKEN` | _(off)_ | require `Authorization: Bearer <token>` on `/v1/*` (ADR-040) |
 | `PASTURE_RATE_LIMIT` | `0` | global requests/min cap on `/v1/*` (0 = unlimited) |
 | `PASTURE_CORS_ORIGINS` | _(off)_ | CORS allow-list (comma-separated, or `*`) for browser clients (§3.6) |
+| `PASTURE_REQUEST_TIMEOUT` | `30` | per-connection read/write timeout in seconds (0 = none, §7) |
 
 ---
 

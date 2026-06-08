@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — per-connection socket timeout / slow-loris guard (IMP-timeout)
+
+- `serve` now applies a per-connection read **and** write timeout
+  (`PASTURE_REQUEST_TIMEOUT`, seconds, default `30`; `0` disables). A slow or dead
+  client previously pinned one of the bounded worker threads indefinitely; a handful
+  could exhaust the pool (slow-loris DoS). A timed-out read now returns **408** and
+  frees the worker. Continuation of the existing DoS caps (body/header/recursion).
+  std-only; 3 tests incl. a fast 50 ms timeout round-trip. Grounded in ADR-046.
+
 ### Added — `GET /v1/models/{id}` single-model retrieve (IMP-model-retrieve)
 
 - The OpenAI `models.retrieve(id)` endpoint is now served: `/v1/models/{id}` returns the

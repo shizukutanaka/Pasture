@@ -16,6 +16,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 /// Errors surfaced to the HTTP client.
 #[derive(Debug)]
@@ -142,6 +143,9 @@ pub struct Proxy {
     rate_limiter: Option<std::sync::Mutex<crate::ratelimit::RateLimiter>>,
     /// Optional CORS policy for browser clients (IMP-cors). None = no CORS headers.
     cors: Option<CorsPolicy>,
+    /// Per-connection socket read/write timeout (IMP-timeout). None = no timeout.
+    /// Guards against slow/dead clients pinning a bounded worker thread.
+    io_timeout: Option<Duration>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -170,7 +174,16 @@ impl Proxy {
             auth_token: None,
             rate_limiter: None,
             cors: None,
+            io_timeout: None,
         }
+    }
+
+    /// Set a per-connection socket read/write timeout (IMP-timeout). A slow or
+    /// dead client then frees its worker after the timeout instead of pinning it
+    /// (slow-loris guard). None disables the timeout.
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.io_timeout = timeout;
+        self
     }
 
     /// Set the CORS policy for browser clients (IMP-cors). None leaves CORS off.
@@ -713,6 +726,11 @@ impl Proxy {
     }
 
     fn handle_connection(&self, stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+        // Bound how long a slow/dead client can hold a worker (slow-loris guard).
+        if let Some(d) = self.io_timeout {
+            let _ = stream.set_read_timeout(Some(d));
+            let _ = stream.set_write_timeout(Some(d));
+        }
         let (method, path, body, auth, origin) = match read_request(stream)? {
             ReadOutcome::Request {
                 method,
@@ -725,6 +743,11 @@ impl Proxy {
                 let payload =
                     build_error_response("request body too large", "invalid_request_error");
                 write_response(stream, 413, &payload, "")?;
+                return Ok(());
+            }
+            ReadOutcome::TimedOut => {
+                let payload = build_error_response("request timed out", "invalid_request_error");
+                write_response(stream, 408, &payload, "")?;
                 return Ok(());
             }
             ReadOutcome::Closed => {
@@ -1236,8 +1259,18 @@ enum ReadOutcome {
     },
     /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413.
     TooLarge,
+    /// A socket read timed out before the request completed → 408 (IMP-timeout).
+    TimedOut,
     /// Connection closed early or headers were malformed/oversized → 400.
     Closed,
+}
+
+/// True for an I/O error that means "no data within the read timeout window".
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome> {
@@ -1248,7 +1281,11 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
             break pos;
         }
-        let n = stream.read(&mut chunk)?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if is_timeout(&e) => return Ok(ReadOutcome::TimedOut),
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Ok(ReadOutcome::Closed);
         }
@@ -1292,7 +1329,11 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
     let body_start = header_end + 4;
     let mut body = buf[body_start..].to_vec();
     while body.len() < content_length {
-        let n = stream.read(&mut chunk)?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if is_timeout(&e) => return Ok(ReadOutcome::TimedOut),
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             break;
         }
@@ -1352,6 +1393,7 @@ fn write_response(
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         502 => "Bad Gateway",
@@ -1464,6 +1506,41 @@ mod tests {
         assert!(body.contains("\"id\":\"llama3\""), "{body}");
         assert!(body.contains("\"object\":\"model\""), "{body}");
         assert!(build_model_response(&models, "nope").is_none());
+    }
+
+    #[test]
+    fn test_is_timeout_classifies_kinds() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_timeout(&Error::from(ErrorKind::WouldBlock)));
+        assert!(is_timeout(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_timeout(&Error::from(ErrorKind::BrokenPipe)));
+    }
+
+    #[test]
+    fn test_roundtrip_slow_client_times_out_408() {
+        // A client that opens a connection and sends an incomplete request must
+        // not pin the worker: with a short timeout the server responds 408.
+        let p = proxy_with(true, false, 100, "unused")
+            .with_request_timeout(Some(std::time::Duration::from_millis(50)));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            // Partial request: headers never terminate.
+            c.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n")
+                .unwrap();
+            // Hold the connection open past the server's read timeout.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let mut resp = String::new();
+            let _ = c.read_to_string(&mut resp);
+            resp
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        p.handle_connection(&mut s).unwrap();
+        drop(s);
+        let resp = client.join().unwrap();
+        assert!(resp.contains("408"), "expected 408 timeout, got: {resp}");
     }
 
     #[test]

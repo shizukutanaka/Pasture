@@ -38,6 +38,8 @@ pub struct Config {
     pub rate_limit: u32,
     /// CORS allowed origins (comma-separated, or `*`). Empty = CORS disabled.
     pub cors_origins: String,
+    /// Per-connection socket read/write timeout in seconds (0 = no timeout).
+    pub request_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -68,6 +70,7 @@ impl Default for Config {
             auth_token: None,
             rate_limit: 0,
             cors_origins: String::new(),
+            request_timeout_secs: 30,
         }
     }
 }
@@ -185,6 +188,11 @@ impl Config {
         if let Ok(v) = std::env::var("PASTURE_CORS_ORIGINS") {
             self.cors_origins = v;
         }
+        if let Ok(v) = std::env::var("PASTURE_REQUEST_TIMEOUT") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.request_timeout_secs = n;
+            }
+        }
         self
     }
 
@@ -245,6 +253,11 @@ impl Config {
                 }
             }
             "cors_origins" => self.cors_origins = val.to_string(),
+            "request_timeout" => {
+                if let Ok(n) = val.parse::<u64>() {
+                    self.request_timeout_secs = n;
+                }
+            }
             _ => {}
         }
     }
@@ -280,5 +293,12 @@ mod tests {
     fn test_parse_invalid_port_keeps_default() {
         let cfg = Config::from_str_with_defaults("ollama_port = notaport");
         assert_eq!(cfg.ollama_port, 11434);
+    }
+
+    #[test]
+    fn test_request_timeout_default_and_parse() {
+        assert_eq!(Config::default().request_timeout_secs, 30);
+        let cfg = Config::from_str_with_defaults("request_timeout = 5");
+        assert_eq!(cfg.request_timeout_secs, 5);
     }
 }

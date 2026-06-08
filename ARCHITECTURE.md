@@ -221,6 +221,15 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-046 Per-connection socket timeout (IMP-timeout).** `read_request` had no
+  timeout, so a slow or dead client could hold one of the bounded worker threads
+  (2..=32) indefinitely — a handful of such connections exhaust the pool and deny
+  service (slow-loris). `serve` now sets a per-connection read **and** write timeout
+  (`PASTURE_REQUEST_TIMEOUT`, default 30s; 0 disables), and a read that times out maps to
+  a `408` response (`ReadOutcome::TimedOut`) rather than propagating, freeing the worker.
+  A natural continuation of the existing DoS caps (body 16 MiB, header 1 MiB, parser
+  depth 128, rate-limit). std-only `TcpStream` timeouts; 3 tests including a fast 50 ms
+  timeout round-trip against an incomplete request.
 - **ADR-045 `GET /v1/models/{id}` (IMP-model-retrieve).** The OpenAI SDK's
   `models.retrieve(id)` and some client validation flows hit the single-model endpoint;
   Pasture served only the list, and `/v1/models/{id}` fell through to it via

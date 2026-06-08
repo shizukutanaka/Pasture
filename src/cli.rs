@@ -1081,7 +1081,12 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         .with_inject_context(config.inject_context)
         .with_auth_token(config.auth_token.clone())
         .with_rate_limit(config.rate_limit)
-        .with_cors(cors);
+        .with_cors(cors)
+        .with_request_timeout(if config.request_timeout_secs > 0 {
+            Some(std::time::Duration::from_secs(config.request_timeout_secs))
+        } else {
+            None
+        });
     print!(
         "{}",
         crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])
