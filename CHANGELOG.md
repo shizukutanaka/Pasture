@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `HEAD /health` and `/v1/engines` alias (IMP-compat-methods)
+
+- `HEAD /health` is now accepted alongside `GET /health`. The response carries
+  the same headers (including the correct `Content-Length` for the body the GET
+  would return) with no response body, as required by RFC 7231 §4.3.2. Monitoring
+  tools that prefer HEAD for liveness checks now work. 1 test.
+- `GET /v1/engines[/{id}]` is now an alias for `GET /v1/models[/{id}]`. The
+  OpenAI v1 "engines" path was deprecated but is still used by old SDK versions
+  and some LLM clients; aliasing it avoids 404 errors during model discovery. 2 tests.
+
 ### Added — HTTP/1.1 keep-alive connection reuse (IMP-keepalive)
 
 - The server now supports HTTP/1.1 persistent connections: a single worker thread

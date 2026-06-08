@@ -221,6 +221,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-051 `HEAD /health` and `/v1/engines` alias (IMP-compat-methods).**
+  (1) `HEAD /health`: accepted alongside `GET`; response has identical headers —
+  including `Content-Length` set to the GET body length — but no body (RFC 7231
+  §4.3.2). Required by monitoring tools that use HEAD for liveness probes.
+  `write_head_response` helper keeps the logic DRY. 1 test.
+  (2) `/v1/engines[/{id}]` aliased to `/v1/models[/{id}]` in the dispatch
+  handler; the deprecated OpenAI "engines" path is still used by old SDK versions
+  and some LLM clients; aliasing avoids 404 during model discovery. 2 tests.
 - **ADR-050 HTTP/1.1 keep-alive connection reuse (IMP-keepalive).** The thread-pool
   server previously closed the TCP connection after every request (HTTP/1.0 style),
   forcing clients to re-connect for each call — one round-trip per request. The

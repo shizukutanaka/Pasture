@@ -852,9 +852,17 @@ impl Proxy {
                         return Ok(());
                     }
                 }
-            } else if method == "GET" && path.starts_with("/v1/models") {
+            } else if method == "GET"
+                && (path.starts_with("/v1/models") || path.starts_with("/v1/engines"))
+            {
                 // `/v1/models` lists; `/v1/models/{id}` retrieves a single model.
-                let rest = &path["/v1/models".len()..];
+                // `/v1/engines[/{id}]` is the deprecated OpenAI v1 path — alias to /v1/models.
+                let strip_prefix = if path.starts_with("/v1/engines") {
+                    "/v1/engines"
+                } else {
+                    "/v1/models"
+                };
+                let rest = &path[strip_prefix.len()..];
                 if let Some(after) = rest.strip_prefix('/') {
                     let id = after
                         .split('?')
@@ -886,8 +894,14 @@ impl Proxy {
                         keep_alive,
                     )?;
                 }
-            } else if method == "GET" && path.starts_with("/health") {
-                write_response(stream, 200, "{\"status\":\"ok\"}", &cors, keep_alive)?;
+            } else if (method == "GET" || method == "HEAD") && path.starts_with("/health") {
+                // HEAD: identical headers to GET but no body (RFC 7231 §4.3.2).
+                const HEALTH_BODY: &str = "{\"status\":\"ok\"}";
+                if method == "HEAD" {
+                    write_head_response(stream, 200, HEALTH_BODY.len(), &cors, keep_alive)?;
+                } else {
+                    write_response(stream, 200, HEALTH_BODY, &cors, keep_alive)?;
+                }
             } else {
                 write_response(
                     stream,
@@ -1491,6 +1505,22 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Write a HEAD-only response (headers identical to the GET equivalent, no body).
+/// `content_length` is the body size the equivalent GET would return (RFC 7231 §4.3.2).
+fn write_head_response(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    content_length: usize,
+    extra: &str,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: {conn}\r\n{extra}\r\n"
+    );
+    stream.write_all(response.as_bytes())
+}
+
 /// Write an HTTP/1.1 response. `extra` is a block of additional header lines
 /// (each already terminated with `\r\n`, e.g. CORS headers) or empty.
 /// `keep_alive` controls the `Connection:` header value.
@@ -1765,6 +1795,63 @@ mod tests {
             resp.contains("Connection: close"),
             "HTTP/1.0 without keep-alive header should close: {resp}"
         );
+    }
+
+    #[test]
+    fn test_head_health_returns_200_no_body() {
+        let p = proxy_with(true, false, 100, "unused");
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"HEAD /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            c.shutdown(Shutdown::Write).ok();
+            let mut r = String::new();
+            c.read_to_string(&mut r).unwrap();
+            r
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        p.handle_connection(&mut server).unwrap();
+        drop(server);
+        let resp = client.join().unwrap();
+        // Must be 200, Content-Length must match GET body size, body must be absent.
+        assert!(resp.starts_with("HTTP/1.1 200"), "status: {resp}");
+        let clen: usize = resp
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            clen,
+            "{\"status\":\"ok\"}".len(),
+            "Content-Length must match GET body"
+        );
+        // Body must be empty (headers end at first \r\n\r\n; nothing follows).
+        let body = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
+        assert!(body.is_empty(), "HEAD must have no body: {body:?}");
+    }
+
+    #[test]
+    fn test_v1_engines_alias_lists_models() {
+        let p = proxy_with(true, false, 100, "unused").with_models(vec!["llama3".into()]);
+        let (status, body) = roundtrip(p, "GET /v1/engines HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 200);
+        assert!(body.contains("\"object\":\"list\""), "{body}");
+        assert!(body.contains("llama3"), "{body}");
+    }
+
+    #[test]
+    fn test_v1_engines_retrieve_alias() {
+        let p = proxy_with(true, false, 100, "unused").with_models(vec!["llama3".into()]);
+        let (status, body) = roundtrip(p, "GET /v1/engines/llama3 HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 200);
+        let v = crate::json::parse(&body).unwrap();
+        assert_eq!(v.get("id").and_then(|x| x.as_str()), Some("llama3"));
     }
 
     #[test]
