@@ -5,3 +5,5 @@
 # ...except the curated, PII-free self-improvement ledger (IMP-13).
 !IMPROVEMENTS.jsonl
 .env
+# Test artifact: some unit tests use "unused" as a throwaway cost-log path.
+/unused
