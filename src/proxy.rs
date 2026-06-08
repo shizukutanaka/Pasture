@@ -261,12 +261,23 @@ impl Proxy {
         self
     }
 
+    /// Build a stub `POST /v1/moderations` response: all categories false, all
+    /// scores zero. Pasture does not run content moderation; the stub lets clients
+    /// that call `/v1/moderations` unconditionally continue without error.
+    fn handle_moderations(body: &str) -> Result<String, ProxyError> {
+        let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
+        // Accept "input" as string or array; ignore the value (stub always passes).
+        let _has_input = v.get("input").is_some();
+        Ok(build_moderations_response())
+    }
+
     /// Return the `Allow:` header value for a known route so the caller can
     /// send 405 Method Not Allowed. Returns `None` for unknown paths (→ 404).
     fn route_allowed_methods(path: &str) -> Option<&'static str> {
         if path.starts_with("/v1/chat/completions")
             || path.starts_with("/v1/completions")
             || path.starts_with("/v1/embeddings")
+            || path.starts_with("/v1/moderations")
         {
             Some("POST, OPTIONS")
         } else if path.starts_with("/v1/stats") {
@@ -434,6 +445,18 @@ impl Proxy {
             .unwrap_or(false);
         let has_tools =
             non_empty_array("tools") || non_empty_array("functions") || tool_choice_active;
+        // "n" must be 1 (or absent). Pasture always returns exactly one
+        // completion per request; n > 1 would silently return fewer than
+        // requested, so we reject it with a clear error.
+        let n = v
+            .get("n")
+            .and_then(JsonValue::as_f64)
+            .unwrap_or(1.0) as i64;
+        if n != 1 {
+            return Err(ProxyError::BadRequest(format!(
+                "'n' must be 1; got {n} (Pasture returns exactly one completion per request)"
+            )));
+        }
         let sampling = Self::parse_sampling(&v);
         Ok(CompletionRequest {
             model,
@@ -713,14 +736,20 @@ impl Proxy {
         let records = crate::cost::read_log(&self.cost_log_path)
             .map_err(|e| ProxyError::Backend(e.to_string()))?;
         let summary = crate::cost::summarize(&records);
-        // Live hit/miss counters from the in-memory cache (independent of the log).
-        let (live_hits, live_misses) = self
+        // Live hit/miss counters + size/capacity from the in-memory cache.
+        let (live_hits, live_misses, cache_size, cache_cap) = self
             .cache
             .as_ref()
             .and_then(|m| m.lock().ok())
-            .map(|g| (g.hits(), g.misses()))
-            .unwrap_or((0, 0));
-        Ok(build_stats_response(&summary, live_hits, live_misses))
+            .map(|g| (g.hits(), g.misses(), g.len(), g.cap()))
+            .unwrap_or((0, 0, 0, 0));
+        Ok(build_stats_response(
+            &summary,
+            live_hits,
+            live_misses,
+            cache_size,
+            cache_cap,
+        ))
     }
 
     /// Parse a legacy `POST /v1/completions` request (text-completion format).
@@ -1022,6 +1051,23 @@ impl Proxy {
                 }
             } else if method == "POST" && path.starts_with("/v1/embeddings") {
                 match self.handle_embeddings(&body) {
+                    Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
+                    Err(e) => {
+                        write_response(
+                            stream,
+                            e.status(),
+                            &build_error_response(e.message(), e.kind()),
+                            &extra,
+                            false,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            } else if method == "POST" && path.starts_with("/v1/moderations") {
+                // Stub: always marks content as safe. Pasture does not run real
+                // moderation; the stub prevents SDK clients that call this endpoint
+                // unconditionally from receiving a 404.
+                match Self::handle_moderations(&body) {
                     Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
                     Err(e) => {
                         write_response(
@@ -1431,12 +1477,15 @@ pub fn build_stats_response(
     s: &crate::cost::CostSummary,
     cache_hits: u64,
     cache_misses: u64,
+    cache_size: usize,
+    cache_cap: usize,
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
     format!(
         "{{\"object\":\"pasture.stats\",\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
 \"cloud_rate\":{},\"cache_rate\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\
-\"cloud_cost_usd\":{},\"cache_hits\":{cache_hits},\"cache_misses\":{cache_misses}}}",
+\"cloud_cost_usd\":{},\"cache_hits\":{cache_hits},\"cache_misses\":{cache_misses},\
+\"cache_size\":{cache_size},\"cache_capacity\":{cache_cap}}}",
         s.total,
         s.local,
         s.cloud,
@@ -1522,6 +1571,27 @@ pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> St
         resp.prompt_tokens,
         resp.completion_tokens,
         total,
+    )
+}
+
+/// Build a stub `/v1/moderations` response. All categories are marked safe
+/// (false / score 0). Pasture does not run content moderation; the stub prevents
+/// client SDKs that unconditionally call the moderation endpoint from erroring.
+pub fn build_moderations_response() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let id = CTR.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{{\"id\":\"modr-pasture{id:08}\",\"model\":\"text-moderation-stable\",\
+\"results\":[{{\"flagged\":false,\
+\"categories\":{{\"hate\":false,\"hate/threatening\":false,\"harassment\":false,\
+\"harassment/threatening\":false,\"self-harm\":false,\"self-harm/intent\":false,\
+\"self-harm/instructions\":false,\"sexual\":false,\"sexual/minors\":false,\"violence\":false,\
+\"violence/graphic\":false}},\
+\"category_scores\":{{\"hate\":0.0,\"hate/threatening\":0.0,\"harassment\":0.0,\
+\"harassment/threatening\":0.0,\"self-harm\":0.0,\"self-harm/intent\":0.0,\
+\"self-harm/instructions\":0.0,\"sexual\":0.0,\"sexual/minors\":0.0,\"violence\":0.0,\
+\"violence/graphic\":0.0}}}}]}}"
     )
 }
 
@@ -2397,7 +2467,7 @@ mod tests {
             completion_tokens: 50,
             cloud_cost_usd: 0.0123,
         };
-        let json = build_stats_response(&s, 7, 3);
+        let json = build_stats_response(&s, 7, 3, 5, 128);
         let v = crate::json::parse(&json).expect("valid json");
         assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
         assert_eq!(v.get("cloud").and_then(|x| x.as_f64()), Some(1.0));
@@ -2409,6 +2479,11 @@ mod tests {
         );
         assert_eq!(v.get("cache_hits").and_then(|x| x.as_f64()), Some(7.0));
         assert_eq!(v.get("cache_misses").and_then(|x| x.as_f64()), Some(3.0));
+        assert_eq!(v.get("cache_size").and_then(|x| x.as_f64()), Some(5.0));
+        assert_eq!(
+            v.get("cache_capacity").and_then(|x| x.as_f64()),
+            Some(128.0)
+        );
     }
 
     #[test]
@@ -2835,6 +2910,66 @@ mod tests {
         assert_eq!(
             status, 200,
             "application/json; charset=utf-8 should be accepted"
+        );
+    }
+
+    // ── n > 1 validation (IMP-n-validation) ───────────────────────────────────
+
+    #[test]
+    fn test_n_gt_1_returns_400() {
+        let p = proxy_with(true, false, 100, "unused");
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"n":3}"#;
+        let (status, resp) = roundtrip(p, http_post("/v1/chat/completions", body));
+        assert_eq!(status, 400, "n:3 should be 400: {resp}");
+        assert!(resp.contains("'n' must be 1"), "error message: {resp}");
+    }
+
+    #[test]
+    fn test_n_equals_1_passes() {
+        let p = proxy_with(true, false, 100, "unused");
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"n":1}"#;
+        let (status, _) = roundtrip(p, http_post("/v1/chat/completions", body));
+        assert_eq!(status, 200, "n:1 should succeed");
+    }
+
+    #[test]
+    fn test_n_absent_passes() {
+        let p = proxy_with(true, false, 100, "unused");
+        let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let (status, _) = roundtrip(p, http_post("/v1/chat/completions", body));
+        assert_eq!(status, 200, "absent n should succeed");
+    }
+
+    // ── /v1/moderations stub (IMP-moderations) ────────────────────────────────
+
+    #[test]
+    fn test_moderations_returns_200_all_false() {
+        let p = proxy_with(true, false, 100, "unused");
+        let body = r#"{"input":"test content"}"#;
+        let (status, resp) = roundtrip(p, http_post("/v1/moderations", body));
+        assert_eq!(status, 200, "body: {resp}");
+        assert!(resp.contains("\"flagged\":false"), "body: {resp}");
+        assert!(resp.contains("\"model\":\"text-moderation-stable\""), "body: {resp}");
+    }
+
+    #[test]
+    fn test_moderations_wrong_method_returns_405() {
+        let p = proxy_with(true, false, 100, "unused");
+        let (status, _) = roundtrip(p, "GET /v1/moderations HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 405);
+    }
+
+    // ── cache_size + cache_capacity in /v1/stats ──────────────────────────────
+
+    #[test]
+    fn test_stats_includes_cache_size_and_capacity() {
+        let p = proxy_with(true, true, 100, "/no/such/cost-log.jsonl");
+        let (status, body) = roundtrip(p, "GET /v1/stats HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 200);
+        assert!(body.contains("\"cache_size\":"), "missing cache_size: {body}");
+        assert!(
+            body.contains("\"cache_capacity\":"),
+            "missing cache_capacity: {body}"
         );
     }
 

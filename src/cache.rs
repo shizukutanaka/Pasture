@@ -78,6 +78,11 @@ impl ResponseCache {
         self.map.is_empty()
     }
 
+    /// Maximum number of entries this cache will hold (0 = disabled).
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
     /// Cumulative cache hits since creation (monotonically increasing).
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)

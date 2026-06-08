@@ -5,6 +5,25 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `POST /v1/moderations` stub (IMP-moderations)
+
+- Many OpenAI SDK versions call `/v1/moderations` before or after completions.
+  Pasture now accepts these requests and returns a well-formed all-categories-safe
+  response (all `false` / score `0`) in OpenAI moderation format. Pasture does
+  not run real content moderation — the stub prevents SDK breakage. 2 tests.
+
+### Changed — Reject `n > 1` with 400 Bad Request (IMP-n-validation)
+
+- Requesting `n > 1` (multiple completions) now returns **400** with a clear
+  message. Previously the extra completions were silently not returned, violating
+  the API contract. `n = 1` and absent `n` are unchanged. 3 tests.
+
+### Added — `cache_size` and `cache_capacity` in `/v1/stats` (IMP-stats-cache-size)
+
+- `GET /v1/stats` now includes `cache_size` (current entry count) and
+  `cache_capacity` (configured maximum, 0 when disabled). Enables sizing
+  `PASTURE_CACHE` without log parsing. 2 tests.
+
 ### Added — Model-pinned routing via `req.model` (IMP-model-pinning)
 
 - Requests that specify a recognised model name are now routed to the matching

@@ -221,6 +221,23 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-062 `cache_size` / `cache_capacity` in `/v1/stats` (IMP-stats-cache-size).**
+  `ResponseCache` gains a `cap()` accessor. `handle_stats` reads both `len()` and
+  `cap()` from the cache mutex. `build_stats_response` gains two extra parameters
+  and emits `cache_size` (current entry count) and `cache_capacity` (maximum).
+  Both are 0 when the cache is disabled. Enables capacity-based tuning of
+  `PASTURE_CACHE` without parsing JSONL logs. 2 tests.
+- **ADR-061 `POST /v1/moderations` stub (IMP-moderations).** Many OpenAI SDK
+  versions call `/v1/moderations` unconditionally; returning 404 breaks them
+  silently. `handle_moderations` accepts the `input` field (any value), ignores
+  it, and `build_moderations_response` returns a well-formed all-categories-safe
+  OpenAI moderation object. Dispatch arm added; 405 for wrong method. Pasture
+  does not run real content moderation — the stub is explicitly labelled. 2 tests.
+- **ADR-060 Reject `n > 1` with 400 Bad Request (IMP-n-validation).**
+  `parse_request` now reads the `n` field. If `n` is present and not 1 (including
+  negative values and zero), a `ProxyError::BadRequest` is returned with a message
+  explaining the constraint. Silently returning 1 completion when `n:3` was
+  requested violates the API contract; an explicit error is always better. 3 tests.
 - **ADR-059 Model-pinned routing (IMP-model-pinning).** Clients that specify an
   explicit model name in the request (e.g. `"model":"gpt-4o-mini"`) expect to
   reach the corresponding backend regardless of what the routing engine would
