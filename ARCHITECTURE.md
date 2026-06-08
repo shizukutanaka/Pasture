@@ -221,6 +221,21 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-072 `X-RateLimit-*` response headers (IMP-ratelimit-headers).** Pasture
+  signalled rate state only reactively (a `429` with `Retry-After`). OpenAI, Azure,
+  Anthropic and LiteLLM all expose `X-RateLimit-*` on *every* response so clients
+  self-throttle *before* hitting a `429` (confirmed by GitHub research:
+  `BerriAI/litellm`'s `OPENAI_RESPONSE_HEADERS`). `RateLimiter::snapshot()` refills
+  the bucket to now without consuming a token and returns `(limit, remaining,
+  reset_secs)`; `Proxy::ratelimit_headers()` formats `X-RateLimit-Limit-Requests`,
+  `-Remaining-Requests`, and `-Reset-Requests` (`<n>s`) and is folded into the
+  per-request `extra` header block, so every response — including the `429`, which
+  still also carries `Retry-After` — advertises the budget. Snapshotted before the
+  gate consumes the token, so `remaining` includes the in-flight request. Only the
+  *request* family is emitted: Pasture meters requests, not tokens, so token-family
+  headers would mislead. The helper returns `""` when the limiter is disabled (the
+  localhost default), so there is zero overhead and no header noise in the common
+  case. Additive, std-only; 4 tests.
 - **ADR-071 `Retry-After` on 429 rate-limit responses (IMP-retry-after).** The
   rate limiter (IMP-15) returned `429` with no `Retry-After`, so a client had to
   guess a backoff and could busy-retry against an empty bucket. `RateLimiter`

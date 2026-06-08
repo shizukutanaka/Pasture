@@ -307,6 +307,28 @@ impl Proxy {
     /// Apply rate-limit then auth gating for a request path (IMP-15). Returns
     /// `Some((status, message, type))` when the request must be rejected, else
     /// `None`. `/health` is always exempt so liveness probes work unauthenticated.
+    /// Build the `X-RateLimit-*` response header block (IMP-ratelimit-headers).
+    /// Empty when rate limiting is disabled (the localhost default) so there is
+    /// zero overhead and no header noise in the common case. When enabled, every
+    /// response advertises the request budget so clients can self-throttle
+    /// proactively instead of only reacting to a `429`. Only the *request* family
+    /// is emitted — Pasture meters requests, not tokens, so token-family headers
+    /// would be misleading.
+    fn ratelimit_headers(&self) -> String {
+        let Some(rl) = &self.rate_limiter else {
+            return String::new();
+        };
+        let Ok(mut g) = rl.lock() else {
+            return String::new();
+        };
+        let (limit, remaining, reset) = g.snapshot();
+        format!(
+            "X-RateLimit-Limit-Requests: {limit}\r\n\
+             X-RateLimit-Remaining-Requests: {remaining}\r\n\
+             X-RateLimit-Reset-Requests: {reset}s\r\n"
+        )
+    }
+
     /// The fourth tuple element is a `Retry-After` value in whole seconds, set
     /// only for a `429` so the caller can advise the client when to retry.
     fn check_gate(
@@ -1003,7 +1025,11 @@ impl Proxy {
                 .as_ref()
                 .map(|id| format!("X-Request-ID: {id}\r\n"))
                 .unwrap_or_default();
-            let extra = format!("{cors}{req_id_hdr}");
+            // X-RateLimit-* headers so clients self-throttle (empty when the
+            // limiter is disabled — the localhost default). Snapshotted before the
+            // gate consumes a token, so `remaining` includes the in-flight request.
+            let rl_hdr = self.ratelimit_headers();
+            let extra = format!("{cors}{req_id_hdr}{rl_hdr}");
             // Append X-Response-Time (elapsed ms) to every response's header block.
             // Timing begins after request parsing, just before dispatch, so it covers
             // routing + backend time but not TCP accept or header reading.
@@ -2811,6 +2837,35 @@ mod tests {
         assert!(matches!(denied.3, Some(secs) if secs >= 1));
         // /health bypasses the limiter.
         assert!(p.check_gate("/health", None).is_none());
+    }
+
+    #[test]
+    fn test_roundtrip_ratelimit_headers_present_when_enabled() {
+        let p = proxy_with(true, false, 100, "unused").with_rate_limit(10);
+        let resp = roundtrip_raw(p, "GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n".to_string());
+        assert!(
+            resp.contains("X-RateLimit-Limit-Requests: 10"),
+            "missing limit header: {resp}"
+        );
+        assert!(
+            resp.contains("X-RateLimit-Remaining-Requests:"),
+            "missing remaining header: {resp}"
+        );
+        assert!(
+            resp.contains("X-RateLimit-Reset-Requests:"),
+            "missing reset header: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_ratelimit_headers_absent_when_disabled() {
+        // Default (no rate limit): no X-RateLimit-* noise on responses.
+        let p = proxy_with(true, false, 100, "unused");
+        let resp = roundtrip_raw(p, "GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n".to_string());
+        assert!(
+            !resp.contains("X-RateLimit"),
+            "rate-limit headers should be absent when disabled: {resp}"
+        );
     }
 
     #[test]

@@ -64,6 +64,22 @@ impl RateLimiter {
         let needed = 1.0 - self.tokens;
         (needed / self.refill_per_sec).ceil().max(1.0) as u64
     }
+
+    /// Refill to now (consuming nothing) and report the state for `X-RateLimit-*`
+    /// response headers: `(limit, whole tokens remaining, seconds until reset)`.
+    /// `limit` is the per-minute request budget, `remaining` the requests that
+    /// would still be admitted right now, and `reset` the seconds until the bucket
+    /// next admits a request (0 when one is already available). Lets clients
+    /// self-throttle proactively rather than only reacting to a 429.
+    pub fn snapshot(&mut self) -> (u32, u32, u64) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        let limit = self.capacity.max(0.0) as u32;
+        let remaining = self.tokens.floor().max(0.0) as u32;
+        (limit, remaining, self.retry_after_secs())
+    }
 }
 
 #[cfg(test)]
@@ -137,5 +153,26 @@ mod tests {
         assert!(!rl.step(0.0)); // empty
         // Need one token at 0.5/sec -> 2 seconds.
         assert_eq!(rl.retry_after_secs(), 2);
+    }
+
+    #[test]
+    fn test_snapshot_full_bucket() {
+        let mut rl = RateLimiter::per_minute(10);
+        let (limit, remaining, reset) = rl.snapshot();
+        assert_eq!(limit, 10);
+        assert_eq!(remaining, 10); // full bucket, all requests available
+        assert_eq!(reset, 0); // a token is available now
+    }
+
+    #[test]
+    fn test_snapshot_empty_bucket_reports_reset() {
+        let mut rl = RateLimiter::per_minute(10); // 1 token / 6s
+        for _ in 0..10 {
+            assert!(rl.step(0.0));
+        }
+        let (limit, remaining, reset) = rl.snapshot();
+        assert_eq!(limit, 10);
+        assert_eq!(remaining, 0); // drained
+        assert!(reset >= 1, "empty bucket must report a positive reset");
     }
 }

@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `X-RateLimit-*` response headers (IMP-ratelimit-headers)
+
+- When `PASTURE_RATE_LIMIT` is set, every response now carries
+  `X-RateLimit-Limit-Requests`, `X-RateLimit-Remaining-Requests`, and
+  `X-RateLimit-Reset-Requests` (`<n>s`), so clients can self-throttle proactively
+  instead of only reacting to a `429`. Matches OpenAI / Azure / Anthropic / LiteLLM.
+  Only the request family is emitted (Pasture meters requests, not tokens). No
+  headers and zero overhead when rate limiting is disabled. Std-only; 4 tests
+  (ADR-072).
+
 ### Added — `Retry-After` header on 429 responses (IMP-retry-after)
 
 - When the rate limiter rejects a request, the `429` response now includes a
