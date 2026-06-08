@@ -973,15 +973,20 @@ impl Proxy {
                 .map(|id| format!("X-Request-ID: {id}\r\n"))
                 .unwrap_or_default();
             let extra = format!("{cors}{req_id_hdr}");
+            // Append X-Response-Time (elapsed ms) to every response's header block.
+            // Timing begins after request parsing, just before dispatch, so it covers
+            // routing + backend time but not TCP accept or header reading.
+            let t0 = std::time::Instant::now();
+            let te = || format!("{}X-Response-Time: {}ms\r\n", extra, t0.elapsed().as_millis());
             // CORS preflight: answer OPTIONS before the gate (preflight is credential-free).
             if method == "OPTIONS" {
                 match self.cors_preflight(origin.as_deref()) {
-                    Some(h) => write_response(stream, 204, "", &h, keep_alive)?,
+                    Some(h) => write_response(stream, 204, "", &format!("{}X-Response-Time: {}ms\r\n", h, t0.elapsed().as_millis()), keep_alive)?,
                     None => write_response(
                         stream,
                         404,
                         &build_error_response("not found", "invalid_request_error"),
-                        &extra,
+                        &te(),
                         keep_alive,
                     )?,
                 }
@@ -997,7 +1002,7 @@ impl Proxy {
                     stream,
                     status,
                     &build_error_response(msg, kind),
-                    &extra,
+                    &te(),
                     false,
                 )?;
                 return Ok(());
@@ -1016,7 +1021,7 @@ impl Proxy {
                                 "unsupported media type; use application/json",
                                 "invalid_request_error",
                             ),
-                            &extra,
+                            &te(),
                             false,
                         )?;
                         return Ok(());
@@ -1028,17 +1033,17 @@ impl Proxy {
                     Ok(req) if req.stream => {
                         // SSE is a long-lived stream; always close the connection afterwards.
                         let include_usage = Self::parse_include_usage(&body);
-                        self.stream_chat_to_socket(stream, &req, &extra, include_usage)?;
+                        self.stream_chat_to_socket(stream, &req, &te(), include_usage)?;
                         return Ok(());
                     }
                     Ok(req) => match self.complete_buffered(&req) {
-                        Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
+                        Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
                         Err(e) => {
                             write_response(
                                 stream,
                                 e.status(),
                                 &build_error_response(e.message(), e.kind()),
-                                &extra,
+                                &te(),
                                 false,
                             )?;
                             return Ok(());
@@ -1049,7 +1054,7 @@ impl Proxy {
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
-                            &extra,
+                            &te(),
                             false,
                         )?;
                         return Ok(());
@@ -1059,13 +1064,13 @@ impl Proxy {
                 // Legacy text-completion API shim — maps prompt→chat message,
                 // routes through the same pipeline, returns object:"text_completion".
                 match self.handle_legacy_completion(&body) {
-                    Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
+                    Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
                     Err(e) => {
                         write_response(
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
-                            &extra,
+                            &te(),
                             false,
                         )?;
                         return Ok(());
@@ -1073,13 +1078,13 @@ impl Proxy {
                 }
             } else if method == "POST" && path.starts_with("/v1/embeddings") {
                 match self.handle_embeddings(&body) {
-                    Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
+                    Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
                     Err(e) => {
                         write_response(
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
-                            &extra,
+                            &te(),
                             false,
                         )?;
                         return Ok(());
@@ -1090,13 +1095,13 @@ impl Proxy {
                 // moderation; the stub prevents SDK clients that call this endpoint
                 // unconditionally from receiving a 404.
                 match Self::handle_moderations(&body) {
-                    Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
+                    Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
                     Err(e) => {
                         write_response(
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
-                            &extra,
+                            &te(),
                             false,
                         )?;
                         return Ok(());
@@ -1104,13 +1109,13 @@ impl Proxy {
                 }
             } else if method == "GET" && path.starts_with("/v1/stats") {
                 match self.handle_stats() {
-                    Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
+                    Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
                     Err(e) => {
                         write_response(
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
-                            &extra,
+                            &te(),
                             false,
                         )?;
                         return Ok(());
@@ -1119,13 +1124,13 @@ impl Proxy {
             } else if method == "GET" && path.starts_with("/metrics") {
                 // Prometheus text-format scrape endpoint (IMP-metrics-prom).
                 match self.handle_metrics() {
-                    Ok(resp) => write_plain_response(stream, &resp, &extra, keep_alive)?,
+                    Ok(resp) => write_plain_response(stream, &resp, &te(), keep_alive)?,
                     Err(e) => {
                         write_response(
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
-                            &extra,
+                            &te(),
                             false,
                         )?;
                         return Ok(());
@@ -1149,7 +1154,7 @@ impl Proxy {
                         .unwrap_or(after)
                         .trim_end_matches('/');
                     match build_model_response(&self.models, id) {
-                        Some(b) => write_response(stream, 200, &b, &extra, keep_alive)?,
+                        Some(b) => write_response(stream, 200, &b, &te(), keep_alive)?,
                         None => {
                             write_response(
                                 stream,
@@ -1158,7 +1163,7 @@ impl Proxy {
                                     &format!("model '{id}' not found"),
                                     "invalid_request_error",
                                 ),
-                                &extra,
+                                &te(),
                                 false,
                             )?;
                             return Ok(());
@@ -1169,7 +1174,7 @@ impl Proxy {
                         stream,
                         200,
                         &build_models_response(&self.models),
-                        &extra,
+                        &te(),
                         keep_alive,
                     )?;
                 }
@@ -1177,15 +1182,15 @@ impl Proxy {
                 // HEAD: identical headers to GET but no body (RFC 7231 §4.3.2).
                 const HEALTH_BODY: &str = "{\"status\":\"ok\"}";
                 if method == "HEAD" {
-                    write_head_response(stream, 200, HEALTH_BODY.len(), &extra, keep_alive)?;
+                    write_head_response(stream, 200, HEALTH_BODY.len(), &te(), keep_alive)?;
                 } else {
-                    write_response(stream, 200, HEALTH_BODY, &extra, keep_alive)?;
+                    write_response(stream, 200, HEALTH_BODY, &te(), keep_alive)?;
                 }
             } else if let Some(allow) =
                 Self::route_allowed_methods(path.split('?').next().unwrap_or(&path))
             {
                 // Known path, wrong method → 405 with Allow header (RFC 7231 §6.5.5).
-                let method_extra = format!("Allow: {allow}\r\n{extra}");
+                let method_extra = format!("Allow: {allow}\r\n{}", te());
                 write_response(
                     stream,
                     405,
@@ -1199,7 +1204,7 @@ impl Proxy {
                     stream,
                     404,
                     &build_error_response("not found", "invalid_request_error"),
-                    &extra,
+                    &te(),
                     false,
                 )?;
                 return Ok(());
@@ -2449,6 +2454,26 @@ mod tests {
         (status, body)
     }
 
+    /// Like `roundtrip` but returns the full raw HTTP response string so tests
+    /// can inspect response headers.
+    fn roundtrip_raw(proxy: Proxy, raw_request: String) -> String {
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(raw_request.as_bytes()).unwrap();
+            c.shutdown(Shutdown::Write).ok();
+            let mut resp = String::new();
+            c.read_to_string(&mut resp).unwrap();
+            resp
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        proxy.handle_connection(&mut server).unwrap();
+        drop(server);
+        client.join().unwrap()
+    }
+
     fn http_post(path: &str, body: &str) -> String {
         format!(
             "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
@@ -3022,6 +3047,49 @@ mod tests {
         assert!(
             body.contains("\"cache_misses\":"),
             "missing cache_misses: {body}"
+        );
+    }
+
+    // ── X-Response-Time header (IMP-response-time) ─────────────────────────────
+
+    #[test]
+    fn test_response_time_header_on_success() {
+        let p = proxy_with(true, false, 100, "unused");
+        let raw = roundtrip_raw(p, "GET /health HTTP/1.1\r\nConnection: close\r\n\r\n".to_string());
+        let header_block = raw.split("\r\n\r\n").next().unwrap_or("");
+        let xrt = header_block
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("x-response-time:"));
+        assert!(xrt.is_some(), "X-Response-Time header missing from /health response:\n{raw}");
+        let val = xrt.unwrap().splitn(2, ':').nth(1).unwrap_or("").trim();
+        assert!(val.ends_with("ms"), "X-Response-Time value must end with ms, got: {val}");
+        let ms: u64 = val.trim_end_matches("ms").parse().expect("X-Response-Time not a number");
+        assert!(ms < 5000, "X-Response-Time suspiciously large: {ms}ms");
+    }
+
+    #[test]
+    fn test_response_time_header_on_error() {
+        let p = proxy_with(true, false, 100, "unused");
+        let raw = roundtrip_raw(p, "GET /no/such/route HTTP/1.1\r\nConnection: close\r\n\r\n".to_string());
+        let header_block = raw.split("\r\n\r\n").next().unwrap_or("");
+        assert!(
+            header_block.to_ascii_lowercase().contains("x-response-time:"),
+            "X-Response-Time missing from 404 error response:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn test_response_time_header_on_chat_completion() {
+        let log = tmp_log();
+        let p = proxy_with(true, false, 100, &log);
+        let raw = roundtrip_raw(p, http_post(
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        ));
+        let header_block = raw.split("\r\n\r\n").next().unwrap_or("");
+        assert!(
+            header_block.to_ascii_lowercase().contains("x-response-time:"),
+            "X-Response-Time missing from chat completions response:\n{raw}"
         );
     }
 

@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `X-Response-Time` response header (IMP-response-time)
+
+- Every HTTP response now includes `X-Response-Time: <N>ms`, measuring elapsed
+  time from request parse completion to response write. Covers all paths: success,
+  error (4xx/5xx), HEAD, streaming SSE (time-to-first-byte), and OPTIONS preflight.
+  Std-only (`std::time::Instant`); additive header, no config required; 3 tests
+  (ADR-064).
+
 ### Added — Prometheus `/metrics` endpoint (IMP-metrics-prom)
 
 - `GET /metrics` now returns Prometheus text exposition format v0.0.4 with:

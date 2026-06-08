@@ -221,6 +221,12 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-064 `X-Response-Time` header (IMP-response-time).** Operators and SDK
+  clients need per-request latency without parsing JSONL logs. `handle_connection`
+  captures `std::time::Instant::now()` after request parsing; a `te()` closure
+  appends `X-Response-Time: <N>ms\r\n` to every response's extra-header block —
+  success, error, HEAD, SSE (time-to-first-byte), and OPTIONS paths. Std-only
+  (`std::time::Instant`); additive/backward-compatible; 3 tests.
 - **ADR-063 Prometheus `/metrics` endpoint (IMP-metrics-prom).** Operators need
   a live, pull-based metrics endpoint compatible with Prometheus / Grafana without
   parsing JSONL logs. `build_metrics_response` emits Prometheus text exposition
