@@ -677,7 +677,14 @@ impl Proxy {
         let records = crate::cost::read_log(&self.cost_log_path)
             .map_err(|e| ProxyError::Backend(e.to_string()))?;
         let summary = crate::cost::summarize(&records);
-        Ok(build_stats_response(&summary))
+        // Live hit/miss counters from the in-memory cache (independent of the log).
+        let (live_hits, live_misses) = self
+            .cache
+            .as_ref()
+            .and_then(|m| m.lock().ok())
+            .map(|g| (g.hits(), g.misses()))
+            .unwrap_or((0, 0));
+        Ok(build_stats_response(&summary, live_hits, live_misses))
     }
 
     /// Parse a legacy `POST /v1/completions` request (text-completion format).
@@ -836,7 +843,7 @@ impl Proxy {
         // Safety cap: one keep-alive connection serves at most this many requests.
         const MAX_KEEPALIVE_REQUESTS: usize = 100;
         for _ in 0..MAX_KEEPALIVE_REQUESTS {
-            let (method, path, body, auth, origin, keep_alive, request_id) =
+            let (method, path, body, auth, origin, keep_alive, request_id, content_type) =
                 match read_request(stream, &mut conn_buf)? {
                     ReadOutcome::Request {
                         method,
@@ -846,7 +853,17 @@ impl Proxy {
                         origin,
                         connection_close,
                         request_id,
-                    } => (method, path, body, auth, origin, !connection_close, request_id),
+                        content_type,
+                    } => (
+                        method,
+                        path,
+                        body,
+                        auth,
+                        origin,
+                        !connection_close,
+                        request_id,
+                        content_type,
+                    ),
                     ReadOutcome::TooLarge => {
                         let payload =
                             build_error_response("request body too large", "invalid_request_error");
@@ -897,6 +914,27 @@ impl Proxy {
                     false,
                 )?;
                 return Ok(());
+            }
+            // 415 Unsupported Media Type: POST requests must carry JSON bodies.
+            // Only reject when Content-Type is explicitly set to something other
+            // than application/json (absent Content-Type is still accepted so that
+            // plain curl and minimal clients work without extra flags).
+            if method == "POST" {
+                if let Some(ct) = &content_type {
+                    if !ct.starts_with("application/json") {
+                        write_response(
+                            stream,
+                            415,
+                            &build_error_response(
+                                "unsupported media type; use application/json",
+                                "invalid_request_error",
+                            ),
+                            &extra,
+                            false,
+                        )?;
+                        return Ok(());
+                    }
+                }
             }
             if method == "POST" && path.starts_with("/v1/chat/completions") {
                 match Self::parse_request(&body) {
@@ -1353,12 +1391,16 @@ pub fn build_model_response(models: &[String], id: &str) -> Option<String> {
 
 /// Build the `GET /v1/stats` JSON body (IMP-metrics): live counters from the
 /// cost log. All values are PII-free aggregates (I3). Rates are rounded to 4 dp.
-pub fn build_stats_response(s: &crate::cost::CostSummary) -> String {
+pub fn build_stats_response(
+    s: &crate::cost::CostSummary,
+    cache_hits: u64,
+    cache_misses: u64,
+) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
     format!(
         "{{\"object\":\"pasture.stats\",\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
 \"cloud_rate\":{},\"cache_rate\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\
-\"cloud_cost_usd\":{}}}",
+\"cloud_cost_usd\":{},\"cache_hits\":{cache_hits},\"cache_misses\":{cache_misses}}}",
         s.total,
         s.local,
         s.cloud,
@@ -1548,6 +1590,9 @@ enum ReadOutcome {
         /// The `X-Request-ID` header value, if present; echoed on all responses
         /// for request tracing.
         request_id: Option<String>,
+        /// The `Content-Type` header value (lowercased), if present. Used to
+        /// return 415 Unsupported Media Type for non-JSON POST bodies.
+        content_type: Option<String>,
     },
     /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413.
     TooLarge,
@@ -1607,10 +1652,13 @@ fn read_request(
     let mut origin: Option<String> = None;
     let mut connection_close = !http11; // HTTP/1.0 default = close
     let mut request_id: Option<String> = None;
+    let mut content_type: Option<String> = None;
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = lower.strip_prefix("content-type:") {
+            content_type = Some(v.trim().to_string());
         } else if lower.starts_with("authorization:") {
             if let Some((_, v)) = line.split_once(':') {
                 auth = Some(v.trim().to_string());
@@ -1680,6 +1728,7 @@ fn read_request(
         origin,
         connection_close,
         request_id,
+        content_type,
     })
 }
 
@@ -2312,7 +2361,7 @@ mod tests {
             completion_tokens: 50,
             cloud_cost_usd: 0.0123,
         };
-        let json = build_stats_response(&s);
+        let json = build_stats_response(&s, 7, 3);
         let v = crate::json::parse(&json).expect("valid json");
         assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
         assert_eq!(v.get("cloud").and_then(|x| x.as_f64()), Some(1.0));
@@ -2322,6 +2371,8 @@ mod tests {
             v.get("completion_tokens").and_then(|x| x.as_f64()),
             Some(50.0)
         );
+        assert_eq!(v.get("cache_hits").and_then(|x| x.as_f64()), Some(7.0));
+        assert_eq!(v.get("cache_misses").and_then(|x| x.as_f64()), Some(3.0));
     }
 
     #[test]
@@ -2697,6 +2748,58 @@ mod tests {
         let (status, body) = roundtrip(p, "GET /v1/stats HTTP/1.1\r\n\r\n".to_string());
         assert_eq!(status, 200);
         assert!(body.contains("\"object\":\"pasture.stats\""), "{body}");
+    }
+
+    #[test]
+    fn test_stats_includes_live_cache_counters() {
+        let p = proxy_with(true, true, 100, "/no/such/cost-log.jsonl");
+        let (status, body) = roundtrip(p, "GET /v1/stats HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 200);
+        assert!(body.contains("\"cache_hits\":"), "missing cache_hits: {body}");
+        assert!(
+            body.contains("\"cache_misses\":"),
+            "missing cache_misses: {body}"
+        );
+    }
+
+    // ── Content-Type: application/json validation (IMP-content-type) ──────────
+
+    #[test]
+    fn test_post_with_wrong_content_type_returns_415() {
+        let p = proxy_with(true, false, 100, "unused");
+        let raw = "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (status, _) = roundtrip(p, raw.to_string());
+        assert_eq!(status, 415, "text/plain POST should be 415");
+    }
+
+    #[test]
+    fn test_post_without_content_type_passes_through() {
+        let p = proxy_with(true, false, 100, "unused");
+        let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        // No Content-Type header — should still work (e.g. bare curl).
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (status, _) = roundtrip(p, raw);
+        assert_eq!(status, 200, "missing Content-Type should not be rejected");
+    }
+
+    #[test]
+    fn test_post_with_charset_suffix_is_accepted() {
+        let p = proxy_with(true, false, 100, "unused");
+        let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (status, _) = roundtrip(p, raw);
+        assert_eq!(
+            status, 200,
+            "application/json; charset=utf-8 should be accepted"
+        );
     }
 
     #[test]

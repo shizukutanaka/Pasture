@@ -221,6 +221,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-058 415 Unsupported Media Type for non-JSON POST bodies (IMP-content-type).**
+  `read_request` now parses and lowercases the `Content-Type` header. For POST
+  requests, if `Content-Type` is present and does not start with
+  `application/json`, the server returns 415 (RFC 7231 §6.5.13) with a clear
+  error message. Absent `Content-Type` is still accepted (bare `curl` and minimal
+  clients don't set it); `charset=utf-8` suffixes pass. 3 tests.
+- **ADR-057 Live cache hit/miss counters in `/v1/stats` (IMP-cache-counters).**
+  `ResponseCache` gains two `AtomicU64` fields: `hits` and `misses`. `get()`
+  increments the appropriate counter on every lookup. `hits()` / `misses()`
+  accessors return the current values. `handle_stats` reads the live counters
+  via the `self.cache` mutex, and `build_stats_response` appends them as
+  `cache_hits` and `cache_misses` to the JSON response. The existing
+  `cache_rate` field still derives from the JSONL cost log; these counters
+  provide real-time effectiveness data. Std-only (no new deps). 3 new tests.
 - **ADR-056 Configurable system prompt (IMP-system-prompt).** Single-user PC
   assistant deployments need a persistent persona prompt (e.g. `"You are a
   coding assistant specialising in Rust"`) that frames every request without

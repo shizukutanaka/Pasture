@@ -10,6 +10,7 @@ use crate::backend::{CompletionRequest, CompletionResponse};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Stable key for a request: model + ordered (role, content) of each message +
 /// the sampling parameters. Sampling is part of the key so that, e.g., a
@@ -46,11 +47,15 @@ pub fn request_key(req: &CompletionRequest) -> u64 {
     h.finish()
 }
 
-/// A bounded, FIFO-evicting response cache.
+/// A bounded, FIFO-evicting response cache with live hit/miss counters.
 pub struct ResponseCache {
     map: HashMap<u64, CompletionResponse>,
     order: VecDeque<u64>,
     cap: usize,
+    /// Total number of successful cache lookups since the cache was created.
+    hits: AtomicU64,
+    /// Total number of failed cache lookups since the cache was created.
+    misses: AtomicU64,
 }
 
 impl ResponseCache {
@@ -60,6 +65,8 @@ impl ResponseCache {
             map: HashMap::new(),
             order: VecDeque::new(),
             cap,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
@@ -71,9 +78,28 @@ impl ResponseCache {
         self.map.is_empty()
     }
 
-    /// Look up a cached response (cloned).
+    /// Cumulative cache hits since creation (monotonically increasing).
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative cache misses since creation (monotonically increasing).
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    /// Look up a cached response (cloned). Increments hit or miss counter.
     pub fn get(&self, key: u64) -> Option<CompletionResponse> {
-        self.map.get(&key).cloned()
+        match self.map.get(&key).cloned() {
+            Some(v) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(v)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     /// Store a response, evicting the oldest entry when over capacity.
@@ -164,5 +190,30 @@ mod tests {
         c.put(1, resp("a2"));
         assert_eq!(c.len(), 1);
         assert_eq!(c.get(1).unwrap().content, "a2");
+    }
+
+    #[test]
+    fn test_hit_miss_counters() {
+        let mut c = ResponseCache::new(4);
+        assert_eq!(c.hits(), 0);
+        assert_eq!(c.misses(), 0);
+        c.get(99); // miss
+        assert_eq!(c.misses(), 1);
+        assert_eq!(c.hits(), 0);
+        c.put(1, resp("a"));
+        c.get(1); // hit
+        c.get(1); // hit
+        c.get(2); // miss
+        assert_eq!(c.hits(), 2);
+        assert_eq!(c.misses(), 2);
+    }
+
+    #[test]
+    fn test_cap_zero_counts_misses() {
+        let mut c = ResponseCache::new(0);
+        c.put(1, resp("a")); // no-op
+        c.get(1); // miss (nothing stored)
+        assert_eq!(c.misses(), 1);
+        assert_eq!(c.hits(), 0);
     }
 }

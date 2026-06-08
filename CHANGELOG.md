@@ -5,6 +5,22 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Live cache hit/miss counters in `/v1/stats` (IMP-cache-counters)
+
+- `GET /v1/stats` now returns two new fields: `cache_hits` and `cache_misses`.
+  These are live in-memory counters from the `ResponseCache` (incremented on
+  every `get()` call), independent of the JSONL cost log. The existing
+  `cache_rate` (log-derived) is unchanged. Useful for real-time tuning of the
+  cache capacity without log parsing. 3 tests.
+
+### Changed — 415 Unsupported Media Type for non-JSON POST bodies (IMP-content-type)
+
+- POST requests with an explicit `Content-Type` that is not `application/json`
+  now receive **415 Unsupported Media Type** (RFC 7231 §6.5.13) with a clear
+  error message instead of a confusing 400 JSON parse error. Absent
+  `Content-Type` (bare curl) is still accepted; `charset=utf-8` suffixes pass.
+  3 tests.
+
 ### Added — Configurable system prompt via `PASTURE_SYSTEM_PROMPT` (IMP-system-prompt)
 
 - Set `PASTURE_SYSTEM_PROMPT="You are a coding assistant"` (or `system_prompt =
