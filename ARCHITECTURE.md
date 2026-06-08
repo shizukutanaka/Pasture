@@ -221,6 +221,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-063 Prometheus `/metrics` endpoint (IMP-metrics-prom).** Operators need
+  a live, pull-based metrics endpoint compatible with Prometheus / Grafana without
+  parsing JSONL logs. `build_metrics_response` emits Prometheus text exposition
+  format v0.0.4: `HELP`/`TYPE` comment lines followed by labelled counter and gauge
+  metrics (`pasture_requests_total{route=…}`, `pasture_tokens_total{type=…}`,
+  `pasture_cache_*`, `pasture_cloud_cost_usd_total`). `handle_metrics` reads the
+  cost log + live cache state (same sources as `/v1/stats`). `write_plain_response`
+  sends `Content-Type: text/plain; version=0.0.4`. `/metrics` added to
+  `route_allowed_methods` and the dispatch table; wrong-method returns 405. Std-only;
+  3 tests.
 - **ADR-062 `cache_size` / `cache_capacity` in `/v1/stats` (IMP-stats-cache-size).**
   `ResponseCache` gains a `cap()` accessor. `handle_stats` reads both `len()` and
   `cap()` from the cache mutex. `build_stats_response` gains two extra parameters

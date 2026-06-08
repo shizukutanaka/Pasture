@@ -280,7 +280,7 @@ impl Proxy {
             || path.starts_with("/v1/moderations")
         {
             Some("POST, OPTIONS")
-        } else if path.starts_with("/v1/stats") {
+        } else if path.starts_with("/v1/stats") || path.starts_with("/metrics") {
             Some("GET, OPTIONS")
         } else if path.starts_with("/v1/models") || path.starts_with("/v1/engines") {
             Some("GET, OPTIONS")
@@ -752,6 +752,28 @@ impl Proxy {
         ))
     }
 
+    /// Serve `GET /metrics` in Prometheus text exposition format (IMP-metrics-prom).
+    /// Exposes the same counters as `/v1/stats` but in the standard text format
+    /// consumed by Prometheus scrape targets and Grafana agent.
+    pub fn handle_metrics(&self) -> Result<String, ProxyError> {
+        let records = crate::cost::read_log(&self.cost_log_path)
+            .map_err(|e| ProxyError::Backend(e.to_string()))?;
+        let s = crate::cost::summarize(&records);
+        let (live_hits, live_misses, cache_size, cache_cap) = self
+            .cache
+            .as_ref()
+            .and_then(|m| m.lock().ok())
+            .map(|g| (g.hits(), g.misses(), g.len(), g.cap()))
+            .unwrap_or((0, 0, 0, 0));
+        Ok(build_metrics_response(
+            &s,
+            live_hits,
+            live_misses,
+            cache_size,
+            cache_cap,
+        ))
+    }
+
     /// Parse a legacy `POST /v1/completions` request (text-completion format).
     /// Maps `prompt` (string or first array element) to a single user message so
     /// the request can be routed through the same pipeline as chat completions.
@@ -1083,6 +1105,21 @@ impl Proxy {
             } else if method == "GET" && path.starts_with("/v1/stats") {
                 match self.handle_stats() {
                     Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
+                    Err(e) => {
+                        write_response(
+                            stream,
+                            e.status(),
+                            &build_error_response(e.message(), e.kind()),
+                            &extra,
+                            false,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            } else if method == "GET" && path.starts_with("/metrics") {
+                // Prometheus text-format scrape endpoint (IMP-metrics-prom).
+                match self.handle_metrics() {
+                    Ok(resp) => write_plain_response(stream, &resp, &extra, keep_alive)?,
                     Err(e) => {
                         write_response(
                             stream,
@@ -1574,6 +1611,55 @@ pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> St
     )
 }
 
+/// Build a Prometheus text-format metrics response for `GET /metrics`.
+/// Uses the standard exposition format (version 0.0.4): `# HELP`, `# TYPE`, then
+/// metric lines. Counter names follow Prometheus naming conventions (total suffix
+/// on counters, no suffix on gauges).
+pub fn build_metrics_response(
+    s: &crate::cost::CostSummary,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_size: usize,
+    cache_cap: usize,
+) -> String {
+    // Prometheus text exposition format v0.0.4.
+    // Braces in label selectors are literal Prometheus syntax — not format args.
+    format!(
+        "# HELP pasture_requests_total Total requests handled by backend\n\
+# TYPE pasture_requests_total counter\n\
+pasture_requests_total{{route=\"local\"}} {local}\n\
+pasture_requests_total{{route=\"cloud\"}} {cloud}\n\
+pasture_requests_total{{route=\"cache\"}} {cache}\n\
+# HELP pasture_prompt_tokens_total Total prompt tokens processed\n\
+# TYPE pasture_prompt_tokens_total counter\n\
+pasture_prompt_tokens_total {prompt_tokens}\n\
+# HELP pasture_completion_tokens_total Total completion tokens generated\n\
+# TYPE pasture_completion_tokens_total counter\n\
+pasture_completion_tokens_total {completion_tokens}\n\
+# HELP pasture_cloud_cost_usd_total Estimated cumulative cloud cost USD\n\
+# TYPE pasture_cloud_cost_usd_total counter\n\
+pasture_cloud_cost_usd_total {cloud_cost}\n\
+# HELP pasture_cache_hits_total Cache hit count since process start\n\
+# TYPE pasture_cache_hits_total counter\n\
+pasture_cache_hits_total {cache_hits}\n\
+# HELP pasture_cache_misses_total Cache miss count since process start\n\
+# TYPE pasture_cache_misses_total counter\n\
+pasture_cache_misses_total {cache_misses}\n\
+# HELP pasture_cache_entries Current number of entries in the cache\n\
+# TYPE pasture_cache_entries gauge\n\
+pasture_cache_entries {cache_size}\n\
+# HELP pasture_cache_capacity Maximum entries the cache holds (0=disabled)\n\
+# TYPE pasture_cache_capacity gauge\n\
+pasture_cache_capacity {cache_cap}\n",
+        local = s.local,
+        cloud = s.cloud,
+        cache = s.cache,
+        prompt_tokens = s.prompt_tokens,
+        completion_tokens = s.completion_tokens,
+        cloud_cost = s.cloud_cost_usd,
+    )
+}
+
 /// Build a stub `/v1/moderations` response. All categories are marked safe
 /// (false / score 0). Pasture does not run content moderation; the stub prevents
 /// client SDKs that unconditionally call the moderation endpoint from erroring.
@@ -1907,6 +1993,21 @@ fn write_response(
     let conn = if keep_alive { "keep-alive" } else { "close" };
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {conn}\r\n{extra}\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())
+}
+
+/// Write an HTTP/1.1 response with `Content-Type: text/plain` (for `/metrics`).
+fn write_plain_response(
+    stream: &mut std::net::TcpStream,
+    body: &str,
+    extra: &str,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: {conn}\r\n{extra}\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes())
@@ -2859,6 +2960,57 @@ mod tests {
         let (status, body) = roundtrip(p, "GET /v1/stats HTTP/1.1\r\n\r\n".to_string());
         assert_eq!(status, 200);
         assert!(body.contains("\"object\":\"pasture.stats\""), "{body}");
+    }
+
+    // ── Prometheus /metrics endpoint (IMP-metrics-prom) ───────────────────────
+
+    #[test]
+    fn test_metrics_endpoint_returns_200_text_plain() {
+        let p = proxy_with(true, true, 100, "/no/such/cost-log.jsonl");
+        let raw = "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = raw_roundtrip(p, raw.to_string());
+        assert!(
+            resp.contains("HTTP/1.1 200"),
+            "expected 200: {resp}"
+        );
+        assert!(
+            resp.contains("text/plain"),
+            "expected text/plain Content-Type: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_metrics_response_shape() {
+        let s = crate::cost::CostSummary {
+            total: 10,
+            local: 7,
+            cloud: 2,
+            cache: 1,
+            prompt_tokens: 200,
+            completion_tokens: 100,
+            cloud_cost_usd: 0.005,
+        };
+        let body = build_metrics_response(&s, 3, 8, 5, 50);
+        assert!(
+            body.contains("pasture_requests_total{route=\"local\"} 7"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pasture_requests_total{route=\"cloud\"} 2"),
+            "{body}"
+        );
+        assert!(body.contains("pasture_cache_hits_total 3"), "{body}");
+        assert!(body.contains("pasture_cache_entries 5"), "{body}");
+        assert!(body.contains("pasture_cache_capacity 50"), "{body}");
+        assert!(body.contains("# TYPE pasture_requests_total counter"), "{body}");
+        assert!(body.contains("# TYPE pasture_cache_entries gauge"), "{body}");
+    }
+
+    #[test]
+    fn test_metrics_wrong_method_returns_405() {
+        let p = proxy_with(true, false, 100, "unused");
+        let (status, _) = roundtrip(p, "POST /metrics HTTP/1.1\r\nContent-Length: 0\r\n\r\n".to_string());
+        assert_eq!(status, 405, "POST /metrics should be 405");
     }
 
     #[test]

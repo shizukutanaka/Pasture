@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Prometheus `/metrics` endpoint (IMP-metrics-prom)
+
+- `GET /metrics` now returns Prometheus text exposition format v0.0.4 with:
+  - `pasture_requests_total{route="local|cloud|cache"}` — request counters per backend
+  - `pasture_tokens_total{type="prompt|completion"}` — cumulative token counters
+  - `pasture_cache_hits_total`, `pasture_cache_misses_total` — cache counters
+  - `pasture_cache_size`, `pasture_cache_capacity` — live cache occupancy gauges
+  - `pasture_cloud_cost_usd_total` — cumulative cloud cost gauge
+- Compatible with Prometheus scrape and Grafana dashboards. Wrong method returns 405.
+  Std-only; 3 tests (ADR-063).
+
 ### Added — `POST /v1/moderations` stub (IMP-moderations)
 
 - Many OpenAI SDK versions call `/v1/moderations` before or after completions.
