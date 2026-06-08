@@ -46,6 +46,9 @@ pub struct Config {
     /// Optional path for the structured per-request access log (IMP-access-log).
     /// Appends one JSONL record per request. Empty string = disabled.
     pub access_log: String,
+    /// TTL for cached responses in seconds (IMP-cache-ttl). 0 = no TTL (entries
+    /// live until evicted by FIFO). Enabled via `PASTURE_CACHE_TTL`.
+    pub cache_ttl_secs: u64,
 }
 
 impl Default for Config {
@@ -79,6 +82,7 @@ impl Default for Config {
             request_timeout_secs: 30,
             system_prompt: String::new(),
             access_log: String::new(),
+            cache_ttl_secs: 0,
         }
     }
 }
@@ -207,6 +211,11 @@ impl Config {
         if let Ok(v) = std::env::var("PASTURE_ACCESS_LOG") {
             self.access_log = v;
         }
+        if let Ok(v) = std::env::var("PASTURE_CACHE_TTL") {
+            if let Ok(n) = v.parse() {
+                self.cache_ttl_secs = n;
+            }
+        }
         self
     }
 
@@ -274,6 +283,11 @@ impl Config {
             }
             "system_prompt" => self.system_prompt = val.to_string(),
             "access_log" => self.access_log = val.to_string(),
+            "cache_ttl_secs" => {
+                if let Ok(n) = val.parse() {
+                    self.cache_ttl_secs = n;
+                }
+            }
             _ => {}
         }
     }

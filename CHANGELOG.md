@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Cache TTL eviction (IMP-cache-ttl)
+
+- Set `PASTURE_CACHE_TTL=3600` (or `cache_ttl_secs =` in config) to expire cached
+  responses after N seconds. Expired entries are evicted lazily on the next `get`
+  and removed from the map so `cache_size` stays accurate. Default 0 = no TTL
+  (entries live until FIFO eviction). Std-only; 4 tests (ADR-067).
+
 ### Added — Structured per-request access log (IMP-access-log)
 
 - Set `PASTURE_ACCESS_LOG=/path/to/access.jsonl` (or `access_log =` in config) to

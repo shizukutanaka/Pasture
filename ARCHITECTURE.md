@@ -221,6 +221,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-067 Cache TTL eviction (IMP-cache-ttl).** Without TTL, stale cached
+  responses are served indefinitely. `ResponseCache` now stores
+  `(CompletionResponse, Instant)` pairs. `get(&mut self)` lazily evicts entries
+  whose `elapsed() > max_age`, removing them from the map and counting as misses
+  so `len()` stays accurate. `with_max_age(secs)` builder + `set_max_age(&mut self)`
+  mutating variant (used by `Proxy::with_cache_ttl`). Enabled via
+  `PASTURE_CACHE_TTL=<secs>` or `cache_ttl_secs =` config key. 0 (default) = no TTL.
+  Std-only (`std::time::Instant`); 4 tests.
 - **ADR-066 Structured per-request access log (IMP-access-log).** Operators need
   per-request visibility without parsing cost JSONL or scraping `/metrics`.
   `Proxy` gains `access_log: Option<String>` and `with_access_log` builder.

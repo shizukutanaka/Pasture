@@ -1075,6 +1075,7 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         .with_cascade(config.cascade)
         .with_cascade_logprob(config.cascade_logprob_threshold)
         .with_cache(config.cache_size)
+        .with_cache_ttl(config.cache_ttl_secs)
         .with_models(models)
         .with_cloud_retry(config.cloud_retry)
         .with_fast_model(fast, config.fast_threshold)

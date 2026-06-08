@@ -407,6 +407,17 @@ impl Proxy {
         self
     }
 
+    pub fn with_cache_ttl(mut self, ttl_secs: u64) -> Self {
+        if ttl_secs > 0 {
+            if let Some(ref cache_mutex) = self.cache {
+                if let Ok(mut guard) = cache_mutex.lock() {
+                    guard.set_max_age(ttl_secs);
+                }
+            }
+        }
+        self
+    }
+
     /// Parse an OpenAI-style chat-completion request body.
     pub fn parse_request(body: &str) -> Result<CompletionRequest, ProxyError> {
         let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
@@ -619,7 +630,7 @@ impl Proxy {
             None
         };
         if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
-            if let Ok(guard) = cache.lock() {
+            if let Ok(mut guard) = cache.lock() {
                 if let Some(hit) = guard.get(key) {
                     return Ok((hit, "cache", None));
                 }
