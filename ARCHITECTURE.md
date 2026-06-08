@@ -221,6 +221,12 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-049 `logprobs: null` in choice objects (IMP-logprobs-field).** OpenAI always
+  includes a `logprobs` key in each choice (null unless the client requested logprobs);
+  Pasture omitted it, so strict client schema validators could reject the response.
+  Both `build_openai_response` and `build_openai_chunk` now emit `logprobs:null` in the
+  choice object (the usage chunk has an empty `choices` array, so it is unaffected).
+  Purely additive, std-only; 2 tests (buffered choice, chunk choice).
 - **ADR-048 `model` field in streaming chunks (IMP-chunk-model).** OpenAI includes the
   `model` name in every `chat.completion.chunk` and in the streaming usage chunk; Pasture
   omitted it, so clients logging or displaying the per-chunk model received nothing.

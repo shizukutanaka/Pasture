@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `logprobs: null` in choice objects (IMP-logprobs-field)
+
+- Both the buffered response choice and every streaming chunk choice now include
+  `logprobs: null`, completing OpenAI choice-object parity. OpenAI always emits this
+  key (null unless logprobs were requested); strict client schema validators that
+  expect the field present now accept Pasture's responses. std-only; 2 tests.
+
 ### Added — `model` field in streaming chunks (IMP-chunk-model)
 
 - Every SSE chunk (delta, stop, and usage) now carries the `model` field with the

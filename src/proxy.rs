@@ -1193,7 +1193,6 @@ fn next_completion_id() -> String {
     format!("chatcmpl-{}{:08}", unix_now(), n)
 }
 
-/// Build an OpenAI-compatible chat-completion response JSON string.
 /// Return a deterministic `system_fingerprint` string for a given model name.
 /// Uses FNV-1a (64-bit) truncated to 32 bits → `fp_pasture_XXXXXXXX`.
 /// Identical model → identical fingerprint across requests and processes.
@@ -1211,7 +1210,7 @@ pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> St
     let total = resp.prompt_tokens + resp.completion_tokens;
     let fp = fingerprint_for_model(&resp.model);
     format!(
-        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fp}\",\"x_pasture_route\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fp}\",\"x_pasture_route\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"logprobs\":null,\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
         next_completion_id(),
         unix_now(),
         escape_string(&resp.model),
@@ -1223,9 +1222,6 @@ pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> St
     )
 }
 
-/// Build an OpenAI-compatible streaming chunk (`chat.completion.chunk`). The `id`
-/// and `fingerprint` are supplied by the caller so every chunk of one stream
-/// shares them (OpenAI behaviour).
 /// Build an OpenAI-compatible streaming chunk (`chat.completion.chunk`). The `id`,
 /// `model`, and `fingerprint` are supplied by the caller so every chunk of one
 /// stream shares them (OpenAI behaviour).
@@ -1247,7 +1243,7 @@ pub fn build_openai_chunk(
         None => "null".to_string(),
     };
     format!(
-        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}",
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"logprobs\":null,\"finish_reason\":{finish_field}}}]}}",
         unix_now(),
         escape_string(model)
     )
@@ -2430,6 +2426,43 @@ mod tests {
                 .and_then(|u| u.get("total_tokens"))
                 .map(|t| matches!(t, JsonValue::Number(_))),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn test_response_choice_has_null_logprobs() {
+        let resp = CompletionResponse {
+            content: "hi".into(),
+            model: "m".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        let json = build_openai_response(&resp, "local");
+        let v = parse(&json).unwrap();
+        let choice = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .unwrap();
+        assert!(
+            matches!(choice.get("logprobs"), Some(JsonValue::Null)),
+            "choice must carry logprobs:null, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_chunk_choice_has_null_logprobs() {
+        let fp = fingerprint_for_model("m");
+        let json = build_openai_chunk("chatcmpl-x", "m", &fp, "tok", "local", None);
+        let v = parse(&json).unwrap();
+        let choice = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .unwrap();
+        assert!(
+            matches!(choice.get("logprobs"), Some(JsonValue::Null)),
+            "chunk choice must carry logprobs:null, got: {json}"
         );
     }
 
