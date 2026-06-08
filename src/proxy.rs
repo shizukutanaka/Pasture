@@ -860,12 +860,14 @@ impl Proxy {
 
         write_sse_headers(sock, cors)?;
         let route_label = decision.route.as_str();
+        // One id shared by every chunk of this stream (OpenAI behaviour).
+        let id = next_completion_id();
         let mut io_err: Option<std::io::Error> = None;
         let resp = backend.stream_complete(req, &mut |delta| {
             if io_err.is_some() {
                 return;
             }
-            let frame = sse_frame(&build_openai_chunk(delta, route_label, None));
+            let frame = sse_frame(&build_openai_chunk(&id, delta, route_label, None));
             if let Err(e) = sock.write_all(frame.as_bytes()) {
                 io_err = Some(e);
             }
@@ -876,11 +878,12 @@ impl Proxy {
         match resp {
             Ok(r) => {
                 self.log_cost(route_label, &r, None);
-                let stop = sse_frame(&build_openai_chunk("", route_label, Some("stop")));
+                let stop = sse_frame(&build_openai_chunk(&id, "", route_label, Some("stop")));
                 sock.write_all(stop.as_bytes())?;
                 // Final usage chunk when the client asked for it (OpenAI feature).
                 if include_usage {
                     let usage = sse_frame(&build_openai_usage_chunk(
+                        &id,
                         route_label,
                         r.prompt_tokens,
                         r.completion_tokens,
@@ -1104,11 +1107,22 @@ pub fn build_embeddings_response(resp: &EmbeddingsResponse) -> String {
     )
 }
 
+/// A unique completion id (`chatcmpl-…`), matching OpenAI's per-response id that
+/// logging/observability/dedup tooling keys on. Uniqueness within the process is
+/// guaranteed by an atomic counter; the wall-clock prefix adds cross-run variety.
+fn next_completion_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("chatcmpl-{}{:08}", unix_now(), n)
+}
+
 /// Build an OpenAI-compatible chat-completion response JSON string.
 pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> String {
     let total = resp.prompt_tokens + resp.completion_tokens;
     format!(
-        "{{\"id\":\"pasture\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"x_pasture_route\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"x_pasture_route\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        next_completion_id(),
         unix_now(),
         escape_string(&resp.model),
         route_label,
@@ -1119,8 +1133,14 @@ pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> St
     )
 }
 
-/// Build an OpenAI-compatible streaming chunk (`chat.completion.chunk`).
-pub fn build_openai_chunk(delta: &str, route_label: &str, finish: Option<&str>) -> String {
+/// Build an OpenAI-compatible streaming chunk (`chat.completion.chunk`). The `id`
+/// is supplied by the caller so every chunk of one stream shares it (OpenAI does).
+pub fn build_openai_chunk(
+    id: &str,
+    delta: &str,
+    route_label: &str,
+    finish: Option<&str>,
+) -> String {
     let delta_field = if delta.is_empty() {
         "{}".to_string()
     } else {
@@ -1131,21 +1151,22 @@ pub fn build_openai_chunk(delta: &str, route_label: &str, finish: Option<&str>) 
         None => "null".to_string(),
     };
     format!(
-        "{{\"id\":\"pasture\",\"object\":\"chat.completion.chunk\",\"created\":{},\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}",
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}",
         unix_now()
     )
 }
 
 /// Build the final streaming chunk carrying token `usage` (emitted only when the
 /// client sets `stream_options.include_usage`). Per the OpenAI contract this
-/// chunk has an empty `choices` array.
+/// chunk has an empty `choices` array. Shares the stream's `id`.
 pub fn build_openai_usage_chunk(
+    id: &str,
     route_label: &str,
     prompt_tokens: u64,
     completion_tokens: u64,
 ) -> String {
     format!(
-        "{{\"id\":\"pasture\",\"object\":\"chat.completion.chunk\",\"created\":{},\"x_pasture_route\":\"{route_label}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}",
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"x_pasture_route\":\"{route_label}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}",
         unix_now(),
         prompt_tokens + completion_tokens
     )
@@ -1420,7 +1441,29 @@ mod tests {
             completion_tokens: 1,
         };
         assert!(build_openai_response(&resp, "local").contains("\"created\":"));
-        assert!(build_openai_chunk("hi", "local", None).contains("\"created\":"));
+        assert!(build_openai_chunk("chatcmpl-x", "hi", "local", None).contains("\"created\":"));
+    }
+
+    #[test]
+    fn test_completion_ids_are_unique_and_prefixed() {
+        let resp = CompletionResponse {
+            content: "hi".into(),
+            model: "m".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        let id_of = |json: &str| {
+            crate::json::parse(json)
+                .unwrap()
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap()
+                .to_string()
+        };
+        let a = id_of(&build_openai_response(&resp, "local"));
+        let b = id_of(&build_openai_response(&resp, "local"));
+        assert!(a.starts_with("chatcmpl-"), "id: {a}");
+        assert_ne!(a, b, "completion ids must be unique");
     }
 
     /// Send `raw_request` to a one-shot server backed by `proxy`; return
@@ -1780,7 +1823,7 @@ mod tests {
 
     #[test]
     fn test_build_usage_chunk_shape() {
-        let json = build_openai_usage_chunk("local", 10, 5);
+        let json = build_openai_usage_chunk("chatcmpl-x", "local", 10, 5);
         let v = crate::json::parse(&json).expect("valid json");
         assert_eq!(
             v.get("object").and_then(|x| x.as_str()),
@@ -1817,6 +1860,25 @@ mod tests {
         assert!(resp.contains("\"usage\""), "expected usage chunk: {resp}");
         assert!(resp.contains("\"total_tokens\""), "{resp}");
         assert!(resp.contains("data: [DONE]"), "{resp}");
+    }
+
+    #[test]
+    fn test_roundtrip_stream_shares_one_id() {
+        let p = proxy_with(true, false, 100, tmp_log().as_str());
+        let body = r#"{"stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}"#;
+        let (status, resp) = roundtrip(p, http_post("/v1/chat/completions", body));
+        assert_eq!(status, 200);
+        // Every chunk's id must be identical across the stream (incl. usage chunk).
+        let ids: Vec<String> = resp
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|p| p.starts_with('{'))
+            .filter_map(|p| crate::json::parse(p).ok())
+            .filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(str::to_string))
+            .collect();
+        assert!(ids.len() >= 2, "expected multiple chunks: {resp}");
+        assert!(ids.iter().all(|id| *id == ids[0]), "ids differ: {ids:?}");
+        assert!(ids[0].starts_with("chatcmpl-"), "{:?}", ids[0]);
     }
 
     #[test]
@@ -2180,7 +2242,7 @@ mod tests {
 
     #[test]
     fn test_build_openai_chunk_delta_is_valid_json() {
-        let json = build_openai_chunk("hel\"lo", "local", None);
+        let json = build_openai_chunk("chatcmpl-x", "hel\"lo", "local", None);
         let v = parse(&json).unwrap();
         assert_eq!(
             v.get("object").and_then(|o| o.as_str()),
@@ -2202,7 +2264,7 @@ mod tests {
 
     #[test]
     fn test_build_openai_chunk_finish_stop() {
-        let json = build_openai_chunk("", "cloud", Some("stop"));
+        let json = build_openai_chunk("chatcmpl-x", "", "cloud", Some("stop"));
         assert!(json.contains("\"finish_reason\":\"stop\""));
         assert!(json.contains("\"delta\":{}"));
     }

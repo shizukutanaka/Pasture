@@ -221,6 +221,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-044 Unique completion ids (IMP-completion-id).** Every Pasture response used a
+  constant `id:"pasture"`, but OpenAI returns a unique `chatcmpl-…` per completion that
+  logging, tracing, and de-duplication tooling keys on — a constant id silently breaks
+  them. Responses now carry a unique id (process-global atomic counter + wall-clock
+  prefix); for streaming, one id is generated per stream and threaded through every chunk
+  (`build_openai_chunk` / `build_openai_usage_chunk` take the id) so all chunks of a
+  response share it, matching OpenAI. std-only, no allocation on the hot path beyond the
+  id string; unit-tested for uniqueness and per-stream consistency.
 - **ADR-043 Structured-output passthrough (IMP-response-format).** OpenAI's
   `response_format` (JSON mode and `json_schema` structured outputs) is supported by
   every backend Pasture fronts (OpenAI, vLLM, LM Studio, Ollama), but the proxy parsed

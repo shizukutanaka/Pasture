@@ -91,7 +91,8 @@ Request body: OpenAI chat-completion JSON. Recognized fields:
   the embedded schema). Part of the cache key.
 
 Success (non-stream): `200`, body is an OpenAI `chat.completion` object containing
-`id`, `object:"chat.completion"`, **`created`** (Unix seconds), `model`, `choices[0]`
+`id` (a unique `chatcmpl-…`, IMP-completion-id), `object:"chat.completion"`,
+**`created`** (Unix seconds), `model`, `choices[0]`
 (`message.role="assistant"`, `message.content`, `finish_reason:"stop"`), `usage`
 (`prompt_tokens`, `completion_tokens`, `total_tokens`), and the Pasture extension
 **`x_pasture_route`** ∈ {`local`,`cloud`,`cache`}.
@@ -128,7 +129,8 @@ a missing cost log reads as all-zeros. No auth (localhost-default, I5). Implemen
 
 ### 3.4 Streaming (SSE)
 When `stream:true`: `200`, `Content-Type: text/event-stream`. Each frame is
-`data: <chat.completion.chunk>\n\n` with `id`, `object:"chat.completion.chunk"`,
+`data: <chat.completion.chunk>\n\n` with `id` (one unique id shared by all chunks of
+the stream, IMP-completion-id), `object:"chat.completion.chunk"`,
 **`created`**, `x_pasture_route`, and `choices[0].delta`. A final chunk carries
 `finish_reason:"stop"`. When the request sets `stream_options.include_usage:true`,
 one further chunk follows with an empty `choices` array and a `usage` object

@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — unique completion ids (IMP-completion-id)
+
+- Responses now carry a unique `id` (`chatcmpl-…`) instead of the constant
+  `"pasture"`, matching OpenAI; logging/tracing/de-dup tooling keys on this. For
+  streaming, one id is generated per stream and shared by every chunk (including the
+  usage chunk). Uniqueness via a process-global atomic counter; std-only. 2 tests
+  (uniqueness, per-stream id consistency). Grounded in ADR-044.
+
 ### Added — structured-output (JSON mode) passthrough (IMP-response-format)
 
 - The proxy now **forwards `response_format`** (OpenAI JSON mode and `json_schema`
