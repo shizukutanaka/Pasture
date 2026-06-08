@@ -905,14 +905,15 @@ impl Proxy {
 
         write_sse_headers(sock, cors)?;
         let route_label = decision.route.as_str();
-        // One id shared by every chunk of this stream (OpenAI behaviour).
+        // One id and fingerprint shared by every chunk of this stream (OpenAI behaviour).
         let id = next_completion_id();
+        let fp = fingerprint_for_model(&req.model);
         let mut io_err: Option<std::io::Error> = None;
         let resp = backend.stream_complete(req, &mut |delta| {
             if io_err.is_some() {
                 return;
             }
-            let frame = sse_frame(&build_openai_chunk(&id, delta, route_label, None));
+            let frame = sse_frame(&build_openai_chunk(&id, &fp, delta, route_label, None));
             if let Err(e) = sock.write_all(frame.as_bytes()) {
                 io_err = Some(e);
             }
@@ -923,12 +924,13 @@ impl Proxy {
         match resp {
             Ok(r) => {
                 self.log_cost(route_label, &r, None);
-                let stop = sse_frame(&build_openai_chunk(&id, "", route_label, Some("stop")));
+                let stop = sse_frame(&build_openai_chunk(&id, &fp, "", route_label, Some("stop")));
                 sock.write_all(stop.as_bytes())?;
                 // Final usage chunk when the client asked for it (OpenAI feature).
                 if include_usage {
                     let usage = sse_frame(&build_openai_usage_chunk(
                         &id,
+                        &fp,
                         route_label,
                         r.prompt_tokens,
                         r.completion_tokens,
@@ -1176,10 +1178,24 @@ fn next_completion_id() -> String {
 }
 
 /// Build an OpenAI-compatible chat-completion response JSON string.
+/// Return a deterministic `system_fingerprint` string for a given model name.
+/// Uses FNV-1a (64-bit) truncated to 32 bits → `fp_pasture_XXXXXXXX`.
+/// Identical model → identical fingerprint across requests and processes.
+pub fn fingerprint_for_model(model: &str) -> String {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in model.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    format!("fp_pasture_{:08x}", h as u32)
+}
+
 pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> String {
     let total = resp.prompt_tokens + resp.completion_tokens;
+    let fp = fingerprint_for_model(&resp.model);
     format!(
-        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"x_pasture_route\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fp}\",\"x_pasture_route\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
         next_completion_id(),
         unix_now(),
         escape_string(&resp.model),
@@ -1192,9 +1208,11 @@ pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> St
 }
 
 /// Build an OpenAI-compatible streaming chunk (`chat.completion.chunk`). The `id`
-/// is supplied by the caller so every chunk of one stream shares it (OpenAI does).
+/// and `fingerprint` are supplied by the caller so every chunk of one stream
+/// shares them (OpenAI behaviour).
 pub fn build_openai_chunk(
     id: &str,
+    fingerprint: &str,
     delta: &str,
     route_label: &str,
     finish: Option<&str>,
@@ -1209,22 +1227,23 @@ pub fn build_openai_chunk(
         None => "null".to_string(),
     };
     format!(
-        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}",
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}",
         unix_now()
     )
 }
 
 /// Build the final streaming chunk carrying token `usage` (emitted only when the
 /// client sets `stream_options.include_usage`). Per the OpenAI contract this
-/// chunk has an empty `choices` array. Shares the stream's `id`.
+/// chunk has an empty `choices` array. Shares the stream's `id` and `fingerprint`.
 pub fn build_openai_usage_chunk(
     id: &str,
+    fingerprint: &str,
     route_label: &str,
     prompt_tokens: u64,
     completion_tokens: u64,
 ) -> String {
     format!(
-        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"x_pasture_route\":\"{route_label}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}",
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}",
         unix_now(),
         prompt_tokens + completion_tokens
     )
@@ -1589,7 +1608,10 @@ mod tests {
             completion_tokens: 1,
         };
         assert!(build_openai_response(&resp, "local").contains("\"created\":"));
-        assert!(build_openai_chunk("chatcmpl-x", "hi", "local", None).contains("\"created\":"));
+        assert!(
+            build_openai_chunk("chatcmpl-x", "fp_pasture_00000000", "hi", "local", None)
+                .contains("\"created\":")
+        );
     }
 
     #[test]
@@ -1971,7 +1993,7 @@ mod tests {
 
     #[test]
     fn test_build_usage_chunk_shape() {
-        let json = build_openai_usage_chunk("chatcmpl-x", "local", 10, 5);
+        let json = build_openai_usage_chunk("chatcmpl-x", "fp_pasture_00000000", "local", 10, 5);
         let v = crate::json::parse(&json).expect("valid json");
         assert_eq!(
             v.get("object").and_then(|x| x.as_str()),
@@ -2390,7 +2412,13 @@ mod tests {
 
     #[test]
     fn test_build_openai_chunk_delta_is_valid_json() {
-        let json = build_openai_chunk("chatcmpl-x", "hel\"lo", "local", None);
+        let json = build_openai_chunk(
+            "chatcmpl-x",
+            "fp_pasture_00000000",
+            "hel\"lo",
+            "local",
+            None,
+        );
         let v = parse(&json).unwrap();
         assert_eq!(
             v.get("object").and_then(|o| o.as_str()),
@@ -2412,9 +2440,77 @@ mod tests {
 
     #[test]
     fn test_build_openai_chunk_finish_stop() {
-        let json = build_openai_chunk("chatcmpl-x", "", "cloud", Some("stop"));
+        let json = build_openai_chunk(
+            "chatcmpl-x",
+            "fp_pasture_00000000",
+            "",
+            "cloud",
+            Some("stop"),
+        );
         assert!(json.contains("\"finish_reason\":\"stop\""));
         assert!(json.contains("\"delta\":{}"));
+    }
+
+    #[test]
+    fn test_fingerprint_for_model_is_deterministic_and_prefixed() {
+        let fp1 = fingerprint_for_model("llama3");
+        let fp2 = fingerprint_for_model("llama3");
+        assert_eq!(fp1, fp2, "fingerprint must be deterministic");
+        assert!(fp1.starts_with("fp_pasture_"), "prefix: {fp1}");
+        assert_eq!(fp1.len(), "fp_pasture_".len() + 8, "8 hex chars: {fp1}");
+        let other = fingerprint_for_model("gpt-4");
+        assert_ne!(fp1, other, "different models must differ");
+    }
+
+    #[test]
+    fn test_response_includes_system_fingerprint() {
+        let resp = CompletionResponse {
+            content: "hi".into(),
+            model: "llama3".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        let json = build_openai_response(&resp, "local");
+        let v = parse(&json).unwrap();
+        let fp = v
+            .get("system_fingerprint")
+            .and_then(|f| f.as_str())
+            .unwrap_or("");
+        assert!(fp.starts_with("fp_pasture_"), "got: {fp}");
+        assert_eq!(fp, fingerprint_for_model("llama3").as_str());
+    }
+
+    #[test]
+    fn test_chunk_includes_system_fingerprint() {
+        let fp = fingerprint_for_model("llama3");
+        let json = build_openai_chunk("chatcmpl-x", &fp, "hello", "local", None);
+        let v = parse(&json).unwrap();
+        assert_eq!(
+            v.get("system_fingerprint").and_then(|f| f.as_str()),
+            Some(fp.as_str())
+        );
+    }
+
+    #[test]
+    fn test_stream_chunks_share_fingerprint() {
+        let fp = fingerprint_for_model("m");
+        let c1 = build_openai_chunk("chatcmpl-a", &fp, "tok1", "local", None);
+        let c2 = build_openai_chunk("chatcmpl-a", &fp, "tok2", "local", None);
+        let stop = build_openai_chunk("chatcmpl-a", &fp, "", "local", Some("stop"));
+        let usage = build_openai_usage_chunk("chatcmpl-a", &fp, "local", 5, 3);
+        let fp_of = |j: &str| {
+            parse(j)
+                .unwrap()
+                .get("system_fingerprint")
+                .and_then(|f| f.as_str())
+                .unwrap()
+                .to_string()
+        };
+        let fps: Vec<_> = [&c1, &c2, &stop, &usage].iter().map(|j| fp_of(j)).collect();
+        assert!(
+            fps.iter().all(|f| f == &fp),
+            "fingerprints must match: {fps:?}"
+        );
     }
 
     #[test]

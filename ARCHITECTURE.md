@@ -221,6 +221,15 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-047 `system_fingerprint` on responses and stream chunks (IMP-fingerprint).**
+  OpenAI clients may key caching invalidation, dedup, or change detection on the
+  `system_fingerprint` field. Pasture omitted it entirely, breaking such clients.
+  A deterministic `fp_pasture_XXXXXXXX` string is now computed per model name via
+  FNV-1a (64-bit) truncated to 32 bits — identical model always yields the same
+  fingerprint, different models yield different fingerprints, no I/O required, std-only.
+  All chunks of one SSE stream share the fingerprint computed once at stream start
+  (same-stream consistency that mirrors OpenAI's model-snapshot semantics).
+  4 tests: determinism + prefix, response field, chunk field, stream consistency.
 - **ADR-046 Per-connection socket timeout (IMP-timeout).** `read_request` had no
   timeout, so a slow or dead client could hold one of the bounded worker threads
   (2..=32) indefinitely — a handful of such connections exhaust the pool and deny

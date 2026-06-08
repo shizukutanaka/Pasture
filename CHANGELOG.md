@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `system_fingerprint` on all responses and stream chunks (IMP-fingerprint)
+
+- All buffered chat responses and every SSE chunk (including the final usage chunk) now
+  carry a `system_fingerprint` field — a deterministic `fp_pasture_XXXXXXXX` string
+  derived from the model name via FNV-1a truncated to 32 bits. OpenAI clients that key
+  on this field for caching invalidation or change detection now behave correctly.
+  All chunks of one stream share the same fingerprint (computed once at stream start).
+  std-only; 4 tests (determinism, response shape, chunk shape, stream consistency).
+
 ### Added — per-connection socket timeout / slow-loris guard (IMP-timeout)
 
 - `serve` now applies a per-connection read **and** write timeout
