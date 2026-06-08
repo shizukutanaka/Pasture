@@ -249,7 +249,10 @@ impl Proxy {
     /// Return the `Allow:` header value for a known route so the caller can
     /// send 405 Method Not Allowed. Returns `None` for unknown paths (→ 404).
     fn route_allowed_methods(path: &str) -> Option<&'static str> {
-        if path.starts_with("/v1/chat/completions") || path.starts_with("/v1/embeddings") {
+        if path.starts_with("/v1/chat/completions")
+            || path.starts_with("/v1/completions")
+            || path.starts_with("/v1/embeddings")
+        {
             Some("POST, OPTIONS")
         } else if path.starts_with("/v1/stats") {
             Some("GET, OPTIONS")
@@ -656,6 +659,57 @@ impl Proxy {
         Ok(build_stats_response(&summary))
     }
 
+    /// Parse a legacy `POST /v1/completions` request (text-completion format).
+    /// Maps `prompt` (string or first array element) to a single user message so
+    /// the request can be routed through the same pipeline as chat completions.
+    /// Streaming is not supported via this shim; callers should use
+    /// `POST /v1/chat/completions` with `"stream":true` instead.
+    fn parse_legacy_completion(body: &str) -> Result<CompletionRequest, ProxyError> {
+        let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
+        let model = v
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let prompt_text = match v.get("prompt") {
+            Some(JsonValue::Str(s)) => s.clone(),
+            Some(JsonValue::Array(a)) => a
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => {
+                return Err(ProxyError::BadRequest(
+                    "missing or invalid 'prompt'".to_string(),
+                ))
+            }
+        };
+        if prompt_text.is_empty() {
+            return Err(ProxyError::BadRequest("empty 'prompt'".to_string()));
+        }
+        let sampling = Self::parse_sampling(&v);
+        Ok(CompletionRequest {
+            model,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: prompt_text,
+            }],
+            stream: false,
+            has_tools: false,
+            sampling,
+        })
+    }
+
+    /// Handle a legacy `POST /v1/completions` request. Routes through the normal
+    /// pipeline and re-formats the response as `object:"text_completion"` with
+    /// `choices[].text` (not `message.content`) for API compatibility.
+    fn handle_legacy_completion(&self, body: &str) -> Result<String, ProxyError> {
+        let req = Self::parse_legacy_completion(body)?;
+        let (resp, label, logprob) = self.run_completion(&req)?;
+        self.log_cost(label, &resp, logprob);
+        Ok(build_legacy_completion_response(&resp, label))
+    }
+
     /// Parse an OpenAI embeddings `input`: a string or an array of strings.
     fn parse_embeddings_request(body: &str) -> Result<Vec<String>, ProxyError> {
         let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
@@ -844,6 +898,22 @@ impl Proxy {
                             return Ok(());
                         }
                     },
+                    Err(e) => {
+                        write_response(
+                            stream,
+                            e.status(),
+                            &build_error_response(e.message(), e.kind()),
+                            &extra,
+                            false,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            } else if method == "POST" && path.starts_with("/v1/completions") {
+                // Legacy text-completion API shim — maps prompt→chat message,
+                // routes through the same pipeline, returns object:"text_completion".
+                match self.handle_legacy_completion(&body) {
+                    Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
                     Err(e) => {
                         write_response(
                             stream,
@@ -1318,6 +1388,28 @@ pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> St
         unix_now(),
         escape_string(&resp.model),
         route_label,
+        escape_string(&resp.content),
+        resp.prompt_tokens,
+        resp.completion_tokens,
+        total,
+    )
+}
+
+/// Build a legacy `text_completion` response for `POST /v1/completions`.
+/// Uses `"object":"text_completion"` and `choices[].text` (not `message.content`)
+/// so old SDK clients that probe the pre-chat API receive a valid reply.
+pub fn build_legacy_completion_response(resp: &CompletionResponse, route_label: &str) -> String {
+    let total = resp.prompt_tokens + resp.completion_tokens;
+    let fp = fingerprint_for_model(&resp.model);
+    // IDs for text completions use the "cmpl-" prefix (matching OpenAI convention).
+    let id = next_completion_id().replace("chatcmpl-", "cmpl-");
+    format!(
+        "{{\"id\":\"{id}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\
+\"system_fingerprint\":\"{fp}\",\"x_pasture_route\":\"{route_label}\",\
+\"choices\":[{{\"text\":\"{}\",\"index\":0,\"logprobs\":null,\"finish_reason\":\"stop\"}}],\
+\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        unix_now(),
+        escape_string(&resp.model),
         escape_string(&resp.content),
         resp.prompt_tokens,
         resp.completion_tokens,
@@ -3204,6 +3296,69 @@ mod tests {
             req.has_tools,
             "named tool_choice object should set has_tools"
         );
+    }
+
+    // ── /v1/completions legacy shim (IMP-legacy-completions) ─────────────────
+
+    #[test]
+    fn test_parse_legacy_completion_string_prompt() {
+        let req = Proxy::parse_legacy_completion(
+            r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, "user");
+        assert_eq!(req.messages[0].content, "Say hi");
+    }
+
+    #[test]
+    fn test_parse_legacy_completion_array_prompt() {
+        let req = Proxy::parse_legacy_completion(
+            r#"{"prompt":["Hello","world"]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.messages[0].content, "Hello\nworld");
+    }
+
+    #[test]
+    fn test_parse_legacy_completion_missing_prompt_errors() {
+        assert!(Proxy::parse_legacy_completion(r#"{"model":"m"}"#).is_err());
+    }
+
+    #[test]
+    fn test_build_legacy_completion_response_shape() {
+        let resp = CompletionResponse {
+            content: "hi there".to_string(),
+            model: "local-model".to_string(),
+            prompt_tokens: 5,
+            completion_tokens: 3,
+        };
+        let json = build_legacy_completion_response(&resp, "local");
+        assert!(json.contains("\"object\":\"text_completion\""), "{json}");
+        assert!(json.contains("\"text\":\"hi there\""), "{json}");
+        assert!(json.contains("\"finish_reason\":\"stop\""), "{json}");
+        assert!(json.contains("\"prompt_tokens\":5"), "{json}");
+        assert!(json.contains("\"total_tokens\":8"), "{json}");
+        assert!(json.starts_with("{\"id\":\"cmpl-"), "{json}");
+    }
+
+    #[test]
+    fn test_legacy_completion_roundtrip_returns_200_text_completion() {
+        let p = proxy_with(true, false, 100, "unused");
+        let body = r#"{"model":"m","prompt":"hello"}"#;
+        let (status, resp_body) = roundtrip(p, http_post("/v1/completions", body));
+        assert_eq!(status, 200, "body: {resp_body}");
+        assert!(
+            resp_body.contains("\"object\":\"text_completion\""),
+            "body: {resp_body}"
+        );
+    }
+
+    #[test]
+    fn test_legacy_completion_wrong_method_returns_405() {
+        let p = proxy_with(true, false, 100, "unused");
+        let (status, _) = roundtrip(p, "GET /v1/completions HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 405);
     }
 
     #[test]

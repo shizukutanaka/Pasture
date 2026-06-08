@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `POST /v1/completions` legacy text-completion shim (IMP-legacy-completions)
+
+- Older LLM clients (pre-chat OpenAI SDK, LM Studio, some LangChain versions)
+  default to the deprecated `POST /v1/completions` endpoint. Pasture now accepts
+  those requests: the `prompt` field (string or string array) is mapped to a
+  single user message and routed through the same privacy / routing / cache
+  pipeline. The response uses `"object":"text_completion"` with `choices[].text`
+  and a `cmpl-` ID prefix, matching the OpenAI convention.
+- Streaming not supported via this shim; use `POST /v1/chat/completions` with
+  `"stream":true` instead.
+- Wrong-method requests (`GET /v1/completions`) return 405. 6 tests.
+
 ### Added — `tool_choice` as a hard escalation signal (IMP-tool-choice)
 
 - `tool_choice` values other than `"none"` (`"auto"`, `"required"`, or a named

@@ -221,6 +221,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-055 `POST /v1/completions` legacy shim (IMP-legacy-completions).**
+  Many older LLM clients (pre-chat OpenAI SDK, LM Studio, older LangChain)
+  default to `POST /v1/completions` (text-completion API, now deprecated) and
+  silently break with a 404. `parse_legacy_completion` maps the `prompt` field
+  (string or string array) to a single `user` message so the request flows
+  through the same routing/privacy/cache pipeline. `build_legacy_completion_response`
+  formats the output as `"object":"text_completion"` with `choices[].text` and
+  a `cmpl-` ID prefix matching OpenAI convention. `handle_legacy_completion`
+  wraps both. Route `/v1/completions` added to dispatch and `route_allowed_methods`
+  (returns 405 for wrong method). Streaming not supported via this shim. 6 tests.
 - **ADR-054 `tool_choice` as a hard escalation signal (IMP-tool-choice).**
   `parse_request` previously set `has_tools` only when a non-empty `tools` or
   `functions` array was present. Some clients send `tool_choice` without a
