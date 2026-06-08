@@ -43,6 +43,9 @@ pub struct Config {
     /// Optional user-defined system prompt prepended to every request.
     /// Loaded from `PASTURE_SYSTEM_PROMPT` env var or `system_prompt` config key.
     pub system_prompt: String,
+    /// Optional path for the structured per-request access log (IMP-access-log).
+    /// Appends one JSONL record per request. Empty string = disabled.
+    pub access_log: String,
 }
 
 impl Default for Config {
@@ -75,6 +78,7 @@ impl Default for Config {
             cors_origins: String::new(),
             request_timeout_secs: 30,
             system_prompt: String::new(),
+            access_log: String::new(),
         }
     }
 }
@@ -200,6 +204,9 @@ impl Config {
         if let Ok(v) = std::env::var("PASTURE_SYSTEM_PROMPT") {
             self.system_prompt = v;
         }
+        if let Ok(v) = std::env::var("PASTURE_ACCESS_LOG") {
+            self.access_log = v;
+        }
         self
     }
 
@@ -266,6 +273,7 @@ impl Config {
                 }
             }
             "system_prompt" => self.system_prompt = val.to_string(),
+            "access_log" => self.access_log = val.to_string(),
             _ => {}
         }
     }

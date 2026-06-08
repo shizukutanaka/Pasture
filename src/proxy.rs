@@ -158,6 +158,10 @@ pub struct Proxy {
     /// specifies this model name, the route is forced to Cloud. The sentinel
     /// `"cloud"` also forces Cloud.
     cloud_model_name: String,
+    /// Optional path for the structured per-request access log (IMP-access-log).
+    /// Appends one JSONL record per request: ts, method, path, status, ms, request_id.
+    /// No prompt content, no auth tokens, no PII. None = disabled.
+    access_log: Option<String>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -190,7 +194,13 @@ impl Proxy {
             system_prompt: None,
             local_model_name: String::new(),
             cloud_model_name: String::new(),
+            access_log: None,
         }
+    }
+
+    pub fn with_access_log(mut self, path: Option<String>) -> Self {
+        self.access_log = path;
+        self
     }
 
     /// Set a per-connection socket read/write timeout (IMP-timeout). A slow or
@@ -981,17 +991,51 @@ impl Proxy {
             // routing + backend time but not TCP accept or header reading.
             let t0 = std::time::Instant::now();
             let te = || format!("{}X-Response-Time: {}ms\r\n", extra, t0.elapsed().as_millis());
+            // Normalised path (no query string) for access-log entries.
+            let norm_path = path.split('?').next().unwrap_or(&path);
+            // Local macros log and write each response (IMP-access-log). Using
+            // macros (not closures) so `stream` can be borrowed mutably in the body.
+            macro_rules! access_log {
+                ($s:expr) => {
+                    if let Some(ref log_path) = self.access_log {
+                        append_access_log(
+                            log_path,
+                            &method,
+                            norm_path,
+                            $s,
+                            t0.elapsed().as_millis(),
+                            request_id.as_deref(),
+                        );
+                    }
+                };
+            }
+            macro_rules! wr {
+                ($s:expr, $b:expr, $e:expr, $ka:expr) => {{
+                    access_log!($s);
+                    write_response(stream, $s, $b, $e, $ka)?;
+                }};
+            }
+            macro_rules! wrp {
+                ($b:expr, $e:expr, $ka:expr) => {{
+                    access_log!(200u16);
+                    write_plain_response(stream, $b, $e, $ka)?;
+                }};
+            }
+            macro_rules! wrh {
+                ($s:expr, $l:expr, $e:expr, $ka:expr) => {{
+                    access_log!($s);
+                    write_head_response(stream, $s, $l, $e, $ka)?;
+                }};
+            }
             // CORS preflight: answer OPTIONS before the gate (preflight is credential-free).
             if method == "OPTIONS" {
                 match self.cors_preflight(origin.as_deref()) {
-                    Some(h) => write_response(stream, 204, "", &format!("{}X-Response-Time: {}ms\r\n", h, t0.elapsed().as_millis()), keep_alive)?,
-                    None => write_response(
-                        stream,
-                        404,
-                        &build_error_response("not found", "invalid_request_error"),
-                        &te(),
-                        keep_alive,
-                    )?,
+                    Some(h) => {
+                        let h_timed = format!("{}X-Response-Time: {}ms\r\n", h, t0.elapsed().as_millis());
+                        access_log!(204u16);
+                        write_response(stream, 204, "", &h_timed, keep_alive)?;
+                    }
+                    None => wr!(404, &build_error_response("not found", "invalid_request_error"), &te(), keep_alive),
                 }
                 // Preflight doesn't count as content: the client follows up immediately.
                 if !keep_alive {
@@ -1001,13 +1045,7 @@ impl Proxy {
             }
             // Auth + rate-limit gating (IMP-15); /health is exempt.
             if let Some((status, msg, kind)) = self.check_gate(&path, auth.as_deref()) {
-                write_response(
-                    stream,
-                    status,
-                    &build_error_response(msg, kind),
-                    &te(),
-                    false,
-                )?;
+                wr!(status, &build_error_response(msg, kind), &te(), false);
                 return Ok(());
             }
             // 415 Unsupported Media Type: POST requests must carry JSON bodies.
@@ -1017,16 +1055,7 @@ impl Proxy {
             if method == "POST" {
                 if let Some(ct) = &content_type {
                     if !ct.starts_with("application/json") {
-                        write_response(
-                            stream,
-                            415,
-                            &build_error_response(
-                                "unsupported media type; use application/json",
-                                "invalid_request_error",
-                            ),
-                            &te(),
-                            false,
-                        )?;
+                        wr!(415, &build_error_response("unsupported media type; use application/json", "invalid_request_error"), &te(), false);
                         return Ok(());
                     }
                 }
@@ -1036,30 +1065,19 @@ impl Proxy {
                     Ok(req) if req.stream => {
                         // SSE is a long-lived stream; always close the connection afterwards.
                         let include_usage = Self::parse_include_usage(&body);
+                        access_log!(200u16); // SSE header sent before streaming; log TTFB
                         self.stream_chat_to_socket(stream, &req, &te(), include_usage)?;
                         return Ok(());
                     }
                     Ok(req) => match self.complete_buffered(&req) {
-                        Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
+                        Ok(resp) => wr!(200, &resp, &te(), keep_alive),
                         Err(e) => {
-                            write_response(
-                                stream,
-                                e.status(),
-                                &build_error_response(e.message(), e.kind()),
-                                &te(),
-                                false,
-                            )?;
+                            wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
                             return Ok(());
                         }
                     },
                     Err(e) => {
-                        write_response(
-                            stream,
-                            e.status(),
-                            &build_error_response(e.message(), e.kind()),
-                            &te(),
-                            false,
-                        )?;
+                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
                         return Ok(());
                     }
                 }
@@ -1067,29 +1085,17 @@ impl Proxy {
                 // Legacy text-completion API shim — maps prompt→chat message,
                 // routes through the same pipeline, returns object:"text_completion".
                 match self.handle_legacy_completion(&body) {
-                    Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
+                    Ok(resp) => wr!(200, &resp, &te(), keep_alive),
                     Err(e) => {
-                        write_response(
-                            stream,
-                            e.status(),
-                            &build_error_response(e.message(), e.kind()),
-                            &te(),
-                            false,
-                        )?;
+                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
                         return Ok(());
                     }
                 }
             } else if method == "POST" && path.starts_with("/v1/embeddings") {
                 match self.handle_embeddings(&body) {
-                    Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
+                    Ok(resp) => wr!(200, &resp, &te(), keep_alive),
                     Err(e) => {
-                        write_response(
-                            stream,
-                            e.status(),
-                            &build_error_response(e.message(), e.kind()),
-                            &te(),
-                            false,
-                        )?;
+                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
                         return Ok(());
                     }
                 }
@@ -1098,44 +1104,26 @@ impl Proxy {
                 // moderation; the stub prevents SDK clients that call this endpoint
                 // unconditionally from receiving a 404.
                 match Self::handle_moderations(&body) {
-                    Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
+                    Ok(resp) => wr!(200, &resp, &te(), keep_alive),
                     Err(e) => {
-                        write_response(
-                            stream,
-                            e.status(),
-                            &build_error_response(e.message(), e.kind()),
-                            &te(),
-                            false,
-                        )?;
+                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
                         return Ok(());
                     }
                 }
             } else if method == "GET" && path.starts_with("/v1/stats") {
                 match self.handle_stats() {
-                    Ok(resp) => write_response(stream, 200, &resp, &te(), keep_alive)?,
+                    Ok(resp) => wr!(200, &resp, &te(), keep_alive),
                     Err(e) => {
-                        write_response(
-                            stream,
-                            e.status(),
-                            &build_error_response(e.message(), e.kind()),
-                            &te(),
-                            false,
-                        )?;
+                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
                         return Ok(());
                     }
                 }
             } else if method == "GET" && path.starts_with("/metrics") {
                 // Prometheus text-format scrape endpoint (IMP-metrics-prom).
                 match self.handle_metrics() {
-                    Ok(resp) => write_plain_response(stream, &resp, &te(), keep_alive)?,
+                    Ok(resp) => wrp!(&resp, &te(), keep_alive),
                     Err(e) => {
-                        write_response(
-                            stream,
-                            e.status(),
-                            &build_error_response(e.message(), e.kind()),
-                            &te(),
-                            false,
-                        )?;
+                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
                         return Ok(());
                     }
                 }
@@ -1157,29 +1145,14 @@ impl Proxy {
                         .unwrap_or(after)
                         .trim_end_matches('/');
                     match build_model_response(&self.models, id) {
-                        Some(b) => write_response(stream, 200, &b, &te(), keep_alive)?,
+                        Some(b) => wr!(200, &b, &te(), keep_alive),
                         None => {
-                            write_response(
-                                stream,
-                                404,
-                                &build_error_response(
-                                    &format!("model '{id}' not found"),
-                                    "invalid_request_error",
-                                ),
-                                &te(),
-                                false,
-                            )?;
+                            wr!(404, &build_error_response(&format!("model '{id}' not found"), "invalid_request_error"), &te(), false);
                             return Ok(());
                         }
                     }
                 } else {
-                    write_response(
-                        stream,
-                        200,
-                        &build_models_response(&self.models),
-                        &te(),
-                        keep_alive,
-                    )?;
+                    wr!(200, &build_models_response(&self.models), &te(), keep_alive);
                 }
             } else if (method == "GET" || method == "HEAD") && path.starts_with("/health") {
                 // HEAD: identical headers to GET but no body (RFC 7231 §4.3.2).
@@ -1190,31 +1163,23 @@ impl Proxy {
                     "\"}"
                 );
                 if method == "HEAD" {
-                    write_head_response(stream, 200, HEALTH_BODY.len(), &te(), keep_alive)?;
+                    wrh!(200, HEALTH_BODY.len(), &te(), keep_alive);
                 } else {
-                    write_response(stream, 200, HEALTH_BODY, &te(), keep_alive)?;
+                    wr!(200, HEALTH_BODY, &te(), keep_alive);
                 }
             } else if method == "POST"
                 && (path.starts_with("/v1/audio") || path.starts_with("/v1/images"))
             {
                 // Audio and image generation are not implemented in Pasture.
                 // Return 501 (not 404) so clients know the path is recognised but unsupported.
-                write_response(
-                    stream,
-                    501,
-                    &build_error_response(
-                        "audio and image endpoints are not supported by Pasture",
-                        "not_supported",
-                    ),
-                    &te(),
-                    false,
-                )?;
+                wr!(501, &build_error_response("audio and image endpoints are not supported by Pasture", "not_supported"), &te(), false);
                 return Ok(());
             } else if let Some(allow) =
                 Self::route_allowed_methods(path.split('?').next().unwrap_or(&path))
             {
                 // Known path, wrong method → 405 with Allow header (RFC 7231 §6.5.5).
                 let method_extra = format!("Allow: {allow}\r\n{}", te());
+                access_log!(405u16);
                 write_response(
                     stream,
                     405,
@@ -1224,13 +1189,7 @@ impl Proxy {
                 )?;
                 return Ok(());
             } else {
-                write_response(
-                    stream,
-                    404,
-                    &build_error_response("not found", "invalid_request_error"),
-                    &te(),
-                    false,
-                )?;
+                wr!(404, &build_error_response("not found", "invalid_request_error"), &te(), false);
                 return Ok(());
             }
             if !keep_alive {
@@ -2043,6 +2002,38 @@ fn write_plain_response(
         body.len()
     );
     stream.write_all(response.as_bytes())
+}
+
+/// Append one access-log record (JSONL, no PII) to the configured file.
+/// Fields: ts (Unix epoch ms), method, path (no query string), status, ms, request_id?.
+/// Silently ignores write errors (access log is best-effort; never drops the request).
+fn append_access_log(
+    path: &str,
+    method: &str,
+    norm_path: &str,
+    status: u16,
+    ms: u128,
+    request_id: Option<&str>,
+) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let req_id_field = match request_id {
+        Some(id) => format!(",\"request_id\":\"{}\"", crate::json::escape_string(id)),
+        None => String::new(),
+    };
+    let line = format!(
+        "{{\"ts\":{ts},\"method\":\"{method}\",\"path\":\"{norm_path}\",\"status\":{status},\"ms\":{ms}{req_id_field}}}\n"
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -3124,6 +3115,85 @@ mod tests {
             header_block.to_ascii_lowercase().contains("x-response-time:"),
             "X-Response-Time missing from chat completions response:\n{raw}"
         );
+    }
+
+    // ── Access log (IMP-access-log) ────────────────────────────────────────────
+
+    fn proxy_with_access_log(log: &str, access: &str) -> Proxy {
+        let engine = RoutingEngine::new(100, true, false);
+        Proxy::new(
+            engine,
+            Some(Box::new(MockBackend::new("local", "local-reply")) as Box<dyn Backend>),
+            None,
+            log,
+        )
+        .with_access_log(Some(access.to_string()))
+    }
+
+    #[test]
+    fn test_access_log_records_successful_request() {
+        let log = tmp_log();
+        let access = tmp_log();
+        let p = proxy_with_access_log(&log, &access);
+        let req = http_post(
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let (status, _) = roundtrip(p, req);
+        assert_eq!(status, 200);
+        let entries = std::fs::read_to_string(&access).unwrap_or_default();
+        assert!(!entries.is_empty(), "access log should not be empty");
+        let parsed: crate::json::JsonValue = crate::json::parse(&entries.trim_end_matches('\n').lines().next().unwrap_or("{}")).unwrap();
+        assert_eq!(parsed.get("status").and_then(|v| v.as_f64()), Some(200.0), "status: {parsed:?}");
+        assert_eq!(parsed.get("method").and_then(|v| v.as_str()), Some("POST"));
+        assert_eq!(parsed.get("path").and_then(|v| v.as_str()), Some("/v1/chat/completions"));
+        assert!(parsed.get("ms").is_some(), "missing ms field");
+        assert!(parsed.get("ts").is_some(), "missing ts field");
+    }
+
+    #[test]
+    fn test_access_log_records_error_response() {
+        let access = tmp_log();
+        let p = proxy_with_access_log("unused", &access);
+        let (status, _) = roundtrip(p, "GET /no/such HTTP/1.1\r\nConnection: close\r\n\r\n".to_string());
+        assert_eq!(status, 404);
+        let entries = std::fs::read_to_string(&access).unwrap_or_default();
+        let line = entries.trim_end_matches('\n').lines().next().unwrap_or("{}");
+        let parsed: crate::json::JsonValue = crate::json::parse(line).unwrap();
+        assert_eq!(parsed.get("status").and_then(|v| v.as_f64()), Some(404.0));
+    }
+
+    #[test]
+    fn test_access_log_includes_request_id() {
+        let log = tmp_log();
+        let access = tmp_log();
+        let p = proxy_with_access_log(&log, &access);
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nX-Request-ID: test-id-1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#.len(),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let (status, _) = roundtrip(p, raw);
+        assert_eq!(status, 200);
+        let entries = std::fs::read_to_string(&access).unwrap_or_default();
+        let line = entries.trim_end_matches('\n').lines().next().unwrap_or("{}");
+        let parsed: crate::json::JsonValue = crate::json::parse(line).unwrap();
+        assert_eq!(parsed.get("request_id").and_then(|v| v.as_str()), Some("test-id-1"), "line: {line}");
+    }
+
+    #[test]
+    fn test_access_log_disabled_by_default() {
+        let log = tmp_log();
+        let engine = RoutingEngine::new(100, true, false);
+        let p = Proxy::new(
+            engine,
+            Some(Box::new(MockBackend::new("local", "local-reply")) as Box<dyn Backend>),
+            None,
+            &log,
+        );
+        // No with_access_log call — access_log is None by default.
+        let (status, _) = roundtrip(p, http_post("/v1/chat/completions", r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#));
+        assert_eq!(status, 200); // just verify it still works without access log
     }
 
     // ── /health version field + /v1/audio|images 501 stubs ────────────────────

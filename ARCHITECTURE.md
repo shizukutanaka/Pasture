@@ -221,6 +221,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-066 Structured per-request access log (IMP-access-log).** Operators need
+  per-request visibility without parsing cost JSONL or scraping `/metrics`.
+  `Proxy` gains `access_log: Option<String>` and `with_access_log` builder.
+  `append_access_log` writes a JSONL line before each response: `ts` (Unix ms),
+  `method`, `path` (no query string), `status`, `ms`, optional `request_id`. No
+  prompt content, no auth tokens, no PII. Enabled via `PASTURE_ACCESS_LOG=<path>`
+  or `access_log = <path>` config key. `handle_connection` uses local `wr!` / `wrp!`
+  / `wrh!` macros that combine status tracking, logging, and response writing into
+  one call, replacing 20+ scattered `write_response` calls. Off by default;
+  std-only; 4 tests.
 - **ADR-065 `/health` version field + 501 stubs for audio/images (IMP-health-version).**
   `/health` now returns `{"status":"ok","version":"<ver>"}` using `concat!/env!` at
   compile time so version is always correct. `POST /v1/audio/*` and

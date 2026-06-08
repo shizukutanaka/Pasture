@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Structured per-request access log (IMP-access-log)
+
+- Set `PASTURE_ACCESS_LOG=/path/to/access.jsonl` (or `access_log =` in config) to
+  enable an append-only per-request access log. Each line is a JSON object with:
+  `ts` (Unix epoch ms), `method`, `path` (no query string), `status`, `ms`
+  (elapsed), and optionally `request_id`. No prompt content, no auth tokens, no PII.
+  Off by default. `std-only`; 4 tests (ADR-066).
+
 ### Changed — `/health` now includes `version` field (IMP-health-version)
 
 - `GET /health` response body is now `{"status":"ok","version":"<ver>"}` (compile-time
