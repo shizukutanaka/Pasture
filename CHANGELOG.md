@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `Retry-After` header on 429 responses (IMP-retry-after)
+
+- When the rate limiter rejects a request, the `429` response now includes a
+  `Retry-After: <seconds>` header (RFC 7231 §7.1.3) computed from the token
+  bucket's time-to-next-token, so clients back off exactly long enough instead of
+  retrying immediately. Matches OpenAI / LiteLLM / nginx behaviour. Std-only;
+  4 tests (ADR-071).
+
 ### Added — Machine approval gate for the self-improvement ledger (IMP-approval-gate)
 
 - `pasture improvements --review` lists only the entries the machine gate cannot

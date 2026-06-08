@@ -307,18 +307,24 @@ impl Proxy {
     /// Apply rate-limit then auth gating for a request path (IMP-15). Returns
     /// `Some((status, message, type))` when the request must be rejected, else
     /// `None`. `/health` is always exempt so liveness probes work unauthenticated.
+    /// The fourth tuple element is a `Retry-After` value in whole seconds, set
+    /// only for a `429` so the caller can advise the client when to retry.
     fn check_gate(
         &self,
         path: &str,
         auth: Option<&str>,
-    ) -> Option<(u16, &'static str, &'static str)> {
+    ) -> Option<(u16, &'static str, &'static str, Option<u64>)> {
         if path.starts_with("/health") {
             return None;
         }
         if let Some(rl) = &self.rate_limiter {
-            let allowed = rl.lock().map(|mut g| g.allow()).unwrap_or(true);
-            if !allowed {
-                return Some((429, "rate limit exceeded", "rate_limit_error"));
+            // Hold the guard so the Retry-After estimate reflects the same bucket
+            // state as the denial. A poisoned lock fails open (request allowed).
+            if let Ok(mut g) = rl.lock() {
+                if !g.allow() {
+                    let retry = g.retry_after_secs();
+                    return Some((429, "rate limit exceeded", "rate_limit_error", Some(retry)));
+                }
             }
         }
         if let Some(expected) = &self.auth_token {
@@ -327,6 +333,7 @@ impl Proxy {
                     401,
                     "missing or invalid Authorization bearer token",
                     "invalid_request_error",
+                    None,
                 ));
             }
         }
@@ -1054,9 +1061,16 @@ impl Proxy {
                 }
                 continue;
             }
-            // Auth + rate-limit gating (IMP-15); /health is exempt.
-            if let Some((status, msg, kind)) = self.check_gate(&path, auth.as_deref()) {
-                wr!(status, &build_error_response(msg, kind), &te(), false);
+            // Auth + rate-limit gating (IMP-15); /health is exempt. A 429 carries
+            // a Retry-After header (RFC 7231 §7.1.3) so clients back off precisely.
+            if let Some((status, msg, kind, retry_after)) = self.check_gate(&path, auth.as_deref())
+            {
+                let gate_extra = match retry_after {
+                    Some(secs) => format!("Retry-After: {secs}\r\n{}", te()),
+                    None => te(),
+                };
+                access_log!(status);
+                write_response(stream, status, &build_error_response(msg, kind), &gate_extra, false)?;
                 return Ok(());
             }
             // 415 Unsupported Media Type: POST requests must carry JSON bodies.
@@ -2791,9 +2805,28 @@ mod tests {
         let p = proxy_with(true, false, 100, "unused").with_rate_limit(1);
         // First request consumes the only token; second is rejected with 429.
         assert!(p.check_gate("/v1/models", None).is_none());
-        assert_eq!(p.check_gate("/v1/models", None).map(|g| g.0), Some(429));
+        let denied = p.check_gate("/v1/models", None).expect("second request denied");
+        assert_eq!(denied.0, 429);
+        // The 429 must carry a positive Retry-After estimate (RFC 7231 §7.1.3).
+        assert!(matches!(denied.3, Some(secs) if secs >= 1));
         // /health bypasses the limiter.
         assert!(p.check_gate("/health", None).is_none());
+    }
+
+    #[test]
+    fn test_roundtrip_429_carries_retry_after_header() {
+        // Two pipelined GETs on one keep-alive connection: the first consumes the
+        // only token, the second is rate-limited and must include Retry-After.
+        let p = proxy_with(true, false, 100, "unused").with_rate_limit(1);
+        let raw = "GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n\
+                   GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n"
+            .to_string();
+        let resp = roundtrip_raw(p, raw);
+        assert!(resp.contains("429"), "expected a 429 in: {resp}");
+        assert!(
+            resp.contains("Retry-After:"),
+            "429 response missing Retry-After header: {resp}"
+        );
     }
 
     #[test]

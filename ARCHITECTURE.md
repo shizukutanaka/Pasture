@@ -221,6 +221,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-071 `Retry-After` on 429 rate-limit responses (IMP-retry-after).** The
+  rate limiter (IMP-15) returned `429` with no `Retry-After`, so a client had to
+  guess a backoff and could busy-retry against an empty bucket. `RateLimiter`
+  gains `retry_after_secs()` — whole seconds until the next token (`ceil`, never
+  below 1 once empty, 0 when a token is available); a zero-rate bucket advises a
+  conservative 60s. `check_gate` now holds the bucket mutex across the `allow()`
+  check and the estimate so both reflect the same state, and returns the value as
+  a fourth tuple element (set only for `429`). `handle_connection` prepends
+  `Retry-After: <secs>` to the `429` response's header block. OpenAI, LiteLLM and
+  nginx all send this header. Additive, std-only; 4 tests (3 limiter-math, 1
+  keep-alive roundtrip asserting the header on the second, rate-limited request).
 - **ADR-070 Machine approval gate for the improvement ledger (IMP-approval-gate).**
   Recursive self-improvement is bottlenecked by *human approval cost*. The ledger
   validator (`is_valid`) only checked that causal fields were *present*, so a human

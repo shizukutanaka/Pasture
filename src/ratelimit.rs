@@ -47,6 +47,23 @@ impl RateLimiter {
             false
         }
     }
+
+    /// Whole seconds until at least one token is available again. Call after
+    /// `allow()` returns `false` to populate a `Retry-After` header so a polite
+    /// client backs off exactly long enough instead of hammering (RFC 7231
+    /// §7.1.3). Returns 0 when a token is already available, and never less than
+    /// 1 once the bucket is empty (clients must wait a measurable interval).
+    pub fn retry_after_secs(&self) -> u64 {
+        if self.tokens >= 1.0 {
+            return 0;
+        }
+        if self.refill_per_sec <= 0.0 {
+            // A zero-rate bucket never refills; advise a conservative minute.
+            return 60;
+        }
+        let needed = 1.0 - self.tokens;
+        (needed / self.refill_per_sec).ceil().max(1.0) as u64
+    }
 }
 
 #[cfg(test)]
@@ -91,5 +108,34 @@ mod tests {
         let mut rl = RateLimiter::per_minute(1);
         assert!(rl.allow());
         assert!(!rl.allow());
+    }
+
+    #[test]
+    fn test_retry_after_zero_when_token_available() {
+        let rl = RateLimiter::per_minute(10);
+        // Fresh bucket is full, so a request would be admitted -> no wait.
+        assert_eq!(rl.retry_after_secs(), 0);
+    }
+
+    #[test]
+    fn test_retry_after_one_second_at_one_per_sec() {
+        let mut rl = RateLimiter::per_minute(60); // 1 token/sec
+        for _ in 0..60 {
+            assert!(rl.step(0.0));
+        }
+        assert!(!rl.step(0.0)); // empty
+        // Need one whole token at 1/sec -> 1 second.
+        assert_eq!(rl.retry_after_secs(), 1);
+    }
+
+    #[test]
+    fn test_retry_after_rounds_up_for_slow_refill() {
+        let mut rl = RateLimiter::per_minute(30); // 0.5 token/sec
+        for _ in 0..30 {
+            assert!(rl.step(0.0));
+        }
+        assert!(!rl.step(0.0)); // empty
+        // Need one token at 0.5/sec -> 2 seconds.
+        assert_eq!(rl.retry_after_secs(), 2);
     }
 }
