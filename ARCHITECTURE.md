@@ -221,6 +221,15 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-038 Live metrics endpoint (IMP-metrics, IMP-16).** Observability was
+  CLI-only (`stats` reads the cost log). Peer gateways expose a live metrics view;
+  the proxy now answers `GET /v1/stats` with a JSON snapshot of the same PII-free
+  counters (`total`, per-route counts, cloud/cache rates, token totals, spend),
+  reusing `cost::summarize` over `cost::read_log`. Purely additive and read-only —
+  no routing behaviour changes; a missing cost log reads as all-zeros. std-only;
+  localhost-default, so no auth is implied (I5). `build_stats_response` is a pure
+  builder, unit-tested alongside a socket round-trip. JSON-format (not Prometheus)
+  to avoid a new format contract; the `object` field is `pasture.stats`.
 - **ADR-037 Self-improvement ledger (IMP-13).** Pasture's improvement history
   lived only as human prose across `CHANGELOG.md`, this file, and `COMPETITIVE.md`.
   Framed by the recursive-self-improvement argument that the durable asset is a

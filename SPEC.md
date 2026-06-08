@@ -103,6 +103,13 @@ backend is reachable the proxy returns `502` with the OpenAI error envelope (§3
 Privacy rules do not apply to embeddings (the vector is returned to the caller, not
 logged). Implemented by `handle_embeddings` (IMP-8 completion).
 
+### 3.2c `GET /v1/stats`
+`200`, JSON snapshot of the cost-log counters (IMP-metrics):
+`{"object":"pasture.stats","total","local","cloud","cache","cloud_rate","cache_rate",`
+`"prompt_tokens","completion_tokens","cloud_cost_usd"}`. Read-only and PII-free (I3);
+a missing cost log reads as all-zeros. No auth (localhost-default, I5). Implemented by
+`handle_stats` (ADR-038).
+
 ### 3.3 `GET /health`
 `200`, `{"status":"ok"}`.
 
@@ -260,11 +267,12 @@ or via `PASTURE_LANG`. A test enforces EN/JA key parity.
 ## 12. Conformance & gaps
 
 **Satisfied by the current implementation:** §2 CLI; §3.1–3.3 (incl. `/v1/models`,
-IMP-8) **+ §3.2b `/v1/embeddings` (IMP-8 completion, ADR-034)**; §4 routing incl.
-tools (IMP-10) **+ `local_only` (ADR-035)**; §5 privacy; §6 cascade/cache/backends
-incl. cloud retry+fallback (IMP-9); §8 config **+ `PASTURE_LOCAL_ONLY`,
-`PASTURE_LOCAL_FAST_MODEL`, `PASTURE_INJECT_CONTEXT` (ADR-035)**; §9 cost log;
-§10 eval; §11 i18n; §7 header cap + parser depth.
+IMP-8) **+ §3.2b `/v1/embeddings` (IMP-8 completion, ADR-034) + §3.2c `/v1/stats`
+(IMP-metrics, ADR-038)**; §4 routing incl. tools (IMP-10) **+ `local_only`
+(ADR-035)**; §5 privacy; §6 cascade/cache/backends incl. cloud retry+fallback
+(IMP-9); §8 config **+ `PASTURE_LOCAL_ONLY`, `PASTURE_LOCAL_FAST_MODEL`,
+`PASTURE_INJECT_CONTEXT` (ADR-035)**; §9 cost log; §10 eval; §11 i18n; §7 header cap
++ parser depth.
 
 **Gaps closed in this round (to satisfy this spec):**
 - **§3.5 error envelope.** Errors now emit `{"error":{"message,type}}` (were flat
@@ -281,5 +289,4 @@ incl. cloud retry+fallback (IMP-9); §8 config **+ `PASTURE_LOCAL_ONLY`,
 **Deferred (tracked in COMPETITIVE.md / RESEARCH.md):**
 - `tool_choice` is not separately inspected (only `tools`/`functions` arrays).
 - Multi-provider cloud fallback chain (IMP-9 remainder); auth + rate-limit (IMP-15);
-  live metrics endpoint (IMP-16); semantic cache (IMP-12); calibrated-uncertainty
-  escalation (IMP-13).
+  semantic cache (IMP-12); calibrated-uncertainty escalation (IMP-13).

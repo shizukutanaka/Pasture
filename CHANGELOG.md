@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — live metrics endpoint (IMP-metrics / IMP-16)
+
+- New **`GET /v1/stats`**: a live JSON snapshot of the cost-log counters —
+  `total`, per-route counts (`local`/`cloud`/`cache`), `cloud_rate`, `cache_rate`,
+  `prompt_tokens`, `completion_tokens`, `cloud_cost_usd` (`object:"pasture.stats"`).
+  Read-only and PII-free (I3), reusing `cost::summarize`; a missing cost log reads
+  as all-zeros. Gives a live observability view without parsing JSONL by hand;
+  previously this was only available via the `stats` CLI command. Purely additive,
+  std-only. New `Proxy::handle_stats` + pure `build_stats_response`; 4 tests
+  (shape, empty-log, counted requests, socket round-trip). Grounded in ADR-038.
+
 ### Added — self-improvement ledger (IMP-13)
 
 - New **`IMPROVEMENTS.jsonl`**: a machine-readable, causal record of every change

@@ -67,6 +67,7 @@ base_url = http://127.0.0.1:8645/v1
 - `POST /v1/embeddings` — pass-through to the local backend (Ollama or OpenAI-compat);
   returns the standard OpenAI embeddings shape. Local-only (no cloud escalation).
 - `GET /v1/models` — list the configured local (and cloud) model ids, OpenAI-compatible.
+- `GET /v1/stats` — live JSON snapshot of the cost-log counters (routes, rates, tokens, spend).
 - `GET /health` — liveness check.
 
 The response includes an `x_pasture_route` field telling you which way the request went.

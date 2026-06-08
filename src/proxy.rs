@@ -403,6 +403,17 @@ impl Proxy {
         Ok(build_embeddings_response(&resp))
     }
 
+    /// Handle `GET /v1/stats` (IMP-metrics): a live JSON view of the cost-log
+    /// counters (route counts, rates, tokens, spend) without parsing JSONL by
+    /// hand. Read-only over the PII-free cost log (I3); a missing log reads as
+    /// all-zeros. Localhost-default, so no auth is implied (I5).
+    pub fn handle_stats(&self) -> Result<String, ProxyError> {
+        let records = crate::cost::read_log(&self.cost_log_path)
+            .map_err(|e| ProxyError::Backend(e.to_string()))?;
+        let summary = crate::cost::summarize(&records);
+        Ok(build_stats_response(&summary))
+    }
+
     /// Parse an OpenAI embeddings `input`: a string or an array of strings.
     fn parse_embeddings_request(body: &str) -> Result<Vec<String>, ProxyError> {
         let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
@@ -449,7 +460,7 @@ impl Proxy {
             .unwrap_or(4)
             .clamp(2, 32);
         eprintln!(
-            "pasture: listening on http://{addr} ({workers} workers, POST /v1/chat/completions, GET /v1/models)"
+            "pasture: listening on http://{addr} ({workers} workers, POST /v1/chat/completions, GET /v1/models, GET /v1/stats)"
         );
 
         let proxy = Arc::new(self);
@@ -534,6 +545,17 @@ impl Proxy {
             }
         } else if method == "POST" && path.starts_with("/v1/embeddings") {
             match self.handle_embeddings(&body) {
+                Ok(resp) => write_response(stream, 200, &resp)?,
+                Err(e) => {
+                    write_response(
+                        stream,
+                        e.status(),
+                        &build_error_response(e.message(), e.kind()),
+                    )?;
+                }
+            }
+        } else if method == "GET" && path.starts_with("/v1/stats") {
+            match self.handle_stats() {
                 Ok(resp) => write_response(stream, 200, &resp)?,
                 Err(e) => {
                     write_response(
@@ -769,6 +791,26 @@ pub fn build_models_response(models: &[String]) -> String {
         })
         .collect();
     format!("{{\"object\":\"list\",\"data\":[{}]}}", entries.join(","))
+}
+
+/// Build the `GET /v1/stats` JSON body (IMP-metrics): live counters from the
+/// cost log. All values are PII-free aggregates (I3). Rates are rounded to 4 dp.
+pub fn build_stats_response(s: &crate::cost::CostSummary) -> String {
+    let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
+    format!(
+        "{{\"object\":\"pasture.stats\",\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
+\"cloud_rate\":{},\"cache_rate\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\
+\"cloud_cost_usd\":{}}}",
+        s.total,
+        s.local,
+        s.cloud,
+        s.cache,
+        round4(s.cloud_rate()),
+        round4(s.cache_rate()),
+        s.prompt_tokens,
+        s.completion_tokens,
+        round4(s.cloud_cost_usd),
+    )
 }
 
 /// Format a float vector as a JSON array (finite values; non-finite → 0).
@@ -1193,6 +1235,62 @@ mod tests {
                 .status(),
             503
         );
+    }
+
+    #[test]
+    fn test_build_stats_response_shape() {
+        let s = crate::cost::CostSummary {
+            total: 4,
+            local: 2,
+            cloud: 1,
+            cache: 1,
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cloud_cost_usd: 0.0123,
+        };
+        let json = build_stats_response(&s);
+        let v = crate::json::parse(&json).expect("valid json");
+        assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
+        assert_eq!(v.get("cloud").and_then(|x| x.as_f64()), Some(1.0));
+        assert_eq!(v.get("cloud_rate").and_then(|x| x.as_f64()), Some(0.25));
+        assert_eq!(v.get("cache_rate").and_then(|x| x.as_f64()), Some(0.25));
+        assert_eq!(
+            v.get("completion_tokens").and_then(|x| x.as_f64()),
+            Some(50.0)
+        );
+    }
+
+    #[test]
+    fn test_handle_stats_empty_log_is_zeros() {
+        // A non-existent cost log reads as all-zeros (no error).
+        let p = proxy_with(true, false, 100, "/no/such/cost-log.jsonl");
+        let json = p.handle_stats().unwrap();
+        let v = crate::json::parse(&json).expect("valid json");
+        assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(0.0));
+    }
+
+    #[test]
+    fn test_handle_stats_counts_logged_requests() {
+        // Drive 2 local completions through a real log file, then read stats.
+        let log = tmp_log();
+        let p = proxy_with(true, false, 100, &log);
+        p.handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+            .unwrap();
+        p.handle_chat(r#"{"messages":[{"role":"user","content":"yo"}]}"#)
+            .unwrap();
+        let json = p.handle_stats().unwrap();
+        let v = crate::json::parse(&json).expect("valid json");
+        assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(2.0));
+        assert_eq!(v.get("local").and_then(|x| x.as_f64()), Some(2.0));
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn test_roundtrip_stats_ok() {
+        let p = proxy_with(true, true, 100, "/no/such/cost-log.jsonl");
+        let (status, body) = roundtrip(p, "GET /v1/stats HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 200);
+        assert!(body.contains("\"object\":\"pasture.stats\""), "{body}");
     }
 
     #[test]
