@@ -221,6 +221,15 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-059 Model-pinned routing (IMP-model-pinning).** Clients that specify an
+  explicit model name in the request (e.g. `"model":"gpt-4o-mini"`) expect to
+  reach the corresponding backend regardless of what the routing engine would
+  normally decide for a short prompt. `classify_and_decide` now checks `req.model`
+  against the configured `local_model_name` and `cloud_model_name` (from
+  `PASTURE_LOCAL_MODEL` / `PASTURE_CLOUD_MODEL`) and the sentinels `"local"` /
+  `"cloud"`. When a match is found the route is forced via `decide_full(forced=…)`,
+  which still respects the privacy override (sensitive content stays local even
+  with `model:"cloud"`). `with_model_names` builder; wired in `cli.rs`. 5 tests.
 - **ADR-058 415 Unsupported Media Type for non-JSON POST bodies (IMP-content-type).**
   `read_request` now parses and lowercases the `Content-Type` header. For POST
   requests, if `Content-Type` is present and does not start with

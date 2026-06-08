@@ -1084,6 +1084,7 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         } else {
             Some(config.system_prompt.clone())
         })
+        .with_model_names(config.local_model.clone(), config.cloud_model.clone())
         .with_auth_token(config.auth_token.clone())
         .with_rate_limit(config.rate_limit)
         .with_cors(cors)

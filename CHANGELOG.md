@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Model-pinned routing via `req.model` (IMP-model-pinning)
+
+- Requests that specify a recognised model name are now routed to the matching
+  backend without consulting the routing engine's heuristics:
+  - `"model":"local"` or `"model":"<PASTURE_LOCAL_MODEL>"` → forced Local.
+  - `"model":"cloud"` or `"model":"<PASTURE_CLOUD_MODEL>"` → forced Cloud.
+- Privacy override still applies: sensitive content stays local even when
+  `model:"cloud"` is requested.
+- Unrecognised model names use normal routing (unchanged).
+- 5 tests.
+
 ### Added — Live cache hit/miss counters in `/v1/stats` (IMP-cache-counters)
 
 - `GET /v1/stats` now returns two new fields: `cache_hits` and `cache_misses`.

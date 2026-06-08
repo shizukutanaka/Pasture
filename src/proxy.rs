@@ -150,6 +150,14 @@ pub struct Proxy {
     /// (`PASTURE_SYSTEM_PROMPT`). Merged with any existing system message in the
     /// request (prepended). Complementary to `inject_context` (date/OS context).
     system_prompt: Option<String>,
+    /// Configured local model name (from `PASTURE_LOCAL_MODEL`). When a request
+    /// specifies this model name, the route is forced to Local regardless of the
+    /// routing engine's decision. The sentinel `"local"` also forces Local.
+    local_model_name: String,
+    /// Configured cloud model name (from `PASTURE_CLOUD_MODEL`). When a request
+    /// specifies this model name, the route is forced to Cloud. The sentinel
+    /// `"cloud"` also forces Cloud.
+    cloud_model_name: String,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -180,6 +188,8 @@ impl Proxy {
             cors: None,
             io_timeout: None,
             system_prompt: None,
+            local_model_name: String::new(),
+            cloud_model_name: String::new(),
         }
     }
 
@@ -319,6 +329,15 @@ impl Proxy {
     /// merged with any existing system message in the request (prepended).
     pub fn with_system_prompt(mut self, prompt: Option<String>) -> Self {
         self.system_prompt = prompt.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Set the known local and cloud model names for model-pinned routing.
+    /// When a request specifies `req.model == local_name` (or `"local"`), the
+    /// route is forced to Local; `cloud_name` (or `"cloud"`) forces Cloud.
+    pub fn with_model_names(mut self, local_name: String, cloud_name: String) -> Self {
+        self.local_model_name = local_name;
+        self.cloud_model_name = cloud_name;
         self
     }
 
@@ -484,9 +503,26 @@ impl Proxy {
                 report.categories.len()
             );
         }
+        // Model-pinned routing: if the client requested a specific model that we
+        // recognise, force the route to the matching backend so the backend can
+        // honour the exact model name. Sentinels "local" and "cloud" also work.
+        let forced = {
+            let m = req.model.as_str();
+            if m == "local"
+                || (!self.local_model_name.is_empty() && m == self.local_model_name)
+            {
+                Some(Route::Local)
+            } else if m == "cloud"
+                || (!self.cloud_model_name.is_empty() && m == self.cloud_model_name)
+            {
+                Some(Route::Cloud)
+            } else {
+                None
+            }
+        };
         let decision = self
             .engine
-            .decide_full(&text, None, sensitive, req.has_tools)
+            .decide_full(&text, forced, sensitive, req.has_tools)
             .map_err(|e| ProxyError::Routing(e.to_string()))?;
         Ok((decision, sensitive))
     }
@@ -3373,6 +3409,75 @@ mod tests {
             .handle_chat(r#"{"messages":[{"role":"user","content":"hello"}]}"#)
             .unwrap();
         assert!(resp.contains("local-reply"), "unexpected: {resp}");
+    }
+
+    // ── Model-pinned routing (IMP-model-pinning) ──────────────────────────────
+
+    fn proxy_with_models(local: bool, cloud: bool) -> Proxy {
+        let log = tmp_log();
+        let engine = RoutingEngine::new(10, local, cloud);
+        Proxy::new(
+            engine,
+            local.then(|| Box::new(MockBackend::new("local", "local-reply")) as Box<dyn Backend>),
+            cloud.then(|| Box::new(MockBackend::new("cloud", "cloud-reply")) as Box<dyn Backend>),
+            &log,
+        )
+        .with_model_names("llama3".to_string(), "gpt-4o-mini".to_string())
+    }
+
+    #[test]
+    fn test_model_sentinel_local_forces_local() {
+        let p = proxy_with_models(true, true);
+        let resp = p
+            .handle_chat(r#"{"model":"local","messages":[{"role":"user","content":"hi"}]}"#)
+            .unwrap();
+        assert!(resp.contains("local-reply"), "model:local should route local: {resp}");
+    }
+
+    #[test]
+    fn test_model_sentinel_cloud_forces_cloud() {
+        let p = proxy_with_models(true, true);
+        let resp = p
+            .handle_chat(r#"{"model":"cloud","messages":[{"role":"user","content":"hi"}]}"#)
+            .unwrap();
+        assert!(resp.contains("cloud-reply"), "model:cloud should route cloud: {resp}");
+    }
+
+    #[test]
+    fn test_configured_local_model_name_forces_local() {
+        let p = proxy_with_models(true, true);
+        // "llama3" is set as the local model name
+        let resp = p
+            .handle_chat(r#"{"model":"llama3","messages":[{"role":"user","content":"hi"}]}"#)
+            .unwrap();
+        assert!(
+            resp.contains("local-reply"),
+            "named local model should route local: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_configured_cloud_model_name_forces_cloud() {
+        let p = proxy_with_models(true, true);
+        // "gpt-4o-mini" is set as the cloud model name; short prompt would normally go local
+        let resp = p
+            .handle_chat(r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#)
+            .unwrap();
+        assert!(
+            resp.contains("cloud-reply"),
+            "named cloud model should route cloud: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_unrecognised_model_name_uses_normal_routing() {
+        let p = proxy_with_models(true, true);
+        // Short prompt with unknown model → normal routing (local for short)
+        let resp = p
+            .handle_chat(r#"{"model":"unknown-model","messages":[{"role":"user","content":"hi"}]}"#)
+            .unwrap();
+        // Normal routing for a short prompt with threshold=10: should go local
+        assert!(!resp.is_empty());
     }
 
     #[test]
