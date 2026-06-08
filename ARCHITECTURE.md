@@ -221,6 +221,13 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-068 Cache key whitespace normalisation (IMP-cache-key-norm).**
+  `request_key()` now trims leading/trailing whitespace from each message's
+  `content` before hashing. Prompts that differ only in leading/trailing spaces
+  (copy-paste artefacts, SDK padding) now share a cache key. Internal whitespace
+  is left intact (code and formatted content preserve it). `str::trim()` returns a
+  slice — zero allocation; backward-compatible (no entries are invalidated, they
+  simply become reachable by more keys). 1 test.
 - **ADR-067 Cache TTL eviction (IMP-cache-ttl).** Without TTL, stale cached
   responses are served indefinitely. `ResponseCache` now stores
   `(CompletionResponse, Instant)` pairs. `get(&mut self)` lazily evicts entries

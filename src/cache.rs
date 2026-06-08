@@ -21,7 +21,9 @@ pub fn request_key(req: &CompletionRequest) -> u64 {
     req.model.hash(&mut h);
     for m in &req.messages {
         m.role.hash(&mut h);
-        m.content.hash(&mut h);
+        // Normalise leading/trailing whitespace so "hi " and "hi" share a key.
+        // Internal whitespace is left intact (code/formatting matters there).
+        m.content.trim().hash(&mut h);
     }
     let s = &req.sampling;
     // f64 has no Hash; hash the bit pattern (None as a fixed sentinel).
@@ -188,6 +190,16 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 1,
         }
+    }
+
+    #[test]
+    fn test_request_key_whitespace_normalised() {
+        // Leading/trailing whitespace should not produce different keys.
+        assert_eq!(request_key(&req("m", "hi")), request_key(&req("m", "hi ")));
+        assert_eq!(request_key(&req("m", "hi")), request_key(&req("m", " hi")));
+        assert_eq!(request_key(&req("m", "hi")), request_key(&req("m", "  hi  ")));
+        // But distinct content must still differ.
+        assert_ne!(request_key(&req("m", "hi")), request_key(&req("m", "bye")));
     }
 
     #[test]

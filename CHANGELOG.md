@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Changed — Cache key normalises leading/trailing whitespace (IMP-cache-key-norm)
+
+- Prompts that differ only in leading/trailing whitespace now share a cache key.
+  Avoids spurious misses caused by copy-paste artifacts or SDK padding. Internal
+  whitespace is unchanged (code formatting preserved). Zero-allocation; 1 test
+  (ADR-068).
+
 ### Added — Cache TTL eviction (IMP-cache-ttl)
 
 - Set `PASTURE_CACHE_TTL=3600` (or `cache_ttl_secs =` in config) to expire cached
