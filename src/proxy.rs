@@ -804,7 +804,29 @@ impl Proxy {
                 }
             }
         } else if method == "GET" && path.starts_with("/v1/models") {
-            write_response(stream, 200, &build_models_response(&self.models), &cors)?;
+            // `/v1/models` lists; `/v1/models/{id}` retrieves a single model.
+            let rest = &path["/v1/models".len()..];
+            if let Some(after) = rest.strip_prefix('/') {
+                let id = after
+                    .split('?')
+                    .next()
+                    .unwrap_or(after)
+                    .trim_end_matches('/');
+                match build_model_response(&self.models, id) {
+                    Some(b) => write_response(stream, 200, &b, &cors)?,
+                    None => write_response(
+                        stream,
+                        404,
+                        &build_error_response(
+                            &format!("model '{id}' not found"),
+                            "invalid_request_error",
+                        ),
+                        &cors,
+                    )?,
+                }
+            } else {
+                write_response(stream, 200, &build_models_response(&self.models), &cors)?;
+            }
         } else if method == "GET" && path.starts_with("/health") {
             write_response(stream, 200, "{\"status\":\"ok\"}", &cors)?;
         } else {
@@ -1048,6 +1070,19 @@ pub fn build_models_response(models: &[String]) -> String {
         })
         .collect();
     format!("{{\"object\":\"list\",\"data\":[{}]}}", entries.join(","))
+}
+
+/// Build a `GET /v1/models/{id}` response for a single configured model, or
+/// `None` if the id is not in the advertised list (→ 404). OpenAI shape.
+pub fn build_model_response(models: &[String], id: &str) -> Option<String> {
+    if models.iter().any(|m| m == id) {
+        Some(format!(
+            "{{\"id\":\"{}\",\"object\":\"model\",\"owned_by\":\"pasture\"}}",
+            escape_string(id)
+        ))
+    } else {
+        None
+    }
 }
 
 /// Build the `GET /v1/stats` JSON body (IMP-metrics): live counters from the
@@ -1420,6 +1455,42 @@ mod tests {
     fn test_build_models_response_empty_is_valid() {
         let body = build_models_response(&[]);
         assert_eq!(body, "{\"object\":\"list\",\"data\":[]}");
+    }
+
+    #[test]
+    fn test_build_model_response_found_and_missing() {
+        let models = vec!["llama3".to_string(), "gpt-4o-mini".to_string()];
+        let body = build_model_response(&models, "llama3").expect("found");
+        assert!(body.contains("\"id\":\"llama3\""), "{body}");
+        assert!(body.contains("\"object\":\"model\""), "{body}");
+        assert!(build_model_response(&models, "nope").is_none());
+    }
+
+    #[test]
+    fn test_roundtrip_model_retrieve_ok() {
+        let p = proxy_with(true, false, 100, "unused").with_models(vec!["llama3".into()]);
+        let (status, body) = roundtrip(p, "GET /v1/models/llama3 HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 200);
+        let v = crate::json::parse(&body).unwrap();
+        assert_eq!(v.get("id").and_then(|x| x.as_str()), Some("llama3"));
+        assert_eq!(v.get("object").and_then(|x| x.as_str()), Some("model"));
+    }
+
+    #[test]
+    fn test_roundtrip_model_retrieve_unknown_is_404() {
+        let p = proxy_with(true, false, 100, "unused").with_models(vec!["llama3".into()]);
+        let (status, body) = roundtrip(p, "GET /v1/models/ghost HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 404);
+        assert!(body.contains("not found"), "{body}");
+    }
+
+    #[test]
+    fn test_roundtrip_models_list_still_works() {
+        // The bare list path must not be captured by the retrieve branch.
+        let p = proxy_with(true, false, 100, "unused").with_models(vec!["llama3".into()]);
+        let (status, body) = roundtrip(p, "GET /v1/models HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 200);
+        assert!(body.contains("\"object\":\"list\""), "{body}");
     }
 
     #[test]

@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `GET /v1/models/{id}` single-model retrieve (IMP-model-retrieve)
+
+- The OpenAI `models.retrieve(id)` endpoint is now served: `/v1/models/{id}` returns the
+  model object (`{id,object:"model",owned_by:"pasture"}`) when the id is configured, or a
+  `404` error envelope otherwise. The bare `/v1/models` list path is unchanged. Query
+  strings and trailing slashes are tolerated. Purely additive, std-only; 5 tests.
+  Grounded in ADR-045.
+
 ### Fixed — unique completion ids (IMP-completion-id)
 
 - Responses now carry a unique `id` (`chatcmpl-…`) instead of the constant

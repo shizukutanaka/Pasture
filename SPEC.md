@@ -102,6 +102,11 @@ Success (non-stream): `200`, body is an OpenAI `chat.completion` object containi
 listing the configured local (and, if enabled, cloud) model ids; de-duplicated. An
 empty list is still valid (IMP-8).
 
+### 3.2a `GET /v1/models/{id}`
+`200` with `{"id","object":"model","owned_by":"pasture"}` when `{id}` is a configured
+model; otherwise `404` with the error envelope (§3.5). Query strings and a trailing
+slash are tolerated (IMP-model-retrieve).
+
 ### 3.2b `POST /v1/embeddings`
 Request body: `{"model":<string>,"input":<string|string[]>}`. `input` MUST be a
 non-empty string or a non-empty array of non-empty strings. Missing or invalid

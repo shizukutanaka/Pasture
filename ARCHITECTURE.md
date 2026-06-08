@@ -221,6 +221,13 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-045 `GET /v1/models/{id}` (IMP-model-retrieve).** The OpenAI SDK's
+  `models.retrieve(id)` and some client validation flows hit the single-model endpoint;
+  Pasture served only the list, and `/v1/models/{id}` fell through to it via
+  `starts_with`. The dispatch now splits the sub-path: a bare `/v1/models` lists, while
+  `/v1/models/{id}` returns the model object when the id is configured (OpenAI shape) or
+  a `404` envelope otherwise. Query strings and trailing slashes are tolerated. Purely
+  additive, std-only; `build_model_response` is a pure builder, 5 tests.
 - **ADR-044 Unique completion ids (IMP-completion-id).** Every Pasture response used a
   constant `id:"pasture"`, but OpenAI returns a unique `chatcmpl-…` per completion that
   logging, tracing, and de-duplication tooling keys on — a constant id silently breaks
