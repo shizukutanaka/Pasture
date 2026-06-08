@@ -182,6 +182,12 @@ pub fn hard_signals(text: &str) -> Vec<&'static str> {
     signals
 }
 
+/// True when the prompt has no hard content signals and is below `threshold`
+/// estimated tokens — suitable for a fast lightweight local model.
+pub fn is_simple_prompt(text: &str, threshold: usize) -> bool {
+    hard_signals(text).is_empty() && estimate_tokens(text) < threshold
+}
+
 /// The deterministic routing engine, parameterised by available backends and a
 /// hardware-adaptive token threshold.
 #[derive(Debug, Clone)]
@@ -191,6 +197,8 @@ pub struct RoutingEngine {
     local_available: bool,
     cloud_available: bool,
     allow_sensitive_cloud: bool,
+    /// When true all traffic routes local regardless of content signals or length.
+    local_only: bool,
 }
 
 impl RoutingEngine {
@@ -202,6 +210,7 @@ impl RoutingEngine {
             local_available,
             cloud_available,
             allow_sensitive_cloud: false,
+            local_only: false,
         }
     }
 
@@ -233,6 +242,14 @@ impl RoutingEngine {
     /// Allow sensitive content to reach the cloud (off by default; privacy-first).
     pub fn with_allow_sensitive_cloud(mut self, allowed: bool) -> Self {
         self.allow_sensitive_cloud = allowed;
+        self
+    }
+
+    /// Force all traffic to the local backend regardless of content signals or
+    /// token length. Privacy rules still apply (sensitive content already stays
+    /// local; this adds nothing there). Cloud availability is ignored.
+    pub fn with_local_only(mut self, enabled: bool) -> Self {
+        self.local_only = enabled;
         self
     }
 
@@ -285,6 +302,19 @@ impl RoutingEngine {
                 })
             } else {
                 Err(RoutingError::SensitiveButNoLocal)
+            };
+        }
+
+        // local_only: bypass cloud entirely after the privacy check so we never
+        // contact cloud even for hard signals or long prompts.
+        if self.local_only {
+            return if self.local_available {
+                Ok(Decision {
+                    route: Route::Local,
+                    reason: "local-only mode (PASTURE_LOCAL_ONLY)".to_string(),
+                })
+            } else {
+                Err(RoutingError::NoBackendAvailable)
             };
         }
 
@@ -616,5 +646,56 @@ mod tests {
             e.decide("solve step by step", None).unwrap().route,
             Route::Local
         );
+    }
+
+    #[test]
+    fn test_local_only_routes_local_for_hard_signal() {
+        // Even code/tools force local when local_only is on.
+        let e = both().with_local_only(true);
+        let d = e
+            .decide_full("```rust\nfn x(){}\n```", None, false, true)
+            .unwrap();
+        assert_eq!(d.route, Route::Local);
+        assert!(d.reason.contains("local-only"), "reason: {}", d.reason);
+    }
+
+    #[test]
+    fn test_local_only_routes_local_for_long_prompt() {
+        let long = "x".repeat(2000);
+        let e = both().with_local_only(true);
+        let d = e.decide(&long, None).unwrap();
+        assert_eq!(d.route, Route::Local);
+    }
+
+    #[test]
+    fn test_local_only_privacy_still_checked_first() {
+        // Sensitive content still goes local for the right reason even in local_only.
+        let e = both().with_local_only(true);
+        let d = e.decide_with_sensitivity("hi", None, true).unwrap();
+        assert_eq!(d.route, Route::Local);
+    }
+
+    #[test]
+    fn test_local_only_no_local_errors() {
+        let e = RoutingEngine::new(100, false, true).with_local_only(true);
+        assert_eq!(
+            e.decide("hi", None).unwrap_err(),
+            RoutingError::NoBackendAvailable
+        );
+    }
+
+    #[test]
+    fn test_is_simple_prompt_short_no_signals() {
+        assert!(is_simple_prompt("what time is it", 50));
+    }
+
+    #[test]
+    fn test_is_simple_prompt_above_threshold() {
+        assert!(!is_simple_prompt("hello", 1));
+    }
+
+    #[test]
+    fn test_is_simple_prompt_has_hard_signal() {
+        assert!(!is_simple_prompt("write a function to sort", 50));
     }
 }

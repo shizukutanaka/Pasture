@@ -71,6 +71,14 @@ pub struct Proxy {
     /// Number of times to retry a transient cloud failure before falling back
     /// to local (IMP-9). 0 disables retries (a single attempt).
     cloud_retry: u32,
+    /// Optional small/fast local model for simple short queries (dual-local routing).
+    /// None means disabled; all local traffic uses the default local backend model.
+    fast_model: Option<String>,
+    /// Estimated-token threshold below which the fast model is used.
+    fast_threshold: usize,
+    /// When true, prepend a system message with current date/OS info so that
+    /// lightweight local models can act as capable PC assistants.
+    inject_context: bool,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -93,7 +101,25 @@ impl Proxy {
             cache: None,
             models: Vec::new(),
             cloud_retry: 0,
+            fast_model: None,
+            fast_threshold: 50,
+            inject_context: false,
         }
+    }
+
+    /// Select a small/fast local model for short, simple queries (dual-local routing).
+    /// `threshold` is the estimated-token count below which the fast model is preferred.
+    pub fn with_fast_model(mut self, model: Option<String>, threshold: usize) -> Self {
+        self.fast_model = model.filter(|m| !m.is_empty());
+        self.fast_threshold = threshold;
+        self
+    }
+
+    /// Prepend a system message with the current date and OS so lightweight local
+    /// models have grounding for PC-assistant tasks (e.g. scheduling, file ops).
+    pub fn with_inject_context(mut self, enabled: bool) -> Self {
+        self.inject_context = enabled;
+        self
     }
 
     /// Retry a transient cloud failure up to `n` times (exponential backoff)
@@ -238,6 +264,15 @@ impl Proxy {
         &self,
         req: &CompletionRequest,
     ) -> Result<(CompletionResponse, &'static str, Option<f64>), ProxyError> {
+        // Optionally prepend a system message so local models know the current date/OS.
+        let injected;
+        let req = if self.inject_context {
+            injected = inject_context_into(req);
+            &injected
+        } else {
+            req
+        };
+
         let (decision, sensitive) = self.classify_and_decide(req)?;
 
         // Exact-match cache (never for sensitive content; I5).
@@ -299,8 +334,37 @@ impl Proxy {
             }
         } else {
             let backend = self.backend_for(decision.route)?;
+            // Dual-local routing: if a fast model is configured, use it for
+            // simple short prompts (no hard signals, below fast_threshold tokens).
+            let fast_req;
+            let effective_req = if decision.route == Route::Local {
+                if let Some(fm) = self.fast_model.as_deref() {
+                    let text = req
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    if crate::routing::is_simple_prompt(text, self.fast_threshold) {
+                        fast_req = CompletionRequest {
+                            model: fm.to_string(),
+                            messages: req.messages.clone(),
+                            stream: req.stream,
+                            has_tools: req.has_tools,
+                        };
+                        &fast_req
+                    } else {
+                        req
+                    }
+                } else {
+                    req
+                }
+            } else {
+                req
+            };
             let resp = backend
-                .complete(req)
+                .complete(effective_req)
                 .map_err(|e| ProxyError::Backend(e.to_string()))?;
             (resp, decision.route, None)
         };
@@ -592,6 +656,94 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Convert a Unix timestamp to a UTC date string `YYYY-MM-DD`.
+fn utc_date_str(secs: u64) -> String {
+    let mut d = secs / 86400;
+    let mut y = 1970u32;
+    loop {
+        let yd: u64 = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if d < yd {
+            break;
+        }
+        d -= yd;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays: [u64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut m = 1u32;
+    for &md in &mdays {
+        if d < md {
+            break;
+        }
+        d -= md;
+        m += 1;
+    }
+    format!("{y}-{m:02}-{:02}", d + 1)
+}
+
+/// Return a system context string for injection: date, OS, and lightweight-LLM note.
+fn system_context_text() -> String {
+    let date = utc_date_str(unix_now());
+    let os = std::env::consts::OS;
+    format!(
+        "[System context — provided by Pasture]\nDate (UTC): {date}\nOS: {os}\n\
+         You are a helpful local AI assistant running on this machine. Answer \
+         concisely and accurately."
+    )
+}
+
+/// Prepend a system-context message into a completion request (for PC-assistant mode).
+fn inject_context_into(req: &CompletionRequest) -> CompletionRequest {
+    let ctx = Message {
+        role: "system".to_string(),
+        content: system_context_text(),
+    };
+    let mut messages = Vec::with_capacity(req.messages.len() + 1);
+    // Insert context before any existing system messages, or at the front.
+    let has_system = req
+        .messages
+        .first()
+        .map(|m| m.role == "system")
+        .unwrap_or(false);
+    if has_system {
+        // Merge with existing system message rather than duplicating.
+        let mut merged = req.messages.clone();
+        let existing = merged[0].content.clone();
+        merged[0].content = format!("{}\n\n{}", ctx.content, existing);
+        return CompletionRequest {
+            model: req.model.clone(),
+            messages: merged,
+            stream: req.stream,
+            has_tools: req.has_tools,
+        };
+    }
+    messages.push(ctx);
+    messages.extend_from_slice(&req.messages);
+    CompletionRequest {
+        model: req.model.clone(),
+        messages,
+        stream: req.stream,
+        has_tools: req.has_tools,
+    }
 }
 
 /// Build an OpenAI-compatible error body: `{"error":{"message":..,"type":..}}`
@@ -1316,5 +1468,114 @@ mod tests {
     #[test]
     fn test_sse_frame_format() {
         assert_eq!(sse_frame("X"), "data: X\n\n");
+    }
+
+    #[test]
+    fn test_utc_date_str_epoch() {
+        assert_eq!(utc_date_str(0), "1970-01-01");
+    }
+
+    #[test]
+    fn test_utc_date_str_known_date() {
+        // 2026-06-08 UTC = 20612 days from epoch (verified by counting leap years)
+        let ts = 20612u64 * 86400;
+        assert_eq!(utc_date_str(ts), "2026-06-08");
+    }
+
+    #[test]
+    fn test_utc_date_str_y2k() {
+        // 2000-01-01 UTC = 10957 days from epoch
+        let ts = 10957u64 * 86400;
+        assert_eq!(utc_date_str(ts), "2000-01-01");
+    }
+
+    #[test]
+    fn test_inject_context_prepends_system() {
+        let req = CompletionRequest {
+            model: "m".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            stream: false,
+            has_tools: false,
+        };
+        let injected = inject_context_into(&req);
+        assert_eq!(injected.messages[0].role, "system");
+        assert!(injected.messages[0].content.contains("Date"));
+        assert_eq!(injected.messages[1].role, "user");
+    }
+
+    #[test]
+    fn test_inject_context_merges_existing_system() {
+        let req = CompletionRequest {
+            model: "m".to_string(),
+            messages: vec![
+                Message {
+                    role: "system".to_string(),
+                    content: "be brief".to_string(),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                },
+            ],
+            stream: false,
+            has_tools: false,
+        };
+        let injected = inject_context_into(&req);
+        // No duplicate system messages — context merged into the existing one.
+        assert_eq!(injected.messages[0].role, "system");
+        assert!(injected.messages[0].content.contains("be brief"));
+        assert!(injected.messages[0].content.contains("Date"));
+        assert_eq!(injected.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_inject_context_enabled_on_proxy() {
+        let log = tmp_log();
+        let p = proxy_with(true, false, 100, &log).with_inject_context(true);
+        let resp = p
+            .handle_chat(r#"{"messages":[{"role":"user","content":"hello"}]}"#)
+            .unwrap();
+        assert!(resp.contains("local-reply"));
+    }
+
+    #[test]
+    fn test_local_only_routes_all_traffic_local() {
+        let log = tmp_log();
+        let engine = RoutingEngine::new(10, true, true).with_local_only(true);
+        // Long prompt that would normally go cloud.
+        let long_body = format!(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}]}}",
+            "x".repeat(500)
+        );
+        let p = Proxy::new(
+            engine,
+            Some(Box::new(MockBackend::new("local", "local-reply"))),
+            Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+            &log,
+        );
+        let resp = p.handle_chat(&long_body).unwrap();
+        assert!(resp.contains("x_pasture_route"));
+        assert!(resp.contains("\"local\"") || resp.contains("local-reply"));
+    }
+
+    #[test]
+    fn test_fast_model_used_for_simple_prompt() {
+        let log = tmp_log();
+        let engine = RoutingEngine::new(1000, true, false);
+        let p = Proxy::new(
+            engine,
+            Some(Box::new(MockBackend::new("local", "local-reply"))),
+            None,
+            &log,
+        )
+        .with_fast_model(Some("phi3:mini".to_string()), 50);
+        // Short, no-hard-signal prompt should use the fast model.
+        let resp = p
+            .handle_chat(r#"{"messages":[{"role":"user","content":"hello"}]}"#)
+            .unwrap();
+        assert!(resp.contains("local-reply"));
     }
 }

@@ -5,6 +5,35 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — GPU-less / local-only PC enhancement
+
+- **`PASTURE_LOCAL_ONLY=1` (local-only mode):** disables the cloud backend entirely —
+  all traffic stays on-device regardless of content signals or prompt length. Ideal for
+  air-gapped machines, privacy-first setups, or PCs without a GPU. The routing engine
+  still applies privacy rules (no change needed: sensitive content was already kept
+  local). Config file key: `local_only = true`. `with_local_only` builder on
+  `RoutingEngine`; covered by 4 new routing tests.
+
+- **`PASTURE_LOCAL_FAST_MODEL` — dual-local model routing:** configure a second, smaller
+  local model (e.g. `qwen2.5:1.5b` or `phi3:mini`) that handles simple short queries
+  (no hard signals, < `PASTURE_FAST_THRESHOLD` estimated tokens, default 50). Harder
+  prompts still go to the main local model. Lets CPU-only machines trade quality vs.
+  speed per query with zero cloud cost. Config: `local_fast_model = <name>`,
+  `fast_threshold = <N>`. `Proxy::with_fast_model` builder; test coverage in proxy.
+
+- **`PASTURE_INJECT_CONTEXT=1` — PC-assistant context injection:** prepends a system
+  message containing the current UTC date and OS name before each completion request.
+  Existing system messages are merged rather than duplicated. This grounds lightweight
+  local models with the information they otherwise lack (date, environment) so they can
+  answer scheduling, file-path, or system questions accurately. Implemented via
+  `inject_context_into` + `utc_date_str` (std-only, zero-dep Gregorian calendar).
+  `Proxy::with_inject_context` builder; date calc tested for epoch + Y2K + 2026-06-08.
+
+- **Ultra-light model tier in `pasture models`:** when no GPU is detected and RAM <
+  8 GB, the command now shows a CPU-only tier with Phi-3-mini, Gemma-2-2B,
+  Qwen2.5-1.5B/0.5B, and TinyLlama — the lightest models that still produce useful
+  output — plus tips on `PASTURE_LOCAL_ONLY` and `PASTURE_INJECT_CONTEXT`. EN + JA.
+
 ### Added — API-surface parity & tool-aware routing
 - `GET /v1/models` (IMP-8): OpenAI-compatible list of the configured local (and
   cloud) model ids. Many clients probe this on connect; it previously 404'd. Purely

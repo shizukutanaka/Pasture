@@ -221,6 +221,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-035 GPU-less / local-only PC enhancement (IMP-new).** Three features for
+  no-GPU / air-gapped machines that together turn Pasture into a capable PC assistant
+  without any cloud dependency: (1) `PASTURE_LOCAL_ONLY` — routes all traffic local
+  regardless of hard signals or token length; the routing engine's privacy rules still
+  apply, so sensitive content is still handled correctly. (2) `PASTURE_LOCAL_FAST_MODEL`
+  — dual-local routing: simple prompts (no hard signals, < `fast_threshold` tokens)
+  use a tiny fast model (e.g. Phi-3-mini, Qwen2.5-1.5B), harder ones use the main
+  local model; grounded in the two-tier local cascade idea from RESEARCH.md cat.1/cat.8.
+  (3) `PASTURE_INJECT_CONTEXT` — prepends a system message with the current UTC date
+  and OS name so lightweight models can answer date/time and system questions correctly;
+  existing system messages are merged, not duplicated. All three features are std-only,
+  zero-dependency, and off by default; `pasture models` gains a CPU-only ultra-light
+  model tier (Phi-3-mini/Gemma-2-2B/Qwen2.5-1.5B/TinyLlama) with setup tips.
 - **ADR-034 `POST /v1/embeddings` pass-through (IMP-8 completion).** Several clients
   (including LlamaIndex, LangChain, and semantic-cache implementations) call
   `/v1/embeddings` before or alongside chat. The proxy now routes this to the local

@@ -733,8 +733,16 @@ fn run_connect(config: &Config, app: Option<&str>) -> i32 {
 fn run_models(_config: &Config) -> i32 {
     use crate::i18n::{detect, t, tf};
     let lang = detect();
-    let ram = HardwareProfile::detect().ram_mb;
-    let tier = if ram < 12_000 { "8 GB" } else { "16 GB" };
+    let hw = HardwareProfile::detect();
+    let ram = hw.ram_mb;
+    let no_gpu = hw.gpu.is_none();
+    let (tier, show_ultra) = if no_gpu && ram < 8_000 {
+        ("4 GB (CPU-only)", true)
+    } else if ram < 12_000 {
+        ("8 GB", false)
+    } else {
+        ("16 GB", false)
+    };
     print!("{}", t(lang, "models.title"));
     println!(
         "{}",
@@ -744,6 +752,10 @@ fn run_models(_config: &Config) -> i32 {
             &[("ram", &ram.to_string()), ("tier", tier)]
         )
     );
+    if show_ultra {
+        println!("{}", t(lang, "models.ultra"));
+        println!("{}", t(lang, "models.local_only_tip"));
+    }
     println!("{}", t(lang, "models.low"));
     println!("{}", t(lang, "models.mid"));
     println!("{}", t(lang, "models.multilingual"));
@@ -889,7 +901,8 @@ fn run_config(config: &Config) -> i32 {
 /// allow-sensitive-cloud setting and any calibrated threshold override.
 fn make_engine(profile: &HardwareProfile, config: &Config, cloud_available: bool) -> RoutingEngine {
     let mut engine = RoutingEngine::for_hardware(profile, true, cloud_available)
-        .with_allow_sensitive_cloud(config.allow_sensitive_cloud);
+        .with_allow_sensitive_cloud(config.allow_sensitive_cloud)
+        .with_local_only(config.local_only);
     if let Some(t) = config.threshold {
         engine = engine.with_threshold(t);
     }
@@ -978,12 +991,31 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
     if cloud.is_some() {
         models.push(config.cloud_model.clone());
     }
+    let fast = if config.local_fast_model.is_empty() {
+        None
+    } else {
+        Some(config.local_fast_model.clone())
+    };
+    if let Some(ref fm) = fast {
+        eprintln!(
+            "pasture: fast local model '{}' enabled (threshold {} tokens)",
+            fm, config.fast_threshold
+        );
+    }
+    if config.inject_context {
+        eprintln!("pasture: context injection enabled (date/OS system message)");
+    }
+    if config.local_only {
+        eprintln!("pasture: local-only mode — cloud backend disabled");
+    }
     let proxy = Proxy::new(engine, local, cloud, &config.cost_log_path)
         .with_cascade(config.cascade)
         .with_cascade_logprob(config.cascade_logprob_threshold)
         .with_cache(config.cache_size)
         .with_models(models)
-        .with_cloud_retry(config.cloud_retry);
+        .with_cloud_retry(config.cloud_retry)
+        .with_fast_model(fast, config.fast_threshold)
+        .with_inject_context(config.inject_context);
     print!(
         "{}",
         crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])

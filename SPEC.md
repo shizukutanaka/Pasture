@@ -212,6 +212,10 @@ wins). Variables:
 | `PASTURE_ALLOW_SENSITIVE_CLOUD` | off | allow sensitive → cloud |
 | `PASTURE_COST_LOG` | `pasture-cost.jsonl` | cost log path |
 | `PASTURE_LANG` | auto | `ja` \| `en` |
+| `PASTURE_LOCAL_ONLY` | off | force all traffic local; cloud disabled (ADR-035) |
+| `PASTURE_LOCAL_FAST_MODEL` | _(off)_ | lightweight model for simple short queries (dual-local) |
+| `PASTURE_FAST_THRESHOLD` | `50` | token threshold below which the fast model is used |
+| `PASTURE_INJECT_CONTEXT` | off | prepend date/OS system message for PC-assistant mode |
 
 ---
 
@@ -244,8 +248,10 @@ or via `PASTURE_LANG`. A test enforces EN/JA key parity.
 
 **Satisfied by the current implementation:** §2 CLI; §3.1–3.3 (incl. `/v1/models`,
 IMP-8) **+ §3.2b `/v1/embeddings` (IMP-8 completion, ADR-034)**; §4 routing incl.
-tools (IMP-10); §5 privacy; §6 cascade/cache/backends incl. cloud retry+fallback
-(IMP-9); §8 config; §9 cost log; §10 eval; §11 i18n; §7 header cap + parser depth.
+tools (IMP-10) **+ `local_only` (ADR-035)**; §5 privacy; §6 cascade/cache/backends
+incl. cloud retry+fallback (IMP-9); §8 config **+ `PASTURE_LOCAL_ONLY`,
+`PASTURE_LOCAL_FAST_MODEL`, `PASTURE_INJECT_CONTEXT` (ADR-035)**; §9 cost log;
+§10 eval; §11 i18n; §7 header cap + parser depth.
 
 **Gaps closed in this round (to satisfy this spec):**
 - **§3.5 error envelope.** Errors now emit `{"error":{"message,type}}` (were flat

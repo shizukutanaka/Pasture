@@ -23,6 +23,15 @@ pub struct Config {
     pub cascade_logprob_threshold: f64,
     /// Cloud transient-failure retry count before falling back to local (IMP-9).
     pub cloud_retry: u32,
+    /// When true, all traffic is routed to the local backend (cloud disabled).
+    pub local_only: bool,
+    /// Optional faster/smaller local model for simple short queries (dual-local routing).
+    /// Empty string means disabled.
+    pub local_fast_model: String,
+    /// Token threshold below which the fast local model is used (dual-local).
+    pub fast_threshold: usize,
+    /// When true, inject current date/OS info as a system message for PC-assistant use.
+    pub inject_context: bool,
 }
 
 impl Default for Config {
@@ -46,6 +55,10 @@ impl Default for Config {
             threshold: None,
             cascade_logprob_threshold: -1.0,
             cloud_retry: 2,
+            local_only: false,
+            local_fast_model: String::new(),
+            fast_threshold: 50,
+            inject_context: false,
         }
     }
 }
@@ -136,6 +149,20 @@ impl Config {
                 self.cloud_retry = n;
             }
         }
+        if std::env::var("PASTURE_LOCAL_ONLY").is_ok() {
+            self.local_only = true;
+        }
+        if let Ok(v) = std::env::var("PASTURE_LOCAL_FAST_MODEL") {
+            self.local_fast_model = v;
+        }
+        if let Ok(v) = std::env::var("PASTURE_FAST_THRESHOLD") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.fast_threshold = n;
+            }
+        }
+        if std::env::var("PASTURE_INJECT_CONTEXT").is_ok() {
+            self.inject_context = true;
+        }
         self
     }
 
@@ -177,6 +204,14 @@ impl Config {
                     self.cloud_retry = n;
                 }
             }
+            "local_only" => self.local_only = matches!(val, "1" | "true" | "yes"),
+            "local_fast_model" => self.local_fast_model = val.to_string(),
+            "fast_threshold" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    self.fast_threshold = n;
+                }
+            }
+            "inject_context" => self.inject_context = matches!(val, "1" | "true" | "yes"),
             _ => {}
         }
     }

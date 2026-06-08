@@ -161,6 +161,14 @@ All commands:               pasture help\n",
     ("models.title", "Recommended models (verify tags at ollama.com/library)\n"),
     ("models.your_machine", "Your machine: about {ram} MB RAM -> use the {tier} tier."),
     (
+        "models.ultra",
+        "CPU-only / <8 GB RAM (ultra-light, runs on any modern laptop):\n    ollama pull phi3:mini          # 3.8B Q4, ~2.3 GB, fast on CPU\n    ollama pull gemma2:2b          # 2.6B, very fast, good quality/size\n    ollama pull qwen2.5:1.5b       # 1.5B, lowest RAM, still capable\n    ollama pull tinyllama          # 1.1B, absolute minimum (fallback)\n\n  For dual-local routing (fast model for simple, main for complex):\n    PASTURE_LOCAL_FAST_MODEL=qwen2.5:1.5b  PASTURE_LOCAL_MODEL=phi3:mini",
+    ),
+    (
+        "models.local_only_tip",
+        "  Tip: no cloud? run with  PASTURE_LOCAL_ONLY=1  to keep everything on-device.\n  Tip: add  PASTURE_INJECT_CONTEXT=1  for date/OS context (better PC-assistant answers).",
+    ),
+    (
         "models.low",
         "8 GB RAM:\n    ollama pull llama3.2      # 3B, best small general model\n    ollama pull gemma3:4b     # 4B, strong all-rounder\n    ollama pull qwen3:4b      # 4B, great for non-English",
     ),
@@ -332,6 +340,14 @@ const JA: &[(&str, &str)] = &[
     (
         "models.your_machine",
         "あなたの環境: 約 {ram} MB RAM -> {tier} 段がおすすめ。",
+    ),
+    (
+        "models.ultra",
+        "CPU のみ / 8 GB RAM 未満（超軽量。GPU なしのノートでも動作）:\n    ollama pull phi3:mini          # 3.8B Q4、約 2.3 GB、CPU でも速い\n    ollama pull gemma2:2b          # 2.6B、非常に速く品質も良好\n    ollama pull qwen2.5:1.5b       # 1.5B、最低 RAM、日本語対応\n    ollama pull tinyllama          # 1.1B、最小サイズ（フォールバック用）\n\n  デュアルローカルルーティング（簡単な質問→高速モデル、複雑→メインモデル）:\n    PASTURE_LOCAL_FAST_MODEL=qwen2.5:1.5b  PASTURE_LOCAL_MODEL=phi3:mini",
+    ),
+    (
+        "models.local_only_tip",
+        "  ヒント: クラウド不要なら  PASTURE_LOCAL_ONLY=1  で完全ローカル動作。\n  ヒント:  PASTURE_INJECT_CONTEXT=1  で日付/OS をコンテキスト注入（PC アシスタントとして便利）。",
     ),
     (
         "models.low",

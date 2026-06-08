@@ -84,6 +84,10 @@ Defaults are sensible; override via environment variables:
 | `PASTURE_LOCAL_MODEL` | `llama3` | local model name |
 | `PASTURE_COST_LOG` | `pasture-cost.jsonl` | cost log path |
 | `PASTURE_CLOUD_RETRY` | `2` | retry transient cloud failures (5xx/timeouts) this many times, then fall back to local |
+| `PASTURE_LOCAL_ONLY` | _(off)_ | when set, all traffic routes local; cloud backend disabled (GPU-less / air-gapped use) |
+| `PASTURE_LOCAL_FAST_MODEL` | _(off)_ | second local model for simple short queries; e.g. `phi3:mini` for greetings, `llama3.2` for harder |
+| `PASTURE_FAST_THRESHOLD` | `50` | estimated-token threshold below which the fast model is selected |
+| `PASTURE_INJECT_CONTEXT` | _(off)_ | when set, prepends a system message with the current date and OS — boosts lightweight models as PC assistants |
 
 The local backend talks to [Ollama](https://ollama.com) over plain HTTP. GPU acceleration (CUDA/Metal/ROCm) is handled by Ollama; Pasture writes no GPU code itself.
 
