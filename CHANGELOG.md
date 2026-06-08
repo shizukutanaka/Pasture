@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Configurable system prompt via `PASTURE_SYSTEM_PROMPT` (IMP-system-prompt)
+
+- Set `PASTURE_SYSTEM_PROMPT="You are a coding assistant"` (or `system_prompt =
+  ...` in the config file) to prepend a persistent system prompt to every
+  request. The configured prompt frames the outermost context: if the client
+  request already has a `system` message, the two are merged (configured prompt
+  first). Applied before `PASTURE_INJECT_CONTEXT` so ordering is:
+  configured system → date/OS context → user messages.
+- Empty string disables the feature. 4 tests.
+
 ### Added — `POST /v1/completions` legacy text-completion shim (IMP-legacy-completions)
 
 - Older LLM clients (pre-chat OpenAI SDK, LM Studio, some LangChain versions)

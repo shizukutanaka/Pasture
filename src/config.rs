@@ -40,6 +40,9 @@ pub struct Config {
     pub cors_origins: String,
     /// Per-connection socket read/write timeout in seconds (0 = no timeout).
     pub request_timeout_secs: u64,
+    /// Optional user-defined system prompt prepended to every request.
+    /// Loaded from `PASTURE_SYSTEM_PROMPT` env var or `system_prompt` config key.
+    pub system_prompt: String,
 }
 
 impl Default for Config {
@@ -71,6 +74,7 @@ impl Default for Config {
             rate_limit: 0,
             cors_origins: String::new(),
             request_timeout_secs: 30,
+            system_prompt: String::new(),
         }
     }
 }
@@ -193,6 +197,9 @@ impl Config {
                 self.request_timeout_secs = n;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_SYSTEM_PROMPT") {
+            self.system_prompt = v;
+        }
         self
     }
 
@@ -258,6 +265,7 @@ impl Config {
                     self.request_timeout_secs = n;
                 }
             }
+            "system_prompt" => self.system_prompt = val.to_string(),
             _ => {}
         }
     }

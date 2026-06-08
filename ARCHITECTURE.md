@@ -221,6 +221,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-056 Configurable system prompt (IMP-system-prompt).** Single-user PC
+  assistant deployments need a persistent persona prompt (e.g. `"You are a
+  coding assistant specialising in Rust"`) that frames every request without
+  requiring the user to include it in every chat turn. `prepend_system_prompt`
+  merges the configured prompt with any existing system message in the request
+  (configured prompt first so it sets the outer frame). Applied first in
+  `run_completion`, before `inject_context`, so the ordering is: configured
+  system prompt → date/OS context → user messages. Set via `PASTURE_SYSTEM_PROMPT`
+  env var or `system_prompt` config-file key. Empty string disables the feature.
+  `with_system_prompt` builder method. 4 tests.
 - **ADR-055 `POST /v1/completions` legacy shim (IMP-legacy-completions).**
   Many older LLM clients (pre-chat OpenAI SDK, LM Studio, older LangChain)
   default to `POST /v1/completions` (text-completion API, now deprecated) and

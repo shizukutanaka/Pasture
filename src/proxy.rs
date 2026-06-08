@@ -146,6 +146,10 @@ pub struct Proxy {
     /// Per-connection socket read/write timeout (IMP-timeout). None = no timeout.
     /// Guards against slow/dead clients pinning a bounded worker thread.
     io_timeout: Option<Duration>,
+    /// Optional user-defined system prompt prepended to every request
+    /// (`PASTURE_SYSTEM_PROMPT`). Merged with any existing system message in the
+    /// request (prepended). Complementary to `inject_context` (date/OS context).
+    system_prompt: Option<String>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -175,6 +179,7 @@ impl Proxy {
             rate_limiter: None,
             cors: None,
             io_timeout: None,
+            system_prompt: None,
         }
     }
 
@@ -306,6 +311,14 @@ impl Proxy {
     /// models have grounding for PC-assistant tasks (e.g. scheduling, file ops).
     pub fn with_inject_context(mut self, enabled: bool) -> Self {
         self.inject_context = enabled;
+        self
+    }
+
+    /// Set a user-defined system prompt prepended to every request. An empty
+    /// string disables the feature (equivalent to passing `None`). The prompt is
+    /// merged with any existing system message in the request (prepended).
+    pub fn with_system_prompt(mut self, prompt: Option<String>) -> Self {
+        self.system_prompt = prompt.filter(|s| !s.is_empty());
         self
     }
 
@@ -508,6 +521,14 @@ impl Proxy {
         &self,
         req: &CompletionRequest,
     ) -> Result<(CompletionResponse, &'static str, Option<f64>), ProxyError> {
+        // Apply user-defined system prompt first (outermost frame), then date/OS.
+        let with_sys;
+        let req = if let Some(sp) = &self.system_prompt {
+            with_sys = prepend_system_prompt(req, sp);
+            &with_sys
+        } else {
+            req
+        };
         // Optionally prepend a system message so local models know the current date/OS.
         let injected;
         let req = if self.inject_context {
@@ -1225,6 +1246,37 @@ fn system_context_text() -> String {
 }
 
 /// Prepend a system-context message into a completion request (for PC-assistant mode).
+/// Prepend a user-configured system prompt to the request message list.
+/// When the first message is already a system message the two are merged:
+/// the configured prompt is placed before the caller's system content.
+fn prepend_system_prompt(req: &CompletionRequest, prompt: &str) -> CompletionRequest {
+    let has_system = req
+        .messages
+        .first()
+        .map(|m| m.role == "system")
+        .unwrap_or(false);
+    let mut messages = req.messages.clone();
+    if has_system {
+        let existing = messages[0].content.clone();
+        messages[0].content = format!("{prompt}\n\n{existing}");
+    } else {
+        messages.insert(
+            0,
+            Message {
+                role: "system".to_string(),
+                content: prompt.to_string(),
+            },
+        );
+    }
+    CompletionRequest {
+        model: req.model.clone(),
+        messages,
+        stream: req.stream,
+        has_tools: req.has_tools,
+        sampling: req.sampling.clone(),
+    }
+}
+
 fn inject_context_into(req: &CompletionRequest) -> CompletionRequest {
     let ctx = Message {
         role: "system".to_string(),
@@ -3145,6 +3197,79 @@ mod tests {
             .handle_chat(r#"{"messages":[{"role":"user","content":"hello"}]}"#)
             .unwrap();
         assert!(resp.contains("local-reply"));
+    }
+
+    // ── PASTURE_SYSTEM_PROMPT (IMP-system-prompt) ─────────────────────────────
+
+    fn make_req_user(content: &str) -> CompletionRequest {
+        CompletionRequest {
+            model: "m".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: content.to_string(),
+            }],
+            stream: false,
+            has_tools: false,
+            sampling: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_prepend_system_prompt_no_existing_system() {
+        let req = make_req_user("hi");
+        let out = prepend_system_prompt(&req, "Be brief.");
+        assert_eq!(out.messages.len(), 2);
+        assert_eq!(out.messages[0].role, "system");
+        assert_eq!(out.messages[0].content, "Be brief.");
+        assert_eq!(out.messages[1].role, "user");
+    }
+
+    #[test]
+    fn test_prepend_system_prompt_merges_existing_system() {
+        let req = CompletionRequest {
+            model: "m".to_string(),
+            messages: vec![
+                Message {
+                    role: "system".to_string(),
+                    content: "existing".to_string(),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                },
+            ],
+            stream: false,
+            has_tools: false,
+            sampling: Default::default(),
+        };
+        let out = prepend_system_prompt(&req, "prefix");
+        assert_eq!(out.messages.len(), 2, "no new message should be added");
+        assert_eq!(out.messages[0].role, "system");
+        assert!(
+            out.messages[0].content.starts_with("prefix"),
+            "configured prompt must be first"
+        );
+        assert!(out.messages[0].content.contains("existing"));
+    }
+
+    #[test]
+    fn test_with_system_prompt_empty_string_disables() {
+        let p = proxy_with(true, false, 100, "unused").with_system_prompt(Some(String::new()));
+        // An empty string is treated as None (disabled).
+        assert!(p.system_prompt.is_none());
+    }
+
+    #[test]
+    fn test_system_prompt_applied_via_handle_chat() {
+        let log = tmp_log();
+        // We can't inspect the messages sent to the backend from handle_chat,
+        // but we verify the call succeeds and returns a normal response.
+        let p = proxy_with(true, false, 100, &log)
+            .with_system_prompt(Some("You are a test assistant.".to_string()));
+        let resp = p
+            .handle_chat(r#"{"messages":[{"role":"user","content":"hello"}]}"#)
+            .unwrap();
+        assert!(resp.contains("local-reply"), "unexpected: {resp}");
     }
 
     #[test]

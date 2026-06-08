@@ -1079,6 +1079,11 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         .with_cloud_retry(config.cloud_retry)
         .with_fast_model(fast, config.fast_threshold)
         .with_inject_context(config.inject_context)
+        .with_system_prompt(if config.system_prompt.is_empty() {
+            None
+        } else {
+            Some(config.system_prompt.clone())
+        })
         .with_auth_token(config.auth_token.clone())
         .with_rate_limit(config.rate_limit)
         .with_cors(cors)
