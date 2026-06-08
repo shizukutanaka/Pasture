@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Machine approval gate for the self-improvement ledger (IMP-approval-gate)
+
+- `pasture improvements --review` lists only the entries the machine gate cannot
+  auto-approve, so human review concentrates on the high-risk/unverified minority
+  instead of every entry. An entry auto-approves iff it is a complete causal
+  record, cites grounding, shows verification evidence in `effect`, and is not
+  high-risk. Each entry now shows a risk tier (low/medium/high) — set explicitly
+  via an optional `"risk"` field or inferred from the change text (security /
+  privacy / auth surfaces and retired entries are high). `improvements` (without
+  `--review`) also prints an `auto-approved / needs review` summary. On the bundled
+  ledger ~71% auto-approve. Std-only; 9 tests (ADR-070).
+
 ### Added — RouterBench-format external eval loader (IMP-routerbench-loader)
 
 - `pasture eval --external <file.jsonl>` validates routing on any labelled JSONL

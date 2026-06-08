@@ -221,6 +221,28 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-070 Machine approval gate for the improvement ledger (IMP-approval-gate).**
+  Recursive self-improvement is bottlenecked by *human approval cost*. The ledger
+  validator (`is_valid`) only checked that causal fields were *present*, so a human
+  still had to read every entry to judge which changes were safe — approval scaled
+  linearly with ledger size. This ADR makes approval **machine-checkable** so the
+  reviewer's attention concentrates on the minority that needs it (the framing:
+  in `RSI = Search × Verification × Compression`, Verification substitutes for the
+  reviewer on the safe set). Each `Improvement` gains a `Risk` tier
+  (`Low`/`Medium`/`High`) — an explicit optional `"risk"` field, else inferred from
+  the change text; `Status::Retired` and any security/privacy/auth surface infer
+  `High`. `Improvement::approval()` returns `Approval::Auto` iff the record is
+  complete, cites `grounding` (provenance), shows verification evidence in `effect`
+  (a test count / "verified" / "eval"), **and** is not `High` risk; otherwise it
+  returns `NeedsReview(reasons)` naming the exact failed checks. Inference is
+  deliberately over-cautious — a false `High` only costs an unnecessary review,
+  while a false `Low` could pass a privacy regression (the same asymmetry as the
+  PII classifier, I3). `pasture improvements --review` prints only the
+  non-auto-approved entries plus the auto-approval rate; on the bundled ledger
+  34/48 auto-approve (71%) and the surfaced minority is exactly the security /
+  privacy changes and the early prose-verified / deferred entries (the gate does
+  not special-case its own entry, which names security terms). The gate runs against
+  the live ledger at CI time via the existing bundled-ledger test. Std-only; 9 tests.
 - **ADR-069 RouterBench-format external eval loader (IMP-routerbench-loader).**
   The built-in 18-case set is the offline regression gate; validating routing on
   a user's own labelled prompts (or a public benchmark such as RouterBench) needs

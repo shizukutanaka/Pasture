@@ -27,6 +27,7 @@ COMMANDS:
     eval [--external <file>] Measure routing quality + token-threshold sweep
     stats                    Summarize the cost log (routes, tokens, spend)
     improvements [path]      Show the self-improvement ledger (verified change history)
+    improvements --review    Show only entries the machine gate cannot auto-approve
     config                   Print the effective configuration (no secrets)
     calibrate [--target R]   Recommend PASTURE_THRESHOLD from your logged usage (R=cloud rate, default 0.2)
     calibrate --logprob       Recommend PASTURE_CASCADE_LOGPROB from logged cascade confidence
@@ -287,7 +288,10 @@ pub fn run(args: &[String]) -> i32 {
             }
         },
         "calibrate" => run_calibrate(&config, rest),
-        "improvements" => run_improvements(positional(rest).first().copied()),
+        "improvements" => {
+            let review = rest.iter().any(|a| a == "--review");
+            run_improvements(positional(rest).first().copied(), review)
+        }
         "config" => run_config(&config),
         "donate" => {
             println!(
@@ -805,9 +809,12 @@ fn run_models(_config: &Config) -> i32 {
     0
 }
 
-/// `improvements [path]`: print the self-improvement ledger (IMP-13) — the
-/// verified causal record of every change. Defaults to `IMPROVEMENTS.jsonl`.
-fn run_improvements(path: Option<&str>) -> i32 {
+/// `improvements [path] [--review]`: print the self-improvement ledger (IMP-13)
+/// — the verified causal record of every change. Defaults to `IMPROVEMENTS.jsonl`.
+/// With `--review`, print only the entries the machine approval gate could not
+/// auto-approve (IMP-approval-gate), concentrating human review on the minority
+/// that needs it.
+fn run_improvements(path: Option<&str>, review: bool) -> i32 {
     let path = path.unwrap_or("IMPROVEMENTS.jsonl");
     let items = match crate::improve::read_ledger(path) {
         Ok(items) => items,
@@ -821,14 +828,56 @@ fn run_improvements(path: Option<&str>) -> i32 {
         return 0;
     }
     let s = crate::improve::summarize(&items);
+
+    if review {
+        let (_, needs) = crate::improve::partition_for_review(&items);
+        println!("Self-improvement review gate: {} ({} records)", path, s.total);
+        println!(
+            "  auto-approved (machine-verified): {}   needs human review: {}   ({:.0}% auto)",
+            s.auto_approved,
+            s.needs_review,
+            s.auto_approval_rate() * 100.0
+        );
+        if needs.is_empty() {
+            println!("\n  nothing needs review — every entry passed the machine gate.");
+            return 0;
+        }
+        println!("\nEntries needing human review:");
+        for it in &needs {
+            println!(
+                "[{}] {} — {} (risk: {})",
+                it.status.as_str(),
+                it.id,
+                it.title,
+                it.inferred_risk().as_str()
+            );
+            if let crate::improve::Approval::NeedsReview(reasons) = it.approval() {
+                for r in reasons {
+                    println!("    review needed: {r}");
+                }
+            }
+        }
+        return 0;
+    }
+
     println!("Self-improvement ledger: {} ({} records)", path, s.total);
     println!(
         "  shipped: {}   deferred: {}   retired: {}",
         s.shipped, s.deferred, s.retired
     );
+    println!(
+        "  auto-approved: {}   needs review: {}   (pasture improvements --review)",
+        s.auto_approved, s.needs_review
+    );
     println!();
     for it in &items {
-        println!("[{}] {} — {}", it.status.as_str(), it.id, it.title);
+        println!(
+            "[{}] {} — {} (risk: {})",
+            it.status.as_str(),
+            it.id,
+            it.title,
+            it.inferred_risk().as_str()
+        );
         println!("    change: {}", it.change);
         println!("    reason: {}", it.reason);
         println!("    effect: {}", it.effect);
