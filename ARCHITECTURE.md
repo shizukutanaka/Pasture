@@ -221,6 +221,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-054 `tool_choice` as a hard escalation signal (IMP-tool-choice).**
+  `parse_request` previously set `has_tools` only when a non-empty `tools` or
+  `functions` array was present. Some clients send `tool_choice` without a
+  `tools` array (e.g. `"tool_choice":"required"`) or use `"tool_choice":"auto"`
+  to hint intent without listing tools. Any `tool_choice` value that isn't `"none"`
+  now sets `has_tools=true`, routing those requests to the stronger model. The
+  `"none"` value explicitly opts out and is not escalated. Closes the SPEC.md
+  deferred item. 4 tests.
+- **ADR-053 405 Method Not Allowed for known routes (IMP-http-methods).**
+  The catch-all `else` branch previously returned 404 for any unmatched request,
+  including wrong methods on known routes. `route_allowed_methods` now maps each
+  known path prefix to its allowed methods; when a wrong method hits a known path
+  the response is 405 with an `Allow:` header (RFC 7231 §6.5.5). Unknown paths
+  still return 404. Std-only. 3 tests.
 - **ADR-052 X-Request-ID echo (IMP-request-id).** Clients correlate async
   responses and distributed traces via a caller-supplied `X-Request-ID` header.
   `read_request` parses the header and strips `\r\n` from its value (CRLF-injection

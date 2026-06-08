@@ -5,6 +5,19 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `tool_choice` as a hard escalation signal (IMP-tool-choice)
+
+- `tool_choice` values other than `"none"` (`"auto"`, `"required"`, or a named
+  function object) now escalate the request to the stronger (cloud) model even
+  when no `tools` array is present. `"tool_choice":"none"` explicitly opts out
+  and does not escalate. Closes the SPEC.md deferred item. 4 tests.
+
+### Changed — 405 Method Not Allowed for known routes (IMP-http-methods)
+
+- Wrong-method requests on known paths now return **405 Method Not Allowed** with
+  an `Allow:` header (RFC 7231 §6.5.5), not 404. Examples: `GET /v1/chat/completions`
+  → 405; `DELETE /v1/models` → 405. Unknown paths still return 404. 3 tests.
+
 ### Added — X-Request-ID echo (IMP-request-id)
 
 - The proxy now echoes the caller-supplied `X-Request-ID` request header back on

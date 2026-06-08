@@ -246,6 +246,22 @@ impl Proxy {
         self
     }
 
+    /// Return the `Allow:` header value for a known route so the caller can
+    /// send 405 Method Not Allowed. Returns `None` for unknown paths (→ 404).
+    fn route_allowed_methods(path: &str) -> Option<&'static str> {
+        if path.starts_with("/v1/chat/completions") || path.starts_with("/v1/embeddings") {
+            Some("POST, OPTIONS")
+        } else if path.starts_with("/v1/stats") {
+            Some("GET, OPTIONS")
+        } else if path.starts_with("/v1/models") || path.starts_with("/v1/engines") {
+            Some("GET, OPTIONS")
+        } else if path.starts_with("/health") {
+            Some("GET, HEAD")
+        } else {
+            None
+        }
+    }
+
     /// Apply rate-limit then auth gating for a request path (IMP-15). Returns
     /// `Some((status, message, type))` when the request must be rejected, else
     /// `None`. `/health` is always exempt so liveness probes work unauthenticated.
@@ -368,13 +384,21 @@ impl Proxy {
         // Tool/function-calling presence is a hard routing signal (IMP-10):
         // a non-empty `tools` or `functions` array means the client expects
         // reliable tool use, which the stronger (cloud) model handles best.
+        // `tool_choice` != "none" is treated equivalently: if the caller explicitly
+        // requests a tool call (auto/required/named function), escalate regardless
+        // of whether `tools` is populated (some clients send tool_choice separately).
         let non_empty_array = |key: &str| {
             v.get(key)
                 .and_then(JsonValue::as_array)
                 .map(|a| !a.is_empty())
                 .unwrap_or(false)
         };
-        let has_tools = non_empty_array("tools") || non_empty_array("functions");
+        let tool_choice_active = v
+            .get("tool_choice")
+            .map(|tc| tc.as_str() != Some("none"))
+            .unwrap_or(false);
+        let has_tools =
+            non_empty_array("tools") || non_empty_array("functions") || tool_choice_active;
         let sampling = Self::parse_sampling(&v);
         Ok(CompletionRequest {
             model,
@@ -909,6 +933,19 @@ impl Proxy {
                 } else {
                     write_response(stream, 200, HEALTH_BODY, &extra, keep_alive)?;
                 }
+            } else if let Some(allow) =
+                Self::route_allowed_methods(path.split('?').next().unwrap_or(&path))
+            {
+                // Known path, wrong method → 405 with Allow header (RFC 7231 §6.5.5).
+                let method_extra = format!("Allow: {allow}\r\n{extra}");
+                write_response(
+                    stream,
+                    405,
+                    &build_error_response("method not allowed", "invalid_request_error"),
+                    &method_extra,
+                    false,
+                )?;
+                return Ok(());
             } else {
                 write_response(
                     stream,
@@ -3095,6 +3132,78 @@ mod tests {
         );
         // A sanitised (non-empty) ID is still echoed.
         assert!(resp.contains("X-Request-ID:"), "no request-id echoed: {resp}");
+    }
+
+    // ── 405 Method Not Allowed (IMP-http-methods) ─────────────────────────────
+
+    #[test]
+    fn test_wrong_method_on_known_route_returns_405() {
+        let p = proxy_with(true, false, 100, "unused");
+        // GET on a POST-only route must return 405, not 404.
+        let (status, _) = roundtrip(p, "GET /v1/chat/completions HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 405, "expected 405 for GET /v1/chat/completions");
+    }
+
+    #[test]
+    fn test_wrong_method_returns_allow_header() {
+        let p = proxy_with(true, false, 100, "unused");
+        let raw = "DELETE /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = raw_roundtrip(p, raw.to_string());
+        assert!(
+            resp.contains("HTTP/1.1 405"),
+            "expected 405 response: {resp}"
+        );
+        assert!(resp.contains("Allow:"), "missing Allow header: {resp}");
+    }
+
+    #[test]
+    fn test_unknown_path_returns_404_not_405() {
+        let p = proxy_with(true, false, 100, "unused");
+        let (status, _) = roundtrip(p, "GET /no/such/path HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 404, "unknown path should be 404, not 405");
+    }
+
+    // ── tool_choice escalation (IMP-tool-choice) ──────────────────────────────
+
+    #[test]
+    fn test_tool_choice_auto_escalates() {
+        // tool_choice:"auto" without a tools array should still escalate.
+        let req = Proxy::parse_request(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":"auto"}"#,
+        )
+        .unwrap();
+        assert!(req.has_tools, "tool_choice:auto should set has_tools");
+    }
+
+    #[test]
+    fn test_tool_choice_required_escalates() {
+        let req = Proxy::parse_request(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":"required"}"#,
+        )
+        .unwrap();
+        assert!(req.has_tools, "tool_choice:required should set has_tools");
+    }
+
+    #[test]
+    fn test_tool_choice_none_does_not_escalate() {
+        // "none" = do not call any tool → not a hard escalation signal.
+        let req = Proxy::parse_request(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":"none"}"#,
+        )
+        .unwrap();
+        assert!(!req.has_tools, "tool_choice:none should not set has_tools");
+    }
+
+    #[test]
+    fn test_tool_choice_named_function_escalates() {
+        let req = Proxy::parse_request(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"function","function":{"name":"my_fn"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            req.has_tools,
+            "named tool_choice object should set has_tools"
+        );
     }
 
     #[test]
