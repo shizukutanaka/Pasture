@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — HTTP/1.1 keep-alive connection reuse (IMP-keepalive)
+
+- The server now supports HTTP/1.1 persistent connections: a single worker thread
+  can serve up to 100 sequential requests on one TCP connection before closing it.
+  Per-connection `conn_buf` carries read-ahead bytes across requests so pipelined
+  data isn't discarded. HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close;
+  `Connection: close` from the client or any error response closes immediately.
+  SSE streaming always closes after the stream. The existing slow-loris timeout
+  guard and body-size cap still apply to every request in the pipeline.
+  std-only; 4 tests (two requests on one connection, `Connection: close` termination,
+  `Connection: keep-alive` header present, HTTP/1.0 defaults to close).
+
 ### Added — `logprobs: null` in choice objects (IMP-logprobs-field)
 
 - Both the buffered response choice and every streaming chunk choice now include

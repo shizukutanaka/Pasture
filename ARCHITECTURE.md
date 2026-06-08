@@ -221,6 +221,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-050 HTTP/1.1 keep-alive connection reuse (IMP-keepalive).** The thread-pool
+  server previously closed the TCP connection after every request (HTTP/1.0 style),
+  forcing clients to re-connect for each call — one round-trip per request. The
+  `handle_connection` loop now serves up to 100 sequential requests per connection:
+  a per-connection `conn_buf: Vec<u8>` accumulates read-ahead bytes so that
+  pipelined request bytes captured in the first `read()` aren't discarded; `drain`
+  removes only the consumed bytes, preserving the rest for the next iteration.
+  Connection semantics: HTTP/1.1 defaults to keep-alive; HTTP/1.0 to close;
+  `Connection: close` from either side, any error response, or an SSE stream all
+  terminate immediately. The slow-loris timeout and body cap apply per-request.
+  `write_response` gains a `keep_alive: bool` param for the `Connection:` header.
+  Std-only; 4 tests covering pipelining, close-on-demand, header presence, HTTP/1.0.
 - **ADR-049 `logprobs: null` in choice objects (IMP-logprobs-field).** OpenAI always
   includes a `logprobs` key in each choice (null unless the client requested logprobs);
   Pasture omitted it, so strict client schema validators could reject the response.

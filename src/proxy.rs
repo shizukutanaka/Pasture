@@ -731,134 +731,177 @@ impl Proxy {
             let _ = stream.set_read_timeout(Some(d));
             let _ = stream.set_write_timeout(Some(d));
         }
-        let (method, path, body, auth, origin) = match read_request(stream)? {
-            ReadOutcome::Request {
-                method,
-                path,
-                body,
-                auth,
-                origin,
-            } => (method, path, body, auth, origin),
-            ReadOutcome::TooLarge => {
-                let payload =
-                    build_error_response("request body too large", "invalid_request_error");
-                write_response(stream, 413, &payload, "")?;
-                return Ok(());
-            }
-            ReadOutcome::TimedOut => {
-                let payload = build_error_response("request timed out", "invalid_request_error");
-                write_response(stream, 408, &payload, "")?;
-                return Ok(());
-            }
-            ReadOutcome::Closed => {
-                let payload = build_error_response("malformed request", "invalid_request_error");
-                write_response(stream, 400, &payload, "")?;
-                return Ok(());
-            }
-        };
-        // CORS headers reflected on every response so the browser can read it.
-        let cors = self.cors_headers(origin.as_deref());
-        // CORS preflight: answer OPTIONS before the gate (preflight is credential-free).
-        if method == "OPTIONS" {
-            match self.cors_preflight(origin.as_deref()) {
-                Some(h) => write_response(stream, 204, "", &h)?,
-                None => write_response(
-                    stream,
-                    404,
-                    &build_error_response("not found", "invalid_request_error"),
-                    &cors,
-                )?,
-            }
-            return Ok(());
-        }
-        // Auth + rate-limit gating (IMP-15); /health is exempt.
-        if let Some((status, msg, kind)) = self.check_gate(&path, auth.as_deref()) {
-            write_response(stream, status, &build_error_response(msg, kind), &cors)?;
-            return Ok(());
-        }
-        if method == "POST" && path.starts_with("/v1/chat/completions") {
-            match Self::parse_request(&body) {
-                Ok(req) if req.stream => {
-                    let include_usage = Self::parse_include_usage(&body);
-                    self.stream_chat_to_socket(stream, &req, &cors, include_usage)?
+        // Per-connection read buffer: bytes read ahead for the current request
+        // stay here for the next (keep-alive pipelining support).
+        let mut conn_buf: Vec<u8> = Vec::new();
+        // Safety cap: one keep-alive connection serves at most this many requests.
+        const MAX_KEEPALIVE_REQUESTS: usize = 100;
+        for _ in 0..MAX_KEEPALIVE_REQUESTS {
+            let (method, path, body, auth, origin, keep_alive) =
+                match read_request(stream, &mut conn_buf)? {
+                    ReadOutcome::Request {
+                        method,
+                        path,
+                        body,
+                        auth,
+                        origin,
+                        connection_close,
+                    } => (method, path, body, auth, origin, !connection_close),
+                    ReadOutcome::TooLarge => {
+                        let payload =
+                            build_error_response("request body too large", "invalid_request_error");
+                        write_response(stream, 413, &payload, "", false)?;
+                        return Ok(());
+                    }
+                    ReadOutcome::TimedOut => {
+                        let payload =
+                            build_error_response("request timed out", "invalid_request_error");
+                        write_response(stream, 408, &payload, "", false)?;
+                        return Ok(());
+                    }
+                    ReadOutcome::Closed => return Ok(()), // normal EOF / graceful close
+                };
+            // CORS headers reflected on every response so the browser can read it.
+            let cors = self.cors_headers(origin.as_deref());
+            // CORS preflight: answer OPTIONS before the gate (preflight is credential-free).
+            if method == "OPTIONS" {
+                match self.cors_preflight(origin.as_deref()) {
+                    Some(h) => write_response(stream, 204, "", &h, keep_alive)?,
+                    None => write_response(
+                        stream,
+                        404,
+                        &build_error_response("not found", "invalid_request_error"),
+                        &cors,
+                        keep_alive,
+                    )?,
                 }
-                Ok(req) => match self.complete_buffered(&req) {
-                    Ok(resp) => write_response(stream, 200, &resp, &cors)?,
+                // Preflight doesn't count as content: the client follows up immediately.
+                if !keep_alive {
+                    return Ok(());
+                }
+                continue;
+            }
+            // Auth + rate-limit gating (IMP-15); /health is exempt.
+            if let Some((status, msg, kind)) = self.check_gate(&path, auth.as_deref()) {
+                write_response(
+                    stream,
+                    status,
+                    &build_error_response(msg, kind),
+                    &cors,
+                    false,
+                )?;
+                return Ok(());
+            }
+            if method == "POST" && path.starts_with("/v1/chat/completions") {
+                match Self::parse_request(&body) {
+                    Ok(req) if req.stream => {
+                        // SSE is a long-lived stream; always close the connection afterwards.
+                        let include_usage = Self::parse_include_usage(&body);
+                        self.stream_chat_to_socket(stream, &req, &cors, include_usage)?;
+                        return Ok(());
+                    }
+                    Ok(req) => match self.complete_buffered(&req) {
+                        Ok(resp) => write_response(stream, 200, &resp, &cors, keep_alive)?,
+                        Err(e) => {
+                            write_response(
+                                stream,
+                                e.status(),
+                                &build_error_response(e.message(), e.kind()),
+                                &cors,
+                                false,
+                            )?;
+                            return Ok(());
+                        }
+                    },
                     Err(e) => {
                         write_response(
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
                             &cors,
+                            false,
                         )?;
+                        return Ok(());
                     }
-                },
-                Err(e) => {
+                }
+            } else if method == "POST" && path.starts_with("/v1/embeddings") {
+                match self.handle_embeddings(&body) {
+                    Ok(resp) => write_response(stream, 200, &resp, &cors, keep_alive)?,
+                    Err(e) => {
+                        write_response(
+                            stream,
+                            e.status(),
+                            &build_error_response(e.message(), e.kind()),
+                            &cors,
+                            false,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            } else if method == "GET" && path.starts_with("/v1/stats") {
+                match self.handle_stats() {
+                    Ok(resp) => write_response(stream, 200, &resp, &cors, keep_alive)?,
+                    Err(e) => {
+                        write_response(
+                            stream,
+                            e.status(),
+                            &build_error_response(e.message(), e.kind()),
+                            &cors,
+                            false,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            } else if method == "GET" && path.starts_with("/v1/models") {
+                // `/v1/models` lists; `/v1/models/{id}` retrieves a single model.
+                let rest = &path["/v1/models".len()..];
+                if let Some(after) = rest.strip_prefix('/') {
+                    let id = after
+                        .split('?')
+                        .next()
+                        .unwrap_or(after)
+                        .trim_end_matches('/');
+                    match build_model_response(&self.models, id) {
+                        Some(b) => write_response(stream, 200, &b, &cors, keep_alive)?,
+                        None => {
+                            write_response(
+                                stream,
+                                404,
+                                &build_error_response(
+                                    &format!("model '{id}' not found"),
+                                    "invalid_request_error",
+                                ),
+                                &cors,
+                                false,
+                            )?;
+                            return Ok(());
+                        }
+                    }
+                } else {
                     write_response(
                         stream,
-                        e.status(),
-                        &build_error_response(e.message(), e.kind()),
+                        200,
+                        &build_models_response(&self.models),
                         &cors,
+                        keep_alive,
                     )?;
                 }
-            }
-        } else if method == "POST" && path.starts_with("/v1/embeddings") {
-            match self.handle_embeddings(&body) {
-                Ok(resp) => write_response(stream, 200, &resp, &cors)?,
-                Err(e) => {
-                    write_response(
-                        stream,
-                        e.status(),
-                        &build_error_response(e.message(), e.kind()),
-                        &cors,
-                    )?;
-                }
-            }
-        } else if method == "GET" && path.starts_with("/v1/stats") {
-            match self.handle_stats() {
-                Ok(resp) => write_response(stream, 200, &resp, &cors)?,
-                Err(e) => {
-                    write_response(
-                        stream,
-                        e.status(),
-                        &build_error_response(e.message(), e.kind()),
-                        &cors,
-                    )?;
-                }
-            }
-        } else if method == "GET" && path.starts_with("/v1/models") {
-            // `/v1/models` lists; `/v1/models/{id}` retrieves a single model.
-            let rest = &path["/v1/models".len()..];
-            if let Some(after) = rest.strip_prefix('/') {
-                let id = after
-                    .split('?')
-                    .next()
-                    .unwrap_or(after)
-                    .trim_end_matches('/');
-                match build_model_response(&self.models, id) {
-                    Some(b) => write_response(stream, 200, &b, &cors)?,
-                    None => write_response(
-                        stream,
-                        404,
-                        &build_error_response(
-                            &format!("model '{id}' not found"),
-                            "invalid_request_error",
-                        ),
-                        &cors,
-                    )?,
-                }
+            } else if method == "GET" && path.starts_with("/health") {
+                write_response(stream, 200, "{\"status\":\"ok\"}", &cors, keep_alive)?;
             } else {
-                write_response(stream, 200, &build_models_response(&self.models), &cors)?;
+                write_response(
+                    stream,
+                    404,
+                    &build_error_response("not found", "invalid_request_error"),
+                    &cors,
+                    false,
+                )?;
+                return Ok(());
             }
-        } else if method == "GET" && path.starts_with("/health") {
-            write_response(stream, 200, "{\"status\":\"ok\"}", &cors)?;
-        } else {
-            write_response(
-                stream,
-                404,
-                &build_error_response("not found", "invalid_request_error"),
-                &cors,
-            )?;
+            if !keep_alive {
+                return Ok(());
+            }
+            // keep_alive=true: loop for the next pipelined request.
         }
         Ok(())
     }
@@ -888,6 +931,7 @@ impl Proxy {
                     e.status(),
                     &build_error_response(e.message(), e.kind()),
                     cors,
+                    false,
                 );
             }
         };
@@ -899,6 +943,7 @@ impl Proxy {
                     e.status(),
                     &build_error_response(e.message(), e.kind()),
                     cors,
+                    false,
                 );
             }
         };
@@ -1294,6 +1339,10 @@ enum ReadOutcome {
         auth: Option<String>,
         /// The `Origin` header value, if present (used for CORS, IMP-cors).
         origin: Option<String>,
+        /// True when the client explicitly requested `Connection: close`, or when
+        /// the request is HTTP/1.0 without an explicit `Connection: keep-alive`
+        /// (HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close).
+        connection_close: bool,
     },
     /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413.
     TooLarge,
@@ -1311,12 +1360,17 @@ fn is_timeout(e: &std::io::Error) -> bool {
     )
 }
 
-fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome> {
-    let mut buf = Vec::new();
+/// Read one HTTP/1.x request from `stream`, using `conn_buf` as a persistent
+/// accumulation buffer. Any bytes read past the end of this request remain in
+/// `conn_buf` for the next call (keep-alive pipelining support).
+fn read_request(
+    stream: &mut std::net::TcpStream,
+    conn_buf: &mut Vec<u8>,
+) -> std::io::Result<ReadOutcome> {
     let mut chunk = [0u8; 1024];
-    // Read until headers are complete.
+    // Accumulate bytes until the header terminator is found.
     let header_end = loop {
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+        if let Some(pos) = find_subslice(conn_buf, b"\r\n\r\n") {
             break pos;
         }
         let n = match stream.read(&mut chunk) {
@@ -1325,36 +1379,46 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
             Err(e) => return Err(e),
         };
         if n == 0 {
+            // EOF with no headers seen → clean connection close.
             return Ok(ReadOutcome::Closed);
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > 1_048_576 {
+        conn_buf.extend_from_slice(&chunk[..n]);
+        if conn_buf.len() > 1_048_576 {
             return Ok(ReadOutcome::Closed); // 1 MiB header guard
         }
     };
 
-    let header_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let header_text = String::from_utf8_lossy(&conn_buf[..header_end]).into_owned();
     let mut lines = header_text.lines();
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
 
+    // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close.
+    let http11 = request_line.contains("HTTP/1.1");
     let mut content_length = 0usize;
     let mut auth: Option<String> = None;
     let mut origin: Option<String> = None;
+    let mut connection_close = !http11; // HTTP/1.0 default = close
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
         } else if lower.starts_with("authorization:") {
-            // Preserve original case for the token value (header name is ASCII).
             if let Some((_, v)) = line.split_once(':') {
                 auth = Some(v.trim().to_string());
             }
         } else if lower.starts_with("origin:") {
             if let Some((_, v)) = line.split_once(':') {
                 origin = Some(v.trim().to_string());
+            }
+        } else if let Some(v) = lower.strip_prefix("connection:") {
+            let val = v.trim();
+            connection_close = val == "close";
+            // HTTP/1.0 + "Connection: keep-alive" → keep alive
+            if !http11 && val == "keep-alive" {
+                connection_close = false;
             }
         }
     }
@@ -1364,9 +1428,13 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
         return Ok(ReadOutcome::TooLarge);
     }
 
+    // The body starts right after the \r\n\r\n. bytes already in conn_buf
+    // past that offset are part of the body (or a pipelined next request).
     let body_start = header_end + 4;
-    let mut body = buf[body_start..].to_vec();
-    while body.len() < content_length {
+    let body_end = body_start + content_length;
+
+    // Read more bytes until we have the full body.
+    while conn_buf.len() < body_end {
         let n = match stream.read(&mut chunk) {
             Ok(n) => n,
             Err(e) if is_timeout(&e) => return Ok(ReadOutcome::TimedOut),
@@ -1375,18 +1443,24 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
         if n == 0 {
             break;
         }
-        body.extend_from_slice(&chunk[..n]);
-        if body.len() > MAX_BODY_BYTES {
+        conn_buf.extend_from_slice(&chunk[..n]);
+        if conn_buf.len() > body_end + MAX_BODY_BYTES {
             return Ok(ReadOutcome::TooLarge);
         }
     }
-    body.truncate(content_length);
+
+    // Extract exactly content_length body bytes.
+    let body_bytes = conn_buf[body_start..body_end.min(conn_buf.len())].to_vec();
+    // Drain the consumed request bytes; any remainder belongs to the next request.
+    conn_buf.drain(..body_end.min(conn_buf.len()));
+
     Ok(ReadOutcome::Request {
         method,
         path,
-        body: String::from_utf8_lossy(&body).into_owned(),
+        body: String::from_utf8_lossy(&body_bytes).into_owned(),
         auth,
         origin,
+        connection_close,
     })
 }
 
@@ -1419,11 +1493,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Write an HTTP/1.1 response. `extra` is a block of additional header lines
 /// (each already terminated with `\r\n`, e.g. CORS headers) or empty.
+/// `keep_alive` controls the `Connection:` header value.
 fn write_response(
     stream: &mut std::net::TcpStream,
     status: u16,
     body: &str,
     extra: &str,
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
@@ -1438,8 +1514,9 @@ fn write_response(
         503 => "Service Unavailable",
         _ => "Error",
     };
+    let conn = if keep_alive { "keep-alive" } else { "close" };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {conn}\r\n{extra}\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes())
@@ -1552,6 +1629,142 @@ mod tests {
         assert!(is_timeout(&Error::from(ErrorKind::WouldBlock)));
         assert!(is_timeout(&Error::from(ErrorKind::TimedOut)));
         assert!(!is_timeout(&Error::from(ErrorKind::BrokenPipe)));
+    }
+
+    /// Helper: send two raw HTTP requests on a single TCP connection and return
+    /// all HTTP response status codes. Parses responses using Content-Length so
+    /// that the second status line isn't merged with the first response body.
+    fn keepalive_statuses(proxy: Proxy, req1: String, req2: String) -> Vec<u16> {
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(req1.as_bytes()).unwrap();
+            c.write_all(req2.as_bytes()).unwrap();
+            c.shutdown(Shutdown::Write).ok();
+            let mut buf = Vec::new();
+            c.read_to_end(&mut buf).unwrap();
+            buf
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        proxy.handle_connection(&mut server).unwrap();
+        drop(server);
+        let raw = client.join().unwrap();
+        // Parse framed HTTP responses via Content-Length so concatenated
+        // responses (keep-alive pipeline) are split correctly.
+        let mut statuses = Vec::new();
+        let mut pos = 0;
+        while pos < raw.len() {
+            // Find header end.
+            let Some(hdr_end) = find_subslice(&raw[pos..], b"\r\n\r\n") else {
+                break;
+            };
+            let hdr = String::from_utf8_lossy(&raw[pos..pos + hdr_end]);
+            // Parse status code from the first line.
+            if let Some(status) = hdr
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<u16>().ok())
+            {
+                statuses.push(status);
+            }
+            // Parse Content-Length to skip body.
+            let clen: usize = hdr
+                .lines()
+                .find_map(|l| {
+                    let low = l.to_ascii_lowercase();
+                    low.strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            pos += hdr_end + 4 + clen;
+        }
+        statuses
+    }
+
+    #[test]
+    fn test_keepalive_two_requests_on_one_connection() {
+        let p = proxy_with(true, false, 100, "unused");
+        let req = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n".to_string();
+        let statuses = keepalive_statuses(p, req.clone(), req);
+        assert_eq!(statuses, vec![200, 200], "expected two 200s: {statuses:?}");
+    }
+
+    #[test]
+    fn test_connection_close_terminates_after_first_request() {
+        let p = proxy_with(true, false, 100, "unused");
+        let req1 = "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_string();
+        let req2 = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n".to_string();
+        let statuses = keepalive_statuses(p, req1, req2);
+        // Only the first request is served; the server closes after Connection: close.
+        assert_eq!(
+            statuses,
+            vec![200],
+            "expected one 200 (connection closed): {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn test_keepalive_response_has_keep_alive_header() {
+        // HTTP/1.1 without Connection: close → response must advertise keep-alive.
+        let (status, raw) = roundtrip(
+            proxy_with(true, false, 100, "unused"),
+            "GET /health HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        );
+        assert_eq!(status, 200);
+        // The raw response (headers + body) must include Connection: keep-alive.
+        // roundtrip() reads everything the server writes; headers appear before body.
+        let _ = raw; // body stripped by roundtrip; check via a second helper approach
+                     // Re-use the raw roundtrip: use the full raw response from the socket.
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            c.shutdown(Shutdown::Write).ok();
+            let mut r = String::new();
+            c.read_to_string(&mut r).unwrap();
+            r
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        proxy_with(true, false, 100, "unused")
+            .handle_connection(&mut server)
+            .unwrap();
+        drop(server);
+        let raw_resp = client.join().unwrap();
+        assert!(
+            raw_resp.contains("Connection: keep-alive"),
+            "HTTP/1.1 response should advertise keep-alive by default: {raw_resp}"
+        );
+    }
+
+    #[test]
+    fn test_http10_request_defaults_to_close() {
+        let p = proxy_with(true, false, 100, "unused");
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"GET /health HTTP/1.0\r\nHost: x\r\n\r\n")
+                .unwrap();
+            c.shutdown(Shutdown::Write).ok();
+            let mut r = String::new();
+            c.read_to_string(&mut r).unwrap();
+            r
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        p.handle_connection(&mut server).unwrap();
+        drop(server);
+        let resp = client.join().unwrap();
+        assert!(
+            resp.contains("Connection: close"),
+            "HTTP/1.0 without keep-alive header should close: {resp}"
+        );
     }
 
     #[test]
