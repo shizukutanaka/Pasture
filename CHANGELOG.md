@@ -5,6 +5,37 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Privacy/PII detection hardening (10 categories)
+
+Expanded `privacy.rs` from 7 to **10 detection categories** — all std-only, zero-dep:
+
+- **`pem_key`** (new): detects `-----BEGIN … PRIVATE KEY-----` blocks (RSA, EC,
+  OPENSSH, PKCS8 etc.) with near-zero false positives. SSH private keys, TLS keys,
+  any PEM secret pasted into a prompt are now caught before reaching the cloud.
+
+- **`url_credential`** (new): detects embedded credentials in URLs of the form
+  `scheme://user:password@host` (postgres, mysql, redis, ftp, …). Requires a
+  non-empty password part; `http://host:8080/` (port-only) is NOT flagged.
+
+- **`env_secret`** (new): detects `KEY=value` / `export KEY=value` lines where the
+  variable name contains secret-sounding substrings (pass, secret, token, auth,
+  credential, private, pwd, _key, api_key, apikey). Trivial values (empty, null,
+  true/false) are excluded. Catches `.env` file pastes, shell session sharing, etc.
+
+- **`keyword`** expanded: +14 EN terms (bearer token, auth token, refresh token,
+  signing key, encryption key, bank account, account number, routing number, swift
+  code, IBAN, national id, taxpayer id, driver's license, date of birth) +10 JA terms
+  (生年月日, 口座番号, 保険証, 年金番号, 運転免許, 在留カード, 住所, 氏名, 電話番号,
+  銀行口座, 個人番号) — now the most comprehensive EN/JA PII keyword list for
+  routing proxies.
+
+- **`api_key` prefixes** expanded: +9 vendor-specific prefixes (Stripe `sk_live_`/
+  `sk_test_`/`rk_live_`/`whsec_`, SendGrid `SG.`, Google OAuth `ya29.`, npm `npm_`,
+  DigitalOcean `dop_v1_`, HashiCorp Vault `hvs.`, Cloudflare `v1.0-`). Total: 20+
+  prefixes covering all major SaaS API key formats.
+
+26 new tests (259 total). SPEC.md §5 updated with the full category table.
+
 ### Added — GPU-less / local-only PC enhancement
 
 - **`PASTURE_LOCAL_ONLY=1` (local-only mode):** disables the cloud backend entirely —

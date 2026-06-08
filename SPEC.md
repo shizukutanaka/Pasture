@@ -152,12 +152,24 @@ else → 300. Overridable by `PASTURE_THRESHOLD`.
 
 ## 5. Privacy classification
 
-`classify(text)` returns category labels only (I3). Categories: `keyword` (EN/JA
-sensitive terms), `email`, `ip` (IPv4), `credit_card` (Luhn), `phone` (intl `+` and
-JP domestic), `api_key` (known prefixes + length), `jwt` (`eyJ` + 3 base64url
-segments). Any hit ⇒ sensitive ⇒ forced local (§4 step 1) and never cached (I2).
-The bias is deliberately toward over-classifying (false positive = stays local, cheap;
-false negative = leak, unacceptable).
+`classify(text)` returns category labels only (I3). **Ten categories:**
+
+| Category | Detection rule |
+|---|---|
+| `keyword` | EN/JA case-insensitive keyword match (credentials, financial, government ID, medical) |
+| `email` | `local@domain.tld` heuristic |
+| `ip` | Four-octet IPv4 in 0–255 |
+| `credit_card` | 13–19 digit run passing Luhn check |
+| `phone` | International `+`-form (8–15 digits) and JP domestic mobile/hyphenated landline |
+| `api_key` | Known vendor prefix + min length (20+ prefixes: OpenAI, GitHub, Stripe, SendGrid, AWS, Google OAuth, npm, …) |
+| `jwt` | `eyJ…` + 3 base64url segments |
+| `pem_key` | `-----BEGIN … PRIVATE KEY-----` block (RSA/EC/OPENSSH/PKCS8 etc.) |
+| `url_credential` | `scheme://user:password@host` embedded credentials |
+| `env_secret` | `KEY=value` / `export KEY=value` where KEY name suggests a secret (password/secret/token/auth/…) |
+
+Any hit ⇒ sensitive ⇒ forced local (§4 step 1) and never cached (I2).
+The bias is deliberately toward over-classifying: false positive = stays local (cheap);
+false negative = data leak (unacceptable).
 
 ---
 

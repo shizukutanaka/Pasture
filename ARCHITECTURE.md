@@ -221,6 +221,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-036 Privacy/PII detection hardening (10 categories).** The original 7-category
+  classifier missed three common leakage vectors: PEM private keys pasted from key
+  files, database/service URLs with embedded credentials (`postgres://user:pass@host`),
+  and `.env` file contents or shell session pastes containing `SECRET=value` assignments.
+  Three new detection functions (`contains_pem_key`, `contains_url_credential`,
+  `contains_env_secret`) close these gaps. The keyword list is expanded with 14 EN and
+  10 JA terms covering financial (IBAN, routing number, bank account), government ID
+  (driver's license, date of birth, 運転免許, 在留カード, 生年月日), and credential
+  vocabulary (bearer token, refresh token). The `KEY_PREFIXES` list gains 9 vendor
+  prefixes (Stripe, SendGrid, Google OAuth, npm, DigitalOcean, HashiCorp Vault,
+  Cloudflare). All functions return category labels only — never matched values (I3/I5).
+  Design bias remains toward over-classification: a false positive keeps a prompt local
+  (cheap); a false negative leaks data (unacceptable). 26 new tests; std-only.
 - **ADR-035 GPU-less / local-only PC enhancement (IMP-new).** Three features for
   no-GPU / air-gapped machines that together turn Pasture into a capable PC assistant
   without any cloud dependency: (1) `PASTURE_LOCAL_ONLY` — routes all traffic local

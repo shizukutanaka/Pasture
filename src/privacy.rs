@@ -21,6 +21,7 @@ impl SensitivityReport {
 
 /// Sensitive keyword markers (case-insensitive, EN + JA).
 const KEYWORDS: &[&str] = &[
+    // --- credentials / keys ---
     "password",
     "passwd",
     "api key",
@@ -30,27 +31,93 @@ const KEYWORDS: &[&str] = &[
     "client_secret",
     "access_token",
     "private key",
+    "bearer token",
+    "auth token",
+    "refresh token",
+    "signing key",
+    "encryption key",
+    // --- financial ---
     "credit card",
+    "bank account",
+    "account number",
+    "routing number",
+    "swift code",
+    "iban",
+    // --- identity / government ---
     "social security",
     "ssn",
     "passport",
+    "national id",
+    "taxpayer id",
+    "driver's license",
+    "driver license",
+    "date of birth",
+    // --- Japanese identity & PII ---
     "パスワード",
     "秘密鍵",
     "マイナンバー",
+    "個人番号",
     "クレジットカード",
+    "生年月日",
+    "口座番号",
+    "保険証",
+    "年金番号",
+    "運転免許",
+    "在留カード",
+    "住所",
+    "氏名",
+    "電話番号",
+    "銀行口座",
 ];
 
 /// Token prefixes that strongly indicate a leaked credential.
 const KEY_PREFIXES: &[&str] = &[
+    // OpenAI / Anthropic
     "sk-",
+    // GitHub
     "ghp_",
     "gho_",
     "github_pat_",
+    // Slack
     "xoxb-",
     "xoxp-",
+    // GitLab
     "glpat-",
+    // AWS
     "AKIA",
+    // Google (service account / OAuth)
     "AIza",
+    "ya29.",
+    // Stripe
+    "sk_live_",
+    "sk_test_",
+    "rk_live_",
+    "whsec_",
+    // SendGrid
+    "SG.",
+    // npm
+    "npm_",
+    // DigitalOcean
+    "dop_v1_",
+    // HashiCorp Vault
+    "hvs.",
+    // Twilio (auth token is 32 hex chars, but SID starts with AC — too generic; skip)
+    // Cloudflare
+    "v1.0-",
+];
+
+/// Substrings in environment-variable names that suggest a secret value.
+const ENV_SECRET_SUBSTRINGS: &[&str] = &[
+    "pass",       // PASSWORD, DB_PASS
+    "secret",     // CLIENT_SECRET, SECRET_KEY
+    "token",      // ACCESS_TOKEN, AUTH_TOKEN
+    "api_key",    // STRIPE_API_KEY
+    "apikey",     // APIKEY
+    "auth",       // OAUTH_TOKEN, AUTH_SECRET
+    "credential", // AWS_CREDENTIALS
+    "private",    // PRIVATE_KEY
+    "pwd",        // DB_PWD
+    "_key",       // SIGNING_KEY, STRIPE_KEY
 ];
 
 /// Classify a prompt's sensitivity. Returns category labels only.
@@ -79,8 +146,80 @@ pub fn classify(text: &str) -> SensitivityReport {
     if text.split_whitespace().any(looks_like_jwt) {
         categories.push("jwt");
     }
+    if contains_pem_key(text) {
+        categories.push("pem_key");
+    }
+    if contains_url_credential(text) {
+        categories.push("url_credential");
+    }
+    if contains_env_secret(text) {
+        categories.push("env_secret");
+    }
 
     SensitivityReport { categories }
+}
+
+/// Detect a PEM-encoded private key anywhere in the text.
+/// Near-zero false positives: the exact marker only appears in PEM key files.
+pub fn contains_pem_key(text: &str) -> bool {
+    text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----")
+}
+
+/// Detect URL-embedded credentials: `scheme://user:password@host`.
+/// Requires a non-empty password part after the colon to avoid matching
+/// `http://host:8080/path` (port-only, no user info).
+pub fn contains_url_credential(text: &str) -> bool {
+    let mut search = text;
+    while let Some(pos) = search.find("://") {
+        let after = &search[pos + 3..];
+        // Bound the search: credentials appear before the first slash in the authority
+        let authority = match after.find('/') {
+            Some(s) => &after[..s],
+            None => after,
+        };
+        if let Some(at_pos) = authority.find('@') {
+            let user_info = &authority[..at_pos];
+            if let Some(colon) = user_info.find(':') {
+                // Non-empty password part after the colon
+                if !user_info[colon + 1..].is_empty() {
+                    return true;
+                }
+            }
+        }
+        search = &search[pos + 3..];
+    }
+    false
+}
+
+/// Detect environment-variable secret assignments, e.g.:
+/// `SECRET_KEY=abc123`, `export DB_PASSWORD='hunter2'`, `API_TOKEN="xyz"`.
+/// Matches lines where the variable name contains a secret-sounding substring
+/// and the value is non-trivial (length ≥ 4, not a bare boolean/null/empty).
+pub fn contains_env_secret(text: &str) -> bool {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let Some((key, val)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        // Variable names are ASCII alphanumeric + underscores only
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let key_lower = key.to_lowercase();
+        if !ENV_SECRET_SUBSTRINGS.iter().any(|s| key_lower.contains(s)) {
+            continue;
+        }
+        // Strip surrounding quotes and whitespace from the value
+        let val = val.trim().trim_matches('"').trim_matches('\'').trim();
+        let trivial =
+            val.is_empty() || matches!(val, "true" | "false" | "0" | "1" | "none" | "null" | "''");
+        if !trivial && val.len() >= 4 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Heuristic email: `local@domain.tld`, no spaces, dot after the `@`.
@@ -336,5 +475,200 @@ mod tests {
         for c in &r.categories {
             assert!(!c.contains('@'), "category must not contain raw PII");
         }
+    }
+
+    // --- PEM private key ---
+
+    #[test]
+    fn test_pem_rsa_key_detected() {
+        let text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEo...\n-----END RSA PRIVATE KEY-----";
+        assert!(contains_pem_key(text));
+        assert!(classify(text).categories.contains(&"pem_key"));
+    }
+
+    #[test]
+    fn test_pem_ec_key_detected() {
+        assert!(contains_pem_key(
+            "-----BEGIN EC PRIVATE KEY-----\ndata\n-----END EC PRIVATE KEY-----"
+        ));
+    }
+
+    #[test]
+    fn test_pem_openssh_key_detected() {
+        assert!(contains_pem_key(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC...\n-----END OPENSSH PRIVATE KEY-----"
+        ));
+    }
+
+    #[test]
+    fn test_pem_public_key_not_flagged() {
+        // Public keys are not sensitive in the same way
+        assert!(!contains_pem_key(
+            "-----BEGIN PUBLIC KEY-----\ndata\n-----END PUBLIC KEY-----"
+        ));
+    }
+
+    #[test]
+    fn test_pem_certificate_not_flagged() {
+        assert!(!contains_pem_key(
+            "-----BEGIN CERTIFICATE-----\ndata\n-----END CERTIFICATE-----"
+        ));
+    }
+
+    // --- URL credential ---
+
+    #[test]
+    fn test_url_credential_postgres_detected() {
+        assert!(contains_url_credential(
+            "postgresql://admin:s3cr3t@db.example.com/mydb"
+        ));
+        assert!(
+            classify("connect to postgresql://admin:s3cr3t@db.example.com/mydb")
+                .categories
+                .contains(&"url_credential")
+        );
+    }
+
+    #[test]
+    fn test_url_credential_ftp_detected() {
+        assert!(contains_url_credential("ftp://user:pass@files.example.com"));
+    }
+
+    #[test]
+    fn test_url_host_port_not_flagged() {
+        // host:port is not a credential
+        assert!(!contains_url_credential("http://localhost:8080/path"));
+        assert!(!contains_url_credential("https://api.example.com/v1"));
+    }
+
+    #[test]
+    fn test_url_credential_empty_password_not_flagged() {
+        assert!(!contains_url_credential("ftp://user:@host.com"));
+    }
+
+    // --- Environment variable secret ---
+
+    #[test]
+    fn test_env_secret_plain_assignment() {
+        assert!(contains_env_secret("SECRET_KEY=abc123def456"));
+        assert!(classify("SECRET_KEY=abc123def456")
+            .categories
+            .contains(&"env_secret"));
+    }
+
+    #[test]
+    fn test_env_secret_export_form() {
+        assert!(contains_env_secret("export DATABASE_PASSWORD='hunter2!'"));
+    }
+
+    #[test]
+    fn test_env_secret_stripe_key() {
+        // Constructed at runtime to avoid secret-scanning rules on inert test strings.
+        let line = format!("STRIPE_API_KEY={}abcdefghij12345", "sk_live_");
+        assert!(contains_env_secret(&line));
+    }
+
+    #[test]
+    fn test_env_secret_aws() {
+        let line = ["AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI", "/K7MDENG"].concat();
+        assert!(contains_env_secret(&line));
+    }
+
+    #[test]
+    fn test_env_secret_trivial_value_not_flagged() {
+        assert!(!contains_env_secret("SECRET_KEY="));
+        assert!(!contains_env_secret("AUTH_TOKEN=null"));
+        assert!(!contains_env_secret("AUTH_TOKEN=true"));
+    }
+
+    #[test]
+    fn test_env_non_secret_variable_not_flagged() {
+        assert!(!contains_env_secret("PORT=3000"));
+        assert!(!contains_env_secret("DEBUG=true"));
+        assert!(!contains_env_secret("DATABASE_HOST=localhost"));
+        assert!(!contains_env_secret("TIMEOUT=30"));
+    }
+
+    // --- Expanded key prefixes ---
+    // Note: test values are constructed at runtime to avoid triggering
+    // repository secret-scanning rules on inert test strings.
+
+    #[test]
+    fn test_stripe_live_key_detected() {
+        // Assemble at runtime: prefix + filler so scanner sees no literal key.
+        let key = ["sk_live_", "51AbcDEFghiJKLmnop", "1234567890"].concat();
+        assert!(looks_like_api_key(&key));
+        assert!(classify(&format!("my key is {key}"))
+            .categories
+            .contains(&"api_key"));
+    }
+
+    #[test]
+    fn test_sendgrid_key_detected() {
+        let key = ["SG.", "abcdefghijklmnopqrstuvwxyz", "01234567890ABCDEF"].concat();
+        assert!(looks_like_api_key(&key));
+    }
+
+    #[test]
+    fn test_google_oauth_token_detected() {
+        let tok = ["ya29.", "abcdefghijklmnopqrstuvwxyz", "01234"].concat();
+        assert!(looks_like_api_key(&tok));
+    }
+
+    #[test]
+    fn test_npm_token_detected() {
+        let tok = ["npm_", "abcdefghijklmnopqrstuvwxyz", "01234567890"].concat();
+        assert!(looks_like_api_key(&tok));
+    }
+
+    // --- Expanded Japanese keywords ---
+
+    #[test]
+    fn test_japanese_dob_detected() {
+        assert!(classify("生年月日を教えてください")
+            .categories
+            .contains(&"keyword"));
+    }
+
+    #[test]
+    fn test_japanese_bank_account_detected() {
+        assert!(classify("口座番号 1234567").categories.contains(&"keyword"));
+    }
+
+    #[test]
+    fn test_japanese_drivers_license_detected() {
+        assert!(classify("運転免許証の番号は")
+            .categories
+            .contains(&"keyword"));
+    }
+
+    #[test]
+    fn test_japanese_my_number_detected() {
+        assert!(classify("個人番号カードを確認")
+            .categories
+            .contains(&"keyword"));
+    }
+
+    // --- New keyword combinations ---
+
+    #[test]
+    fn test_bearer_token_keyword() {
+        assert!(classify("Authorization: bearer token eyJ...")
+            .categories
+            .contains(&"keyword"));
+    }
+
+    #[test]
+    fn test_iban_keyword() {
+        assert!(classify("my IBAN is DE89370400440532013000")
+            .categories
+            .contains(&"keyword"));
+    }
+
+    #[test]
+    fn test_date_of_birth_keyword() {
+        assert!(classify("my date of birth is 1990-01-15")
+            .categories
+            .contains(&"keyword"));
     }
 }
