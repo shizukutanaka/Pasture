@@ -905,15 +905,23 @@ impl Proxy {
 
         write_sse_headers(sock, cors)?;
         let route_label = decision.route.as_str();
-        // One id and fingerprint shared by every chunk of this stream (OpenAI behaviour).
+        // One id, model, and fingerprint shared by every chunk of this stream (OpenAI behaviour).
         let id = next_completion_id();
-        let fp = fingerprint_for_model(&req.model);
+        let model = req.model.clone();
+        let fp = fingerprint_for_model(&model);
         let mut io_err: Option<std::io::Error> = None;
         let resp = backend.stream_complete(req, &mut |delta| {
             if io_err.is_some() {
                 return;
             }
-            let frame = sse_frame(&build_openai_chunk(&id, &fp, delta, route_label, None));
+            let frame = sse_frame(&build_openai_chunk(
+                &id,
+                &model,
+                &fp,
+                delta,
+                route_label,
+                None,
+            ));
             if let Err(e) = sock.write_all(frame.as_bytes()) {
                 io_err = Some(e);
             }
@@ -924,12 +932,20 @@ impl Proxy {
         match resp {
             Ok(r) => {
                 self.log_cost(route_label, &r, None);
-                let stop = sse_frame(&build_openai_chunk(&id, &fp, "", route_label, Some("stop")));
+                let stop = sse_frame(&build_openai_chunk(
+                    &id,
+                    &model,
+                    &fp,
+                    "",
+                    route_label,
+                    Some("stop"),
+                ));
                 sock.write_all(stop.as_bytes())?;
                 // Final usage chunk when the client asked for it (OpenAI feature).
                 if include_usage {
                     let usage = sse_frame(&build_openai_usage_chunk(
                         &id,
+                        &model,
                         &fp,
                         route_label,
                         r.prompt_tokens,
@@ -1210,8 +1226,12 @@ pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> St
 /// Build an OpenAI-compatible streaming chunk (`chat.completion.chunk`). The `id`
 /// and `fingerprint` are supplied by the caller so every chunk of one stream
 /// shares them (OpenAI behaviour).
+/// Build an OpenAI-compatible streaming chunk (`chat.completion.chunk`). The `id`,
+/// `model`, and `fingerprint` are supplied by the caller so every chunk of one
+/// stream shares them (OpenAI behaviour).
 pub fn build_openai_chunk(
     id: &str,
+    model: &str,
     fingerprint: &str,
     delta: &str,
     route_label: &str,
@@ -1227,24 +1247,27 @@ pub fn build_openai_chunk(
         None => "null".to_string(),
     };
     format!(
-        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}",
-        unix_now()
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}",
+        unix_now(),
+        escape_string(model)
     )
 }
 
 /// Build the final streaming chunk carrying token `usage` (emitted only when the
 /// client sets `stream_options.include_usage`). Per the OpenAI contract this
-/// chunk has an empty `choices` array. Shares the stream's `id` and `fingerprint`.
+/// chunk has an empty `choices` array. Shares the stream's `id`, `model`, and `fingerprint`.
 pub fn build_openai_usage_chunk(
     id: &str,
+    model: &str,
     fingerprint: &str,
     route_label: &str,
     prompt_tokens: u64,
     completion_tokens: u64,
 ) -> String {
     format!(
-        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}",
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}",
         unix_now(),
+        escape_string(model),
         prompt_tokens + completion_tokens
     )
 }
@@ -1608,10 +1631,15 @@ mod tests {
             completion_tokens: 1,
         };
         assert!(build_openai_response(&resp, "local").contains("\"created\":"));
-        assert!(
-            build_openai_chunk("chatcmpl-x", "fp_pasture_00000000", "hi", "local", None)
-                .contains("\"created\":")
-        );
+        assert!(build_openai_chunk(
+            "chatcmpl-x",
+            "m",
+            "fp_pasture_00000000",
+            "hi",
+            "local",
+            None
+        )
+        .contains("\"created\":"));
     }
 
     #[test]
@@ -1993,7 +2021,8 @@ mod tests {
 
     #[test]
     fn test_build_usage_chunk_shape() {
-        let json = build_openai_usage_chunk("chatcmpl-x", "fp_pasture_00000000", "local", 10, 5);
+        let json =
+            build_openai_usage_chunk("chatcmpl-x", "m", "fp_pasture_00000000", "local", 10, 5);
         let v = crate::json::parse(&json).expect("valid json");
         assert_eq!(
             v.get("object").and_then(|x| x.as_str()),
@@ -2414,6 +2443,7 @@ mod tests {
     fn test_build_openai_chunk_delta_is_valid_json() {
         let json = build_openai_chunk(
             "chatcmpl-x",
+            "llama3",
             "fp_pasture_00000000",
             "hel\"lo",
             "local",
@@ -2442,6 +2472,7 @@ mod tests {
     fn test_build_openai_chunk_finish_stop() {
         let json = build_openai_chunk(
             "chatcmpl-x",
+            "gpt-4",
             "fp_pasture_00000000",
             "",
             "cloud",
@@ -2483,7 +2514,7 @@ mod tests {
     #[test]
     fn test_chunk_includes_system_fingerprint() {
         let fp = fingerprint_for_model("llama3");
-        let json = build_openai_chunk("chatcmpl-x", &fp, "hello", "local", None);
+        let json = build_openai_chunk("chatcmpl-x", "llama3", &fp, "hello", "local", None);
         let v = parse(&json).unwrap();
         assert_eq!(
             v.get("system_fingerprint").and_then(|f| f.as_str()),
@@ -2494,10 +2525,10 @@ mod tests {
     #[test]
     fn test_stream_chunks_share_fingerprint() {
         let fp = fingerprint_for_model("m");
-        let c1 = build_openai_chunk("chatcmpl-a", &fp, "tok1", "local", None);
-        let c2 = build_openai_chunk("chatcmpl-a", &fp, "tok2", "local", None);
-        let stop = build_openai_chunk("chatcmpl-a", &fp, "", "local", Some("stop"));
-        let usage = build_openai_usage_chunk("chatcmpl-a", &fp, "local", 5, 3);
+        let c1 = build_openai_chunk("chatcmpl-a", "m", &fp, "tok1", "local", None);
+        let c2 = build_openai_chunk("chatcmpl-a", "m", &fp, "tok2", "local", None);
+        let stop = build_openai_chunk("chatcmpl-a", "m", &fp, "", "local", Some("stop"));
+        let usage = build_openai_usage_chunk("chatcmpl-a", "m", &fp, "local", 5, 3);
         let fp_of = |j: &str| {
             parse(j)
                 .unwrap()
@@ -2510,6 +2541,45 @@ mod tests {
         assert!(
             fps.iter().all(|f| f == &fp),
             "fingerprints must match: {fps:?}"
+        );
+    }
+
+    #[test]
+    fn test_chunk_includes_model() {
+        let fp = fingerprint_for_model("llama3");
+        let json = build_openai_chunk("chatcmpl-x", "llama3", &fp, "tok", "local", None);
+        let v = parse(&json).unwrap();
+        assert_eq!(v.get("model").and_then(|m| m.as_str()), Some("llama3"));
+    }
+
+    #[test]
+    fn test_usage_chunk_includes_model() {
+        let fp = fingerprint_for_model("llama3");
+        let json = build_openai_usage_chunk("chatcmpl-x", "llama3", &fp, "local", 5, 3);
+        let v = parse(&json).unwrap();
+        assert_eq!(v.get("model").and_then(|m| m.as_str()), Some("llama3"));
+    }
+
+    #[test]
+    fn test_stream_chunks_share_model() {
+        let fp = fingerprint_for_model("phi3");
+        let chunks = [
+            build_openai_chunk("chatcmpl-b", "phi3", &fp, "tok1", "local", None),
+            build_openai_chunk("chatcmpl-b", "phi3", &fp, "", "local", Some("stop")),
+            build_openai_usage_chunk("chatcmpl-b", "phi3", &fp, "local", 4, 2),
+        ];
+        let model_of = |j: &str| {
+            parse(j)
+                .unwrap()
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap()
+                .to_string()
+        };
+        let models: Vec<_> = chunks.iter().map(|j| model_of(j)).collect();
+        assert!(
+            models.iter().all(|m| m == "phi3"),
+            "model must be consistent: {models:?}"
         );
     }
 

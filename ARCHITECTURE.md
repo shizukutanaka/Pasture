@@ -221,6 +221,13 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-048 `model` field in streaming chunks (IMP-chunk-model).** OpenAI includes the
+  `model` name in every `chat.completion.chunk` and in the streaming usage chunk; Pasture
+  omitted it, so clients logging or displaying the per-chunk model received nothing.
+  `build_openai_chunk` and `build_openai_usage_chunk` now accept an explicit `model`
+  parameter (after `id`); the streaming path passes `req.model` (stored before the
+  closure to avoid borrow conflicts). All chunks of one stream share the same value.
+  3 tests: delta chunk, usage chunk, cross-chunk consistency.
 - **ADR-047 `system_fingerprint` on responses and stream chunks (IMP-fingerprint).**
   OpenAI clients may key caching invalidation, dedup, or change detection on the
   `system_fingerprint` field. Pasture omitted it entirely, breaking such clients.

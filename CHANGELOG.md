@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `model` field in streaming chunks (IMP-chunk-model)
+
+- Every SSE chunk (delta, stop, and usage) now carries the `model` field with the
+  requested model name, matching the OpenAI streaming contract. Clients that use the
+  per-chunk model for display, logging, or routing decisions now work correctly.
+  All chunks of one stream share the same model value computed at stream start.
+  std-only; 3 tests (delta chunk, usage chunk, cross-chunk consistency).
+
 ### Added — `system_fingerprint` on all responses and stream chunks (IMP-fingerprint)
 
 - All buffered chat responses and every SSE chunk (including the final usage chunk) now
