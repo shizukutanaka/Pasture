@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — X-Request-ID echo (IMP-request-id)
+
+- The proxy now echoes the caller-supplied `X-Request-ID` request header back on
+  every response (buffered, streaming/SSE, error, HEAD). Clients use this header
+  to correlate asynchronous responses and trace distributed calls. Matches OpenAI
+  API and LiteLLM behaviour.
+- CRLF injection guarded: `\r` and `\n` are stripped from the header value before
+  it is reflected, preventing header-injection attacks.
+- The header is absent on the response when the client does not include it. 3 tests.
+
 ### Added — `HEAD /health` and `/v1/engines` alias (IMP-compat-methods)
 
 - `HEAD /health` is now accepted alongside `GET /health`. The response carries

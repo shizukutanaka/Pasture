@@ -737,7 +737,7 @@ impl Proxy {
         // Safety cap: one keep-alive connection serves at most this many requests.
         const MAX_KEEPALIVE_REQUESTS: usize = 100;
         for _ in 0..MAX_KEEPALIVE_REQUESTS {
-            let (method, path, body, auth, origin, keep_alive) =
+            let (method, path, body, auth, origin, keep_alive, request_id) =
                 match read_request(stream, &mut conn_buf)? {
                     ReadOutcome::Request {
                         method,
@@ -746,7 +746,8 @@ impl Proxy {
                         auth,
                         origin,
                         connection_close,
-                    } => (method, path, body, auth, origin, !connection_close),
+                        request_id,
+                    } => (method, path, body, auth, origin, !connection_close, request_id),
                     ReadOutcome::TooLarge => {
                         let payload =
                             build_error_response("request body too large", "invalid_request_error");
@@ -763,6 +764,12 @@ impl Proxy {
                 };
             // CORS headers reflected on every response so the browser can read it.
             let cors = self.cors_headers(origin.as_deref());
+            // Echo X-Request-ID back to the caller so clients can correlate responses.
+            let req_id_hdr = request_id
+                .as_ref()
+                .map(|id| format!("X-Request-ID: {id}\r\n"))
+                .unwrap_or_default();
+            let extra = format!("{cors}{req_id_hdr}");
             // CORS preflight: answer OPTIONS before the gate (preflight is credential-free).
             if method == "OPTIONS" {
                 match self.cors_preflight(origin.as_deref()) {
@@ -771,7 +778,7 @@ impl Proxy {
                         stream,
                         404,
                         &build_error_response("not found", "invalid_request_error"),
-                        &cors,
+                        &extra,
                         keep_alive,
                     )?,
                 }
@@ -787,7 +794,7 @@ impl Proxy {
                     stream,
                     status,
                     &build_error_response(msg, kind),
-                    &cors,
+                    &extra,
                     false,
                 )?;
                 return Ok(());
@@ -797,17 +804,17 @@ impl Proxy {
                     Ok(req) if req.stream => {
                         // SSE is a long-lived stream; always close the connection afterwards.
                         let include_usage = Self::parse_include_usage(&body);
-                        self.stream_chat_to_socket(stream, &req, &cors, include_usage)?;
+                        self.stream_chat_to_socket(stream, &req, &extra, include_usage)?;
                         return Ok(());
                     }
                     Ok(req) => match self.complete_buffered(&req) {
-                        Ok(resp) => write_response(stream, 200, &resp, &cors, keep_alive)?,
+                        Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
                         Err(e) => {
                             write_response(
                                 stream,
                                 e.status(),
                                 &build_error_response(e.message(), e.kind()),
-                                &cors,
+                                &extra,
                                 false,
                             )?;
                             return Ok(());
@@ -818,7 +825,7 @@ impl Proxy {
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
-                            &cors,
+                            &extra,
                             false,
                         )?;
                         return Ok(());
@@ -826,13 +833,13 @@ impl Proxy {
                 }
             } else if method == "POST" && path.starts_with("/v1/embeddings") {
                 match self.handle_embeddings(&body) {
-                    Ok(resp) => write_response(stream, 200, &resp, &cors, keep_alive)?,
+                    Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
                     Err(e) => {
                         write_response(
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
-                            &cors,
+                            &extra,
                             false,
                         )?;
                         return Ok(());
@@ -840,13 +847,13 @@ impl Proxy {
                 }
             } else if method == "GET" && path.starts_with("/v1/stats") {
                 match self.handle_stats() {
-                    Ok(resp) => write_response(stream, 200, &resp, &cors, keep_alive)?,
+                    Ok(resp) => write_response(stream, 200, &resp, &extra, keep_alive)?,
                     Err(e) => {
                         write_response(
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
-                            &cors,
+                            &extra,
                             false,
                         )?;
                         return Ok(());
@@ -870,7 +877,7 @@ impl Proxy {
                         .unwrap_or(after)
                         .trim_end_matches('/');
                     match build_model_response(&self.models, id) {
-                        Some(b) => write_response(stream, 200, &b, &cors, keep_alive)?,
+                        Some(b) => write_response(stream, 200, &b, &extra, keep_alive)?,
                         None => {
                             write_response(
                                 stream,
@@ -879,7 +886,7 @@ impl Proxy {
                                     &format!("model '{id}' not found"),
                                     "invalid_request_error",
                                 ),
-                                &cors,
+                                &extra,
                                 false,
                             )?;
                             return Ok(());
@@ -890,7 +897,7 @@ impl Proxy {
                         stream,
                         200,
                         &build_models_response(&self.models),
-                        &cors,
+                        &extra,
                         keep_alive,
                     )?;
                 }
@@ -898,16 +905,16 @@ impl Proxy {
                 // HEAD: identical headers to GET but no body (RFC 7231 §4.3.2).
                 const HEALTH_BODY: &str = "{\"status\":\"ok\"}";
                 if method == "HEAD" {
-                    write_head_response(stream, 200, HEALTH_BODY.len(), &cors, keep_alive)?;
+                    write_head_response(stream, 200, HEALTH_BODY.len(), &extra, keep_alive)?;
                 } else {
-                    write_response(stream, 200, HEALTH_BODY, &cors, keep_alive)?;
+                    write_response(stream, 200, HEALTH_BODY, &extra, keep_alive)?;
                 }
             } else {
                 write_response(
                     stream,
                     404,
                     &build_error_response("not found", "invalid_request_error"),
-                    &cors,
+                    &extra,
                     false,
                 )?;
                 return Ok(());
@@ -1357,6 +1364,9 @@ enum ReadOutcome {
         /// the request is HTTP/1.0 without an explicit `Connection: keep-alive`
         /// (HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close).
         connection_close: bool,
+        /// The `X-Request-ID` header value, if present; echoed on all responses
+        /// for request tracing.
+        request_id: Option<String>,
     },
     /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413.
     TooLarge,
@@ -1415,6 +1425,7 @@ fn read_request(
     let mut auth: Option<String> = None;
     let mut origin: Option<String> = None;
     let mut connection_close = !http11; // HTTP/1.0 default = close
+    let mut request_id: Option<String> = None;
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
@@ -1433,6 +1444,18 @@ fn read_request(
             // HTTP/1.0 + "Connection: keep-alive" → keep alive
             if !http11 && val == "keep-alive" {
                 connection_close = false;
+            }
+        } else if lower.starts_with("x-request-id:") {
+            if let Some((_, v)) = line.split_once(':') {
+                // Strip CR/LF to guard against header injection.
+                let clean: String = v
+                    .trim()
+                    .chars()
+                    .filter(|&c| c != '\r' && c != '\n')
+                    .collect();
+                if !clean.is_empty() {
+                    request_id = Some(clean);
+                }
             }
         }
     }
@@ -1475,6 +1498,7 @@ fn read_request(
         auth,
         origin,
         connection_close,
+        request_id,
     })
 }
 
@@ -3012,6 +3036,65 @@ mod tests {
         let resp = p.handle_chat(&long_body).unwrap();
         assert!(resp.contains("x_pasture_route"));
         assert!(resp.contains("\"local\"") || resp.contains("local-reply"));
+    }
+
+    // ── X-Request-ID echo (IMP-request-id) ────────────────────────────────────
+
+    /// Helper: send a raw HTTP request, return the full response string.
+    fn raw_roundtrip(p: Proxy, raw: String) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            c.write_all(raw.as_bytes()).unwrap();
+            c.shutdown(std::net::Shutdown::Write).ok();
+            let mut resp = String::new();
+            c.read_to_string(&mut resp).unwrap();
+            resp
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        p.handle_connection(&mut s).unwrap();
+        drop(s);
+        client.join().unwrap()
+    }
+
+    #[test]
+    fn test_request_id_echoed_on_response() {
+        let p = proxy_with(true, false, 100, "unused");
+        let raw = "GET /health HTTP/1.1\r\nHost: x\r\nX-Request-ID: abc-123\r\nConnection: close\r\n\r\n";
+        let resp = raw_roundtrip(p, raw.to_string());
+        assert!(
+            resp.contains("X-Request-ID: abc-123"),
+            "missing echoed request-id: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_request_id_absent_when_not_sent() {
+        let p = proxy_with(true, false, 100, "unused");
+        let raw = "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = raw_roundtrip(p, raw.to_string());
+        assert!(
+            !resp.contains("X-Request-ID:"),
+            "unexpected request-id header in response: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_request_id_crlf_injection_guard() {
+        let p = proxy_with(true, false, 100, "unused");
+        // An attacker trying to inject a second header via CRLF in the ID value.
+        let raw =
+            "GET /health HTTP/1.1\r\nHost: x\r\nX-Request-ID: id\r\nEvil: hdr\r\nConnection: close\r\n\r\n";
+        let resp = raw_roundtrip(p, raw.to_string());
+        // The \r\n inside the ID value should be stripped so "Evil: hdr" is not injected.
+        assert!(
+            !resp.contains("Evil: hdr"),
+            "CRLF injection not prevented: {resp}"
+        );
+        // A sanitised (non-empty) ID is still echoed.
+        assert!(resp.contains("X-Request-ID:"), "no request-id echoed: {resp}");
     }
 
     #[test]

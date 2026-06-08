@@ -221,6 +221,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-052 X-Request-ID echo (IMP-request-id).** Clients correlate async
+  responses and distributed traces via a caller-supplied `X-Request-ID` header.
+  `read_request` parses the header and strips `\r\n` from its value (CRLF-injection
+  guard). `handle_connection` builds an `extra` block = CORS headers +
+  `X-Request-ID: <value>\r\n` (or just CORS if absent) and passes it to every
+  response path including SSE. Absent when the client omits the header. Purely
+  additive, std-only; 3 socket round-trip tests. Matches OpenAI API and LiteLLM
+  behaviour.
 - **ADR-051 `HEAD /health` and `/v1/engines` alias (IMP-compat-methods).**
   (1) `HEAD /health`: accepted alongside `GET`; response has identical headers —
   including `Content-Length` set to the GET body length — but no body (RFC 7231
