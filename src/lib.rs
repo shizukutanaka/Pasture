@@ -21,6 +21,7 @@ pub mod json;
 pub mod monetize;
 pub mod privacy;
 pub mod proxy;
+pub mod ratelimit;
 pub mod routing;
 
 pub use backend::{Backend, BackendError, CompletionRequest, CompletionResponse, Message};

@@ -1047,6 +1047,26 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
     if config.local_only {
         eprintln!("pasture: local-only mode — cloud backend disabled");
     }
+    if config.auth_token.is_some() {
+        eprintln!("pasture: bearer-token auth required on /v1/* endpoints");
+    }
+    if config.rate_limit > 0 {
+        eprintln!(
+            "pasture: rate limit {} requests/min (global)",
+            config.rate_limit
+        );
+    }
+    // Security nudge: a non-localhost bind without auth is exposed to the network.
+    let localhost = addr.starts_with("127.")
+        || addr.starts_with("localhost")
+        || addr.starts_with("[::1]")
+        || addr.starts_with("::1");
+    if !localhost && config.auth_token.is_none() {
+        eprintln!(
+            "pasture: WARNING — listening on {addr} (non-localhost) without auth; \
+             set PASTURE_AUTH_TOKEN to require a bearer token"
+        );
+    }
     let proxy = Proxy::new(engine, local, cloud, &config.cost_log_path)
         .with_cascade(config.cascade)
         .with_cascade_logprob(config.cascade_logprob_threshold)
@@ -1054,7 +1074,9 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         .with_models(models)
         .with_cloud_retry(config.cloud_retry)
         .with_fast_model(fast, config.fast_threshold)
-        .with_inject_context(config.inject_context);
+        .with_inject_context(config.inject_context)
+        .with_auth_token(config.auth_token.clone())
+        .with_rate_limit(config.rate_limit);
     print!(
         "{}",
         crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])

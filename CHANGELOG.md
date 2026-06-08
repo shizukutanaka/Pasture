@@ -5,6 +5,19 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — optional auth + rate-limit for exposed deployments (IMP-15)
+
+- **`PASTURE_AUTH_TOKEN`**: when set, all `/v1/*` requests must present
+  `Authorization: Bearer <token>` (constant-time comparison); `/health` stays
+  exempt for liveness probes. Missing/invalid → `401` (OpenAI error envelope).
+- **`PASTURE_RATE_LIMIT`** (requests/minute): a global std-only token bucket
+  (continuous refill, burst = the budget) caps `/v1/*`; over-limit → `429`.
+- Both are evaluated by a single pure `check_gate` before route dispatch and are
+  **off by default**, so the zero-config single-user localhost path is unchanged.
+  `serve` now warns when bound to a non-localhost address without a token.
+- New `ratelimit` module (deterministic, clock-split, no-sleep tests); 12 tests.
+  Closes the auth/rate-limit gap noted in earlier release notes. Grounded in ADR-040.
+
 ### Fixed — sampling parameters were silently dropped (IMP-sampling)
 
 - The proxy now **forwards client sampling parameters** to the backend instead of

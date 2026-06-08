@@ -221,6 +221,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-040 Optional auth + rate-limit (IMP-15).** The proxy binds `127.0.0.1` by
+  default (I5), but users do expose it (`PASTURE_LISTEN_ADDR=0.0.0.0:…`), and there
+  was no gate. Two opt-in, std-only protections now guard `/v1/*` (with `/health`
+  always exempt for liveness probes): `PASTURE_AUTH_TOKEN` requires an
+  `Authorization: Bearer <token>` header, compared in constant time; and
+  `PASTURE_RATE_LIMIT` (requests/min) applies a global token-bucket
+  (`ratelimit::RateLimiter`, continuous refill, burst = the budget). Both are
+  evaluated by a single pure `check_gate` before route dispatch, returning `401`/`429`
+  in the OpenAI error envelope. The limiter is split from the wall clock (`step`)
+  so it is unit-tested deterministically without sleeps. `serve` warns when bound to
+  a non-localhost address without a token. Off by default — the zero-config
+  single-user localhost path is unchanged. Grounded in COMPETITIVE.md IMP-15 and
+  peer-gateway auth (LiteLLM/Portkey).
 - **ADR-039 Sampling-parameter passthrough (IMP-sampling).** Every peer gateway
   (LiteLLM, OpenRouter, Ollama, LM Studio, vLLM) honours the client's sampling
   parameters; Pasture parsed only `messages`/`model`/`stream`/tools and silently

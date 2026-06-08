@@ -32,6 +32,10 @@ pub struct Config {
     pub fast_threshold: usize,
     /// When true, inject current date/OS info as a system message for PC-assistant use.
     pub inject_context: bool,
+    /// Optional bearer token required on `/v1/*` requests (empty = no auth).
+    pub auth_token: Option<String>,
+    /// Global rate limit for `/v1/*` in requests per minute (0 = unlimited).
+    pub rate_limit: u32,
 }
 
 impl Default for Config {
@@ -59,6 +63,8 @@ impl Default for Config {
             local_fast_model: String::new(),
             fast_threshold: 50,
             inject_context: false,
+            auth_token: None,
+            rate_limit: 0,
         }
     }
 }
@@ -163,6 +169,16 @@ impl Config {
         if std::env::var("PASTURE_INJECT_CONTEXT").is_ok() {
             self.inject_context = true;
         }
+        if let Ok(v) = std::env::var("PASTURE_AUTH_TOKEN") {
+            if !v.trim().is_empty() {
+                self.auth_token = Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_RATE_LIMIT") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.rate_limit = n;
+            }
+        }
         self
     }
 
@@ -212,6 +228,16 @@ impl Config {
                 }
             }
             "inject_context" => self.inject_context = matches!(val, "1" | "true" | "yes"),
+            "auth_token" => {
+                if !val.is_empty() {
+                    self.auth_token = Some(val.to_string());
+                }
+            }
+            "rate_limit" => {
+                if let Ok(n) = val.parse::<u32>() {
+                    self.rate_limit = n;
+                }
+            }
             _ => {}
         }
     }

@@ -79,6 +79,12 @@ pub struct Proxy {
     /// When true, prepend a system message with current date/OS info so that
     /// lightweight local models can act as capable PC assistants.
     inject_context: bool,
+    /// Optional bearer token required on `/v1/*` requests (IMP-15). None = no
+    /// auth (the localhost default). `/health` is always exempt.
+    auth_token: Option<String>,
+    /// Optional global token-bucket rate limiter for `/v1/*` (IMP-15). None =
+    /// unlimited (the localhost default).
+    rate_limiter: Option<std::sync::Mutex<crate::ratelimit::RateLimiter>>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -104,7 +110,57 @@ impl Proxy {
             fast_model: None,
             fast_threshold: 50,
             inject_context: false,
+            auth_token: None,
+            rate_limiter: None,
         }
+    }
+
+    /// Require this bearer token on `/v1/*` requests (IMP-15). Empty disables auth.
+    pub fn with_auth_token(mut self, token: Option<String>) -> Self {
+        self.auth_token = token.filter(|t| !t.is_empty());
+        self
+    }
+
+    /// Cap `/v1/*` requests to `per_minute` (global token bucket, IMP-15).
+    /// 0 disables rate limiting.
+    pub fn with_rate_limit(mut self, per_minute: u32) -> Self {
+        self.rate_limiter = if per_minute > 0 {
+            Some(std::sync::Mutex::new(
+                crate::ratelimit::RateLimiter::per_minute(per_minute),
+            ))
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Apply rate-limit then auth gating for a request path (IMP-15). Returns
+    /// `Some((status, message, type))` when the request must be rejected, else
+    /// `None`. `/health` is always exempt so liveness probes work unauthenticated.
+    fn check_gate(
+        &self,
+        path: &str,
+        auth: Option<&str>,
+    ) -> Option<(u16, &'static str, &'static str)> {
+        if path.starts_with("/health") {
+            return None;
+        }
+        if let Some(rl) = &self.rate_limiter {
+            let allowed = rl.lock().map(|mut g| g.allow()).unwrap_or(true);
+            if !allowed {
+                return Some((429, "rate limit exceeded", "rate_limit_error"));
+            }
+        }
+        if let Some(expected) = &self.auth_token {
+            if !auth_ok(auth, expected) {
+                return Some((
+                    401,
+                    "missing or invalid Authorization bearer token",
+                    "invalid_request_error",
+                ));
+            }
+        }
+        None
     }
 
     /// Select a small/fast local model for short, simple queries (dual-local routing).
@@ -544,8 +600,13 @@ impl Proxy {
     }
 
     fn handle_connection(&self, stream: &mut std::net::TcpStream) -> std::io::Result<()> {
-        let (method, path, body) = match read_request(stream)? {
-            ReadOutcome::Request { method, path, body } => (method, path, body),
+        let (method, path, body, auth) = match read_request(stream)? {
+            ReadOutcome::Request {
+                method,
+                path,
+                body,
+                auth,
+            } => (method, path, body, auth),
             ReadOutcome::TooLarge => {
                 let payload =
                     build_error_response("request body too large", "invalid_request_error");
@@ -558,6 +619,11 @@ impl Proxy {
                 return Ok(());
             }
         };
+        // Auth + rate-limit gating (IMP-15); /health is exempt.
+        if let Some((status, msg, kind)) = self.check_gate(&path, auth.as_deref()) {
+            write_response(stream, status, &build_error_response(msg, kind))?;
+            return Ok(());
+        }
         if method == "POST" && path.starts_with("/v1/chat/completions") {
             match Self::parse_request(&body) {
                 Ok(req) if req.stream => self.stream_chat_to_socket(stream, &req)?,
@@ -940,6 +1006,8 @@ enum ReadOutcome {
         method: String,
         path: String,
         body: String,
+        /// The `Authorization` header value, if present (used for auth, IMP-15).
+        auth: Option<String>,
     },
     /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413.
     TooLarge,
@@ -973,9 +1041,16 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
     let path = parts.next().unwrap_or("").to_string();
 
     let mut content_length = 0usize;
+    let mut auth: Option<String> = None;
     for line in lines {
-        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+        let lower = line.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
+        } else if lower.starts_with("authorization:") {
+            // Preserve original case for the token value (header name is ASCII).
+            if let Some((_, v)) = line.split_once(':') {
+                auth = Some(v.trim().to_string());
+            }
         }
     }
 
@@ -1001,7 +1076,35 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
         method,
         path,
         body: String::from_utf8_lossy(&body).into_owned(),
+        auth,
     })
+}
+
+/// Validate a bearer token from an `Authorization` header against the expected
+/// value, in constant time (no early return on first mismatch).
+fn auth_ok(header: Option<&str>, expected: &str) -> bool {
+    let Some(h) = header else {
+        return false;
+    };
+    let token = h
+        .strip_prefix("Bearer ")
+        .or_else(|| h.strip_prefix("bearer "))
+        .unwrap_or(h)
+        .trim();
+    constant_time_eq(token.as_bytes(), expected.as_bytes())
+}
+
+/// Length-checked, constant-time byte comparison (avoids leaking token length
+/// match timing beyond the unavoidable length check).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn write_response(
@@ -1012,8 +1115,10 @@ fn write_response(
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Error",
@@ -1365,6 +1470,97 @@ mod tests {
             crate::cache::request_key(&r0),
             crate::cache::request_key(&r1)
         );
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"Secret"));
+        assert!(!constant_time_eq(b"secret", b"secre"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_auth_ok_bearer_forms() {
+        assert!(auth_ok(Some("Bearer tok123"), "tok123"));
+        assert!(auth_ok(Some("bearer tok123"), "tok123")); // case-insensitive scheme
+        assert!(auth_ok(Some("tok123"), "tok123")); // bare token accepted too
+        assert!(!auth_ok(Some("Bearer wrong"), "tok123"));
+        assert!(!auth_ok(None, "tok123"));
+    }
+
+    #[test]
+    fn test_gate_open_when_unconfigured() {
+        let p = proxy_with(true, false, 100, "unused");
+        assert!(p.check_gate("/v1/chat/completions", None).is_none());
+    }
+
+    #[test]
+    fn test_gate_auth_required_and_enforced() {
+        let p = proxy_with(true, false, 100, "unused").with_auth_token(Some("s3cret".to_string()));
+        // No / wrong token -> 401.
+        assert_eq!(
+            p.check_gate("/v1/chat/completions", None).map(|g| g.0),
+            Some(401)
+        );
+        assert_eq!(
+            p.check_gate("/v1/chat/completions", Some("Bearer nope"))
+                .map(|g| g.0),
+            Some(401)
+        );
+        // Correct token -> allowed.
+        assert!(p
+            .check_gate("/v1/chat/completions", Some("Bearer s3cret"))
+            .is_none());
+        // /health is always exempt.
+        assert!(p.check_gate("/health", None).is_none());
+    }
+
+    #[test]
+    fn test_gate_rate_limit_enforced() {
+        let p = proxy_with(true, false, 100, "unused").with_rate_limit(1);
+        // First request consumes the only token; second is rejected with 429.
+        assert!(p.check_gate("/v1/models", None).is_none());
+        assert_eq!(p.check_gate("/v1/models", None).map(|g| g.0), Some(429));
+        // /health bypasses the limiter.
+        assert!(p.check_gate("/health", None).is_none());
+    }
+
+    #[test]
+    fn test_roundtrip_401_without_token() {
+        let p = proxy_with(true, true, 100, "unused").with_auth_token(Some("k".to_string()));
+        let (status, body) = roundtrip(
+            p,
+            http_post(
+                "/v1/chat/completions",
+                r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        );
+        assert_eq!(status, 401);
+        assert!(
+            body.contains("\"type\":\"invalid_request_error\""),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_authed_request_ok() {
+        let p = proxy_with(true, false, 100, "unused").with_auth_token(Some("k".to_string()));
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer k\r\nContent-Length: {}\r\n\r\n{}",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#.len(),
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let (status, _body) = roundtrip(p, req);
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn test_roundtrip_health_exempt_from_auth() {
+        let p = proxy_with(true, false, 100, "unused").with_auth_token(Some("k".to_string()));
+        let (status, _) = roundtrip(p, "GET /health HTTP/1.1\r\n\r\n".to_string());
+        assert_eq!(status, 200);
     }
 
     #[test]
