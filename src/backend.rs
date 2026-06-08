@@ -49,6 +49,9 @@ pub struct SamplingParams {
     pub seed: Option<i64>,
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
+    /// Structured-output request (`response_format`), forwarded so JSON mode /
+    /// JSON-schema output works through the proxy. Stored as the raw JSON value.
+    pub response_format: Option<JsonValue>,
 }
 
 impl SamplingParams {
@@ -88,7 +91,29 @@ impl SamplingParams {
         if !self.stop.is_empty() {
             out.push_str(&format!(",\"stop\":{}", json_string_array(&self.stop)));
         }
+        if let Some(rf) = &self.response_format {
+            out.push_str(&format!(",\"response_format\":{}", rf.to_json_string()));
+        }
         out
+    }
+
+    /// Ollama puts structured-output control in a top-level `format` field (not
+    /// in `options`). Map OpenAI's `response_format` onto it, comma-prefixed
+    /// (empty when absent or unrecognized):
+    /// `{"type":"json_object"}` → `"json"`; `{"type":"json_schema",...}` → the schema.
+    pub fn ollama_format_field(&self) -> String {
+        let Some(rf) = &self.response_format else {
+            return String::new();
+        };
+        match rf.get("type").and_then(JsonValue::as_str) {
+            Some("json_object") => ",\"format\":\"json\"".to_string(),
+            Some("json_schema") => rf
+                .get("json_schema")
+                .and_then(|j| j.get("schema"))
+                .map(|schema| format!(",\"format\":{}", schema.to_json_string()))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
     }
 
     /// Ollama `options` object, comma-prefixed (empty if none). Ollama nests
@@ -369,9 +394,10 @@ impl OllamaBackend {
             })
             .collect();
         format!(
-            "{{\"model\":\"{}\",\"stream\":{stream},\"messages\":[{}]{}}}",
+            "{{\"model\":\"{}\",\"stream\":{stream},\"messages\":[{}]{}{}}}",
             escape_string(&req.model),
             msgs.join(","),
+            req.sampling.ollama_format_field(),
             req.sampling.ollama_options()
         )
     }
@@ -932,6 +958,43 @@ mod tests {
         assert!(body.contains("\"num_predict\":128"), "{body}");
         assert!(body.contains("\"stop\":[\"STOP\"]"), "{body}");
         assert!(!body.contains("\"max_tokens\""), "{body}");
+    }
+
+    #[test]
+    fn test_ollama_format_json_object() {
+        let mut r = req();
+        r.sampling.response_format = Some(crate::json::parse(r#"{"type":"json_object"}"#).unwrap());
+        let body = OllamaBackend::build_body(&r);
+        assert!(body.contains("\"format\":\"json\""), "{body}");
+    }
+
+    #[test]
+    fn test_ollama_format_json_schema() {
+        let mut r = req();
+        r.sampling.response_format = Some(
+            crate::json::parse(
+                r#"{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}"#,
+            )
+            .unwrap(),
+        );
+        let body = OllamaBackend::build_body(&r);
+        assert!(body.contains("\"format\":{\"type\":\"object\"}"), "{body}");
+    }
+
+    #[test]
+    fn test_ollama_no_format_when_absent() {
+        assert!(!OllamaBackend::build_body(&req()).contains("\"format\""));
+    }
+
+    #[test]
+    fn test_openai_fields_includes_response_format() {
+        let mut s = SamplingParams::default();
+        s.response_format = Some(crate::json::parse(r#"{"type":"json_object"}"#).unwrap());
+        let f = s.openai_fields();
+        assert!(
+            f.contains("\"response_format\":{\"type\":\"json_object\"}"),
+            "{f}"
+        );
     }
 
     #[test]

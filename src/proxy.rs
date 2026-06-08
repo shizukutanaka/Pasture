@@ -415,6 +415,7 @@ impl Proxy {
             seed: finite("seed").map(|x| x as i64),
             presence_penalty: finite("presence_penalty"),
             frequency_penalty: finite("frequency_penalty"),
+            response_format: v.get("response_format").cloned(),
         }
     }
 
@@ -1635,6 +1636,31 @@ mod tests {
         let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
         let req = Proxy::parse_request(body).unwrap();
         assert!(req.sampling.is_empty());
+    }
+
+    #[test]
+    fn test_parse_request_extracts_response_format() {
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}"#;
+        let req = Proxy::parse_request(body).unwrap();
+        let rf = req
+            .sampling
+            .response_format
+            .expect("response_format parsed");
+        assert_eq!(rf.get("type").and_then(|x| x.as_str()), Some("json_object"));
+    }
+
+    #[test]
+    fn test_cache_distinguishes_by_response_format() {
+        let base = r#"{"messages":[{"role":"user","content":"hi"}]"#;
+        let plain = Proxy::parse_request(&format!("{base}}}")).unwrap();
+        let json_mode = Proxy::parse_request(&format!(
+            "{base},\"response_format\":{{\"type\":\"json_object\"}}}}"
+        ))
+        .unwrap();
+        assert_ne!(
+            crate::cache::request_key(&plain),
+            crate::cache::request_key(&json_mode)
+        );
     }
 
     #[test]

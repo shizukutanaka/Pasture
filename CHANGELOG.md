@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — structured-output (JSON mode) passthrough (IMP-response-format)
+
+- The proxy now **forwards `response_format`** (OpenAI JSON mode and `json_schema`
+  structured outputs) to the backend instead of dropping it — every peer (OpenAI,
+  vLLM, LM Studio, Ollama) supports it, so a JSON-mode request previously returned
+  free-form text. Forwarded verbatim for OpenAI/OpenAI-compat; translated for Ollama
+  (`{"type":"json_object"}` → top-level `format:"json"`; `json_schema` → the schema).
+- Added a JSON **serializer** (`JsonValue::to_json_string`) — the dependency-free JSON
+  module could parse but not round-trip; it emits sorted keys (deterministic), reused
+  for the cache key, which now includes `response_format`. std-only; 9 tests. ADR-043.
+
 ### Added — streaming token usage (IMP-stream-usage)
 
 - When a streaming request sets `stream_options.include_usage` (an OpenAI feature

@@ -85,6 +85,10 @@ Request body: OpenAI chat-completion JSON. Recognized fields:
   `options`, length cap as `num_predict`; Anthropic as `max_tokens` +
   `stop_sequences`). Non-finite numbers are rejected. Sampling params are part of the
   cache key (§6), so they never cross-serve responses.
+- **`response_format`** (optional, IMP-response-format): structured-output / JSON mode.
+  Forwarded verbatim to OpenAI/OpenAI-compat; for Ollama mapped to the top-level
+  `format` field (`{"type":"json_object"}` → `"json"`, `{"type":"json_schema",…}` →
+  the embedded schema). Part of the cache key.
 
 Success (non-stream): `200`, body is an OpenAI `chat.completion` object containing
 `id`, `object:"chat.completion"`, **`created`** (Unix seconds), `model`, `choices[0]`

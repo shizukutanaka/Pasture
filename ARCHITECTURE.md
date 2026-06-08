@@ -221,6 +221,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-043 Structured-output passthrough (IMP-response-format).** OpenAI's
+  `response_format` (JSON mode and `json_schema` structured outputs) is supported by
+  every backend Pasture fronts (OpenAI, vLLM, LM Studio, Ollama), but the proxy parsed
+  only `messages`/`model`/`stream`/tools/sampling and silently dropped it, so a JSON-mode
+  request returned free-form text. It is now captured (as a raw `JsonValue`) and
+  forwarded: verbatim for OpenAI/OpenAI-compat, and translated for Ollama, whose control
+  lives in a top-level `format` field (`{"type":"json_object"}` → `"json"`;
+  `{"type":"json_schema",…}` → the embedded schema). This required a JSON **serializer**
+  (`JsonValue::to_json_string`) — the hand-rolled lib could parse but not round-trip; the
+  serializer emits `BTreeMap`-sorted keys so output is deterministic and reusable for the
+  cache key, which now includes `response_format`. std-only; 9 tests (serializer
+  round-trip, per-backend emission, parse, cache distinction).
 - **ADR-042 Streaming token usage (IMP-stream-usage).** OpenAI's streaming API emits a
   final chunk carrying `usage` when the client sets `stream_options.include_usage`;
   peers (LiteLLM, vLLM) do too, but Pasture's SSE path reported no token counts, so

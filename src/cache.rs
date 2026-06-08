@@ -39,6 +39,10 @@ pub fn request_key(req: &CompletionRequest) -> u64 {
     for stop in &s.stop {
         stop.hash(&mut h);
     }
+    // response_format (a JSON value) has no Hash; hash its canonical string.
+    if let Some(rf) = &s.response_format {
+        rf.to_json_string().hash(&mut h);
+    }
     h.finish()
 }
 

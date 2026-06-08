@@ -53,6 +53,66 @@ impl JsonValue {
             _ => None,
         }
     }
+
+    /// Serialize back to a compact JSON string (the inverse of `parse`). Object
+    /// keys are emitted in sorted order because the backing store is a `BTreeMap`,
+    /// so the output is deterministic — useful for hashing/caching. Non-finite
+    /// numbers serialize as `null` (JSON has no NaN/Infinity).
+    pub fn to_json_string(&self) -> String {
+        let mut out = String::new();
+        self.write_json(&mut out);
+        out
+    }
+
+    fn write_json(&self, out: &mut String) {
+        match self {
+            JsonValue::Null => out.push_str("null"),
+            JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            JsonValue::Number(n) => out.push_str(&fmt_json_number(*n)),
+            JsonValue::Str(s) => {
+                out.push('"');
+                out.push_str(&escape_string(s));
+                out.push('"');
+            }
+            JsonValue::Array(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write_json(out);
+                }
+                out.push(']');
+            }
+            JsonValue::Object(m) => {
+                out.push('{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('"');
+                    out.push_str(&escape_string(k));
+                    out.push_str("\":");
+                    v.write_json(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+}
+
+/// Format a JSON number: whole values within i64 range as integers (so a parsed
+/// `2` round-trips as `2`, not `2.0`), others via the default float formatter,
+/// and non-finite as `null`.
+fn fmt_json_number(n: f64) -> String {
+    if !n.is_finite() {
+        return "null".to_string();
+    }
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
 }
 
 /// A parse error with the byte position at which it occurred.
@@ -331,6 +391,35 @@ pub fn escape_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_to_json_string_scalars() {
+        assert_eq!(JsonValue::Null.to_json_string(), "null");
+        assert_eq!(JsonValue::Bool(true).to_json_string(), "true");
+        assert_eq!(JsonValue::Number(2.0).to_json_string(), "2"); // whole -> integer
+        assert_eq!(JsonValue::Number(0.5).to_json_string(), "0.5");
+        assert_eq!(
+            JsonValue::Str("a\"b".to_string()).to_json_string(),
+            "\"a\\\"b\""
+        );
+    }
+
+    #[test]
+    fn test_to_json_string_roundtrip_object() {
+        let src = r#"{"a":[1,2,3],"b":{"c":true,"d":"x"},"e":null}"#;
+        let v = parse(src).unwrap();
+        // Keys are sorted (BTreeMap); this input is already in sorted order.
+        let out = v.to_json_string();
+        assert_eq!(out, src);
+        // Re-parsing yields the same value (true round-trip).
+        assert_eq!(parse(&out).unwrap(), v);
+    }
+
+    #[test]
+    fn test_to_json_string_sorts_keys() {
+        let v = parse(r#"{"z":1,"a":2}"#).unwrap();
+        assert_eq!(v.to_json_string(), r#"{"a":2,"z":1}"#);
+    }
 
     #[test]
     fn test_parse_object_with_string() {
