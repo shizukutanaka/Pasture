@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — streaming token usage (IMP-stream-usage)
+
+- When a streaming request sets `stream_options.include_usage` (an OpenAI feature
+  also supported by LiteLLM/vLLM), the SSE stream now emits a final chunk with an
+  empty `choices` array and a `usage` object (`prompt_tokens`/`completion_tokens`/
+  `total_tokens`) before `data: [DONE]`. Clients that track cost or length on
+  streamed responses previously got no token counts. Off unless requested, so the
+  default stream is unchanged; std-only. New `build_openai_usage_chunk`; 4 tests
+  (parse, build, stream round-trips with and without the flag). Grounded in ADR-042.
+
 ### Added — CORS support for browser clients (IMP-cors)
 
 - **`PASTURE_CORS_ORIGINS`** (comma-separated allow-list, or `*`): opt-in CORS so

@@ -74,6 +74,8 @@ Request body: OpenAI chat-completion JSON. Recognized fields:
 - `model` (optional string; default `"default"`). Pasture routes by content, so the
   client's `model` is advisory.
 - `stream` (optional bool; default false). `true` ⇒ SSE response (§3.4).
+- `stream_options.include_usage` (optional bool). With streaming, `true` appends a
+  final `usage` chunk before `[DONE]` (§3.4, IMP-stream-usage).
 - `tools` / `functions` (optional arrays). A **non-empty** array marks the request as
   tool-using ⇒ hard signal ⇒ cloud (§4, IMP-10). Fields are passed through unchanged.
 - **Sampling parameters** (optional, IMP-sampling): `temperature`, `top_p`,
@@ -124,9 +126,11 @@ a missing cost log reads as all-zeros. No auth (localhost-default, I5). Implemen
 When `stream:true`: `200`, `Content-Type: text/event-stream`. Each frame is
 `data: <chat.completion.chunk>\n\n` with `id`, `object:"chat.completion.chunk"`,
 **`created`**, `x_pasture_route`, and `choices[0].delta`. A final chunk carries
-`finish_reason:"stop"`, followed by `data: [DONE]\n\n`. Routing and privacy decide
-**before** the first byte; cascade does not apply to streaming (the local answer
-cannot be un-sent).
+`finish_reason:"stop"`. When the request sets `stream_options.include_usage:true`,
+one further chunk follows with an empty `choices` array and a `usage` object
+(`prompt_tokens`/`completion_tokens`/`total_tokens`, IMP-stream-usage). The stream
+ends with `data: [DONE]\n\n`. Routing and privacy decide **before** the first byte;
+cascade does not apply to streaming (the local answer cannot be un-sent).
 
 ### 3.5 Errors
 All error responses MUST use the OpenAI envelope:

@@ -221,6 +221,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-042 Streaming token usage (IMP-stream-usage).** OpenAI's streaming API emits a
+  final chunk carrying `usage` when the client sets `stream_options.include_usage`;
+  peers (LiteLLM, vLLM) do too, but Pasture's SSE path reported no token counts, so
+  clients tracking cost/length on streamed responses got nothing. The proxy now parses
+  `stream_options.include_usage` (without touching `CompletionRequest`, to avoid
+  rippling through its constructors) and, when set, emits one extra chunk with an empty
+  `choices` array and a `usage` object (prompt/completion/total) before `data: [DONE]`.
+  Off unless requested, so the default stream is byte-for-byte unchanged. The backend's
+  returned `CompletionResponse` already carries the counts; `build_openai_usage_chunk`
+  is a pure builder, unit-tested, plus stream round-trips with and without the flag.
 - **ADR-041 CORS / OPTIONS preflight (IMP-cors).** Browser-based clients (Open WebUI
   web, custom dashboards) cannot call the proxy without CORS preflight handling, which
   every peer (Ollama via `OLLAMA_ORIGINS`, LM Studio, LiteLLM) provides. `PASTURE_CORS_ORIGINS`

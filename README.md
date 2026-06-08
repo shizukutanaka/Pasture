@@ -62,7 +62,8 @@ base_url = http://127.0.0.1:8645/v1
 
 ### Endpoints
 
-- `POST /v1/chat/completions` — routed chat completion. Supports `"stream": true` (SSE).
+- `POST /v1/chat/completions` — routed chat completion. Supports `"stream": true` (SSE),
+  including `stream_options.include_usage` for a final token-usage chunk.
   Requests carrying `tools`/`functions` are treated as a hard signal and escalate to cloud.
   Sampling parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, penalties)
   are forwarded to the backend.

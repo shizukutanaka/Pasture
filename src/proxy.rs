@@ -372,6 +372,19 @@ impl Proxy {
         })
     }
 
+    /// True when the client requested `stream_options.include_usage` — emit a
+    /// final SSE chunk carrying token usage (OpenAI streaming feature).
+    fn parse_include_usage(body: &str) -> bool {
+        parse(body)
+            .ok()
+            .and_then(|v| {
+                v.get("stream_options")
+                    .and_then(|s| s.get("include_usage"))
+                    .and_then(JsonValue::as_bool)
+            })
+            .unwrap_or(false)
+    }
+
     /// Extract OpenAI sampling parameters from a request body. Non-finite numbers
     /// are rejected so the value can always be serialised as valid JSON; negative
     /// `max_tokens` is dropped. `stop` accepts a string or an array of strings;
@@ -741,7 +754,10 @@ impl Proxy {
         }
         if method == "POST" && path.starts_with("/v1/chat/completions") {
             match Self::parse_request(&body) {
-                Ok(req) if req.stream => self.stream_chat_to_socket(stream, &req, &cors)?,
+                Ok(req) if req.stream => {
+                    let include_usage = Self::parse_include_usage(&body);
+                    self.stream_chat_to_socket(stream, &req, &cors, include_usage)?
+                }
                 Ok(req) => match self.complete_buffered(&req) {
                     Ok(resp) => write_response(stream, 200, &resp, &cors)?,
                     Err(e) => {
@@ -816,6 +832,7 @@ impl Proxy {
         sock: &mut std::net::TcpStream,
         req: &CompletionRequest,
         cors: &str,
+        include_usage: bool,
     ) -> std::io::Result<()> {
         let decision = match self.classify_and_decide(req) {
             Ok((d, _)) => d,
@@ -860,6 +877,15 @@ impl Proxy {
                 self.log_cost(route_label, &r, None);
                 let stop = sse_frame(&build_openai_chunk("", route_label, Some("stop")));
                 sock.write_all(stop.as_bytes())?;
+                // Final usage chunk when the client asked for it (OpenAI feature).
+                if include_usage {
+                    let usage = sse_frame(&build_openai_usage_chunk(
+                        route_label,
+                        r.prompt_tokens,
+                        r.completion_tokens,
+                    ));
+                    sock.write_all(usage.as_bytes())?;
+                }
             }
             Err(e) => {
                 let err = sse_frame(&build_error_response(&e.to_string(), "upstream_error"));
@@ -1106,6 +1132,21 @@ pub fn build_openai_chunk(delta: &str, route_label: &str, finish: Option<&str>) 
     format!(
         "{{\"id\":\"pasture\",\"object\":\"chat.completion.chunk\",\"created\":{},\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"finish_reason\":{finish_field}}}]}}",
         unix_now()
+    )
+}
+
+/// Build the final streaming chunk carrying token `usage` (emitted only when the
+/// client sets `stream_options.include_usage`). Per the OpenAI contract this
+/// chunk has an empty `choices` array.
+pub fn build_openai_usage_chunk(
+    route_label: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> String {
+    format!(
+        "{{\"id\":\"pasture\",\"object\":\"chat.completion.chunk\",\"created\":{},\"x_pasture_route\":\"{route_label}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}",
+        unix_now(),
+        prompt_tokens + completion_tokens
     )
 }
 
@@ -1698,6 +1739,68 @@ mod tests {
         let p = proxy_with(true, false, 100, "unused").with_auth_token(Some("k".to_string()));
         let (status, _) = roundtrip(p, "GET /health HTTP/1.1\r\n\r\n".to_string());
         assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn test_parse_include_usage() {
+        assert!(Proxy::parse_include_usage(
+            r#"{"stream":true,"stream_options":{"include_usage":true}}"#
+        ));
+        assert!(!Proxy::parse_include_usage(
+            r#"{"stream":true,"stream_options":{"include_usage":false}}"#
+        ));
+        assert!(!Proxy::parse_include_usage(r#"{"stream":true}"#));
+    }
+
+    #[test]
+    fn test_build_usage_chunk_shape() {
+        let json = build_openai_usage_chunk("local", 10, 5);
+        let v = crate::json::parse(&json).expect("valid json");
+        assert_eq!(
+            v.get("object").and_then(|x| x.as_str()),
+            Some("chat.completion.chunk")
+        );
+        // OpenAI: the usage chunk has an empty choices array.
+        assert_eq!(
+            v.get("choices")
+                .and_then(JsonValue::as_array)
+                .map(|a| a.len()),
+            Some(0)
+        );
+        let usage = v.get("usage").unwrap();
+        assert_eq!(
+            usage.get("prompt_tokens").and_then(|x| x.as_f64()),
+            Some(10.0)
+        );
+        assert_eq!(
+            usage.get("completion_tokens").and_then(|x| x.as_f64()),
+            Some(5.0)
+        );
+        assert_eq!(
+            usage.get("total_tokens").and_then(|x| x.as_f64()),
+            Some(15.0)
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_stream_includes_usage_when_requested() {
+        let p = proxy_with(true, false, 100, tmp_log().as_str());
+        let body = r#"{"stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}"#;
+        let (status, resp) = roundtrip(p, http_post("/v1/chat/completions", body));
+        assert_eq!(status, 200);
+        assert!(resp.contains("\"usage\""), "expected usage chunk: {resp}");
+        assert!(resp.contains("\"total_tokens\""), "{resp}");
+        assert!(resp.contains("data: [DONE]"), "{resp}");
+    }
+
+    #[test]
+    fn test_roundtrip_stream_omits_usage_by_default() {
+        let p = proxy_with(true, false, 100, tmp_log().as_str());
+        let body = r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let (status, resp) = roundtrip(p, http_post("/v1/chat/completions", body));
+        assert_eq!(status, 200);
+        assert!(!resp.contains("\"usage\""), "should not emit usage: {resp}");
+        assert!(resp.contains("data: [DONE]"), "{resp}");
     }
 
     #[test]
