@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — RouterBench-format external eval loader (IMP-routerbench-loader)
+
+- `pasture eval --external <file.jsonl>` validates routing on any labelled JSONL
+  file. Each line is `{"prompt":"…","expected":"local"|"cloud"}`. Blank lines and
+  `//` comments are skipped. Missing files and malformed lines return a clear
+  error message. The external path uses the same routing pipeline as the built-in
+  18-case set (privacy classifier + routing engine + sensitivity override).
+  Std-only (`BufRead` + the in-tree JSON parser); 5 tests (ADR-069).
+
 ### Changed — Cache key normalises leading/trailing whitespace (IMP-cache-key-norm)
 
 - Prompts that differ only in leading/trailing whitespace now share a cache key.

@@ -24,7 +24,7 @@ COMMANDS:
     route <text>             Dry-run: show where a prompt would be routed
     chat  <text>             Send one prompt through the router (needs Ollama)
     serve                    Start the OpenAI-compatible proxy server
-    eval                     Measure routing quality + token-threshold sweep
+    eval [--external <file>] Measure routing quality + token-threshold sweep
     stats                    Summarize the cost log (routes, tokens, spend)
     improvements [path]      Show the self-improvement ledger (verified change history)
     config                   Print the effective configuration (no secrets)
@@ -177,6 +177,44 @@ pub fn run(args: &[String]) -> i32 {
         "eval" => {
             let profile = HardwareProfile::detect();
             let engine = RoutingEngine::for_hardware(&profile, true, true);
+            // --external <file>: load a user-supplied JSONL eval file and run it
+            // through the same routing harness as the built-in cases (IMP-17).
+            if let Some(path) = option_value(rest, "--external") {
+                match crate::eval::load_eval_cases(path) {
+                    Ok(cases) => {
+                        if cases.is_empty() {
+                            println!("external eval file contains no cases: {path}");
+                            return 0;
+                        }
+                        let report = crate::eval::run_eval_owned(&engine, &cases);
+                        println!(
+                            "External routing eval ({} cases from {path}, threshold {}):",
+                            report.total,
+                            engine.threshold()
+                        );
+                        println!(
+                            "  accuracy: {:.1}% ({}/{})",
+                            report.accuracy() * 100.0,
+                            report.correct,
+                            report.total
+                        );
+                        println!("  cloud rate: {:.1}%", report.cloud_rate() * 100.0);
+                        println!(
+                            "  false escalations (local->cloud): {}",
+                            report.false_escalations
+                        );
+                        println!(
+                            "  missed escalations (cloud->local): {}",
+                            report.missed_escalations
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("eval --external: {e}");
+                        return 1;
+                    }
+                }
+                return 0;
+            }
             let report = crate::eval::run_eval(&engine, &crate::eval::default_cases());
             println!(
                 "Routing eval ({} cases, threshold {}):",

@@ -159,6 +159,99 @@ pub fn default_cases() -> Vec<EvalCase> {
     ]
 }
 
+/// A dynamically-loaded evaluation case (prompt owned on the heap, not `'static`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedEvalCase {
+    pub prompt: String,
+    pub expected: Route,
+}
+
+/// Run the engine over dynamically-loaded eval cases. Identical routing logic
+/// to `run_eval`; a separate type is used because loaded prompts are not `'static`.
+pub fn run_eval_owned(engine: &RoutingEngine, cases: &[OwnedEvalCase]) -> EvalReport {
+    let mut report = EvalReport {
+        total: cases.len(),
+        correct: 0,
+        cloud_count: 0,
+        false_escalations: 0,
+        missed_escalations: 0,
+    };
+    for case in cases {
+        let sensitive = classify(case.prompt.as_str()).is_sensitive();
+        let got = engine
+            .decide_with_sensitivity(case.prompt.as_str(), None, sensitive)
+            .map(|d| d.route)
+            .unwrap_or(Route::Local);
+        if got == Route::Cloud {
+            report.cloud_count += 1;
+        }
+        if got == case.expected {
+            report.correct += 1;
+        } else if case.expected == Route::Local && got == Route::Cloud {
+            report.false_escalations += 1;
+        } else {
+            report.missed_escalations += 1;
+        }
+    }
+    report
+}
+
+/// Load a JSONL eval file (RouterBench-compatible format). Each non-blank,
+/// non-comment line must be a JSON object with a `"prompt"` string and an
+/// `"expected"` field that is `"local"` or `"cloud"`. Lines starting with `//`
+/// are skipped.
+///
+/// # Format
+/// ```json
+/// {"prompt": "what is 2+2", "expected": "local"}
+/// {"prompt": "prove the halting problem", "expected": "cloud"}
+/// ```
+pub fn load_eval_cases(path: &str) -> Result<Vec<OwnedEvalCase>, String> {
+    use std::io::{BufRead, BufReader};
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut cases = Vec::new();
+    for (lineno, line_res) in reader.lines().enumerate() {
+        let line = line_res.map_err(|e| format!("{path}:{}: read error: {e}", lineno + 1))?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let val = crate::json::parse(line)
+            .map_err(|e| format!("{path}:{}: {e}", lineno + 1))?;
+        let prompt = val
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                format!("{path}:{}: missing or non-string 'prompt' field", lineno + 1)
+            })?
+            .to_string();
+        if prompt.is_empty() {
+            return Err(format!("{path}:{}: prompt must not be empty", lineno + 1));
+        }
+        let expected_str = val
+            .get("expected")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                format!("{path}:{}: missing or non-string 'expected' field", lineno + 1)
+            })?;
+        let expected = match expected_str {
+            "local" => Route::Local,
+            "cloud" => Route::Cloud,
+            other => {
+                return Err(format!(
+                    "{path}:{}: expected 'local' or 'cloud', got {:?}",
+                    lineno + 1,
+                    other
+                ))
+            }
+        };
+        cases.push(OwnedEvalCase { prompt, expected });
+    }
+    Ok(cases)
+}
+
 /// Plain prompts of increasing length (no hard signals, not sensitive) used to
 /// visualise how the token threshold trades locality against cost.
 pub fn length_samples() -> Vec<String> {
@@ -257,5 +350,78 @@ mod tests {
             assert!(!classify(&s).is_sensitive());
             assert!(crate::routing::hard_signals(&s).is_empty());
         }
+    }
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("pasture_eval_{name}.jsonl"))
+    }
+
+    #[test]
+    fn test_load_eval_cases_basic() {
+        use std::io::Write;
+        let p = tmp_path("basic");
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(f, r#"{{"prompt":"hi","expected":"local"}}"#).unwrap();
+        writeln!(f, r#"{{"prompt":"prove sqrt(2) irrational","expected":"cloud"}}"#).unwrap();
+        let cases = load_eval_cases(p.to_str().unwrap()).unwrap();
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].prompt, "hi");
+        assert_eq!(cases[0].expected, Route::Local);
+        assert_eq!(cases[1].prompt, "prove sqrt(2) irrational");
+        assert_eq!(cases[1].expected, Route::Cloud);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_load_eval_cases_skips_blank_and_comment_lines() {
+        use std::io::Write;
+        let p = tmp_path("skip");
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(f, "").unwrap();
+        writeln!(f, "// this is a comment").unwrap();
+        writeln!(f, r#"{{"prompt":"hello","expected":"local"}}"#).unwrap();
+        writeln!(f, "").unwrap();
+        let cases = load_eval_cases(p.to_str().unwrap()).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].prompt, "hello");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_load_eval_cases_rejects_invalid_expected() {
+        use std::io::Write;
+        let p = tmp_path("bad_expected");
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(f, r#"{{"prompt":"hi","expected":"neither"}}"#).unwrap();
+        assert!(load_eval_cases(p.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_load_eval_cases_empty_file() {
+        let p = tmp_path("empty");
+        std::fs::File::create(&p).unwrap();
+        let cases = load_eval_cases(p.to_str().unwrap()).unwrap();
+        assert!(cases.is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_run_eval_owned_routes_correctly() {
+        let engine = RoutingEngine::new(300, true, true);
+        let cases = vec![
+            OwnedEvalCase {
+                prompt: "what is the capital of France".to_string(),
+                expected: Route::Local,
+            },
+            OwnedEvalCase {
+                prompt: "prove that the square root of two is irrational, step by step"
+                    .to_string(),
+                expected: Route::Cloud,
+            },
+        ];
+        let report = run_eval_owned(&engine, &cases);
+        assert_eq!(report.total, 2);
+        assert_eq!(report.correct, 2, "run_eval_owned should match built-in routing");
     }
 }

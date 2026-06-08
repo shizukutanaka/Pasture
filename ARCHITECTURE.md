@@ -221,6 +221,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-069 RouterBench-format external eval loader (IMP-routerbench-loader).**
+  The built-in 18-case set is the offline regression gate; validating routing on
+  a user's own labelled prompts (or a public benchmark such as RouterBench) needs
+  an external loader without a new dependency. `OwnedEvalCase { prompt: String,
+  expected: Route }` holds heap-allocated prompts for dynamically loaded data.
+  `load_eval_cases(path)` reads a JSONL file line by line (one object per line:
+  `{"prompt":"…","expected":"local"|"cloud"}`), skipping blank lines and `//`
+  comments; each line is parsed with `crate::json::parse` (the existing in-tree
+  parser). `run_eval_owned` runs `OwnedEvalCase` slices through the identical
+  routing pipeline as `run_eval` — privacy classifier → `decide_with_sensitivity`
+  → tally. `pasture eval --external <file>` triggers the external path; the
+  built-in path is unchanged. JSONL format matches the project's existing log
+  conventions. Std-only (`std::io::BufRead`); 5 tests.
 - **ADR-068 Cache key whitespace normalisation (IMP-cache-key-norm).**
   `request_key()` now trims leading/trailing whitespace from each message's
   `content` before hashing. Prompts that differ only in leading/trailing spaces
