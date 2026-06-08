@@ -76,6 +76,13 @@ Request body: OpenAI chat-completion JSON. Recognized fields:
 - `stream` (optional bool; default false). `true` ⇒ SSE response (§3.4).
 - `tools` / `functions` (optional arrays). A **non-empty** array marks the request as
   tool-using ⇒ hard signal ⇒ cloud (§4, IMP-10). Fields are passed through unchanged.
+- **Sampling parameters** (optional, IMP-sampling): `temperature`, `top_p`,
+  `max_tokens` (alias `max_completion_tokens`), `stop` (string or array of strings),
+  `seed`, `presence_penalty`, `frequency_penalty`. Present values MUST be forwarded to
+  the selected backend (OpenAI/OpenAI-compat as top-level fields; Ollama under
+  `options`, length cap as `num_predict`; Anthropic as `max_tokens` +
+  `stop_sequences`). Non-finite numbers are rejected. Sampling params are part of the
+  cache key (§6), so they never cross-serve responses.
 
 Success (non-stream): `200`, body is an OpenAI `chat.completion` object containing
 `id`, `object:"chat.completion"`, **`created`** (Unix seconds), `model`, `choices[0]`

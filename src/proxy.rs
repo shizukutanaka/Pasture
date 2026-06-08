@@ -207,12 +207,47 @@ impl Proxy {
                 .unwrap_or(false)
         };
         let has_tools = non_empty_array("tools") || non_empty_array("functions");
+        let sampling = Self::parse_sampling(&v);
         Ok(CompletionRequest {
             model,
             messages: parsed,
             stream,
             has_tools,
+            sampling,
         })
+    }
+
+    /// Extract OpenAI sampling parameters from a request body. Non-finite numbers
+    /// are rejected so the value can always be serialised as valid JSON; negative
+    /// `max_tokens` is dropped. `stop` accepts a string or an array of strings;
+    /// `max_completion_tokens` is honoured as an alias for `max_tokens`.
+    fn parse_sampling(v: &JsonValue) -> crate::backend::SamplingParams {
+        let finite = |key: &str| {
+            v.get(key)
+                .and_then(JsonValue::as_f64)
+                .filter(|x| x.is_finite())
+        };
+        let max_tokens = finite("max_tokens")
+            .or_else(|| finite("max_completion_tokens"))
+            .filter(|x| *x >= 0.0)
+            .map(|x| x as u64);
+        let stop = match v.get("stop") {
+            Some(JsonValue::Str(s)) => vec![s.clone()],
+            Some(JsonValue::Array(a)) => a
+                .iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        crate::backend::SamplingParams {
+            temperature: finite("temperature"),
+            top_p: finite("top_p"),
+            max_tokens,
+            stop,
+            seed: finite("seed").map(|x| x as i64),
+            presence_penalty: finite("presence_penalty"),
+            frequency_penalty: finite("frequency_penalty"),
+        }
     }
 
     /// Classify, then decide routing (keeps sensitive content local).
@@ -352,6 +387,7 @@ impl Proxy {
                             messages: req.messages.clone(),
                             stream: req.stream,
                             has_tools: req.has_tools,
+                            sampling: req.sampling.clone(),
                         };
                         &fast_req
                     } else {
@@ -756,6 +792,7 @@ fn inject_context_into(req: &CompletionRequest) -> CompletionRequest {
             messages: merged,
             stream: req.stream,
             has_tools: req.has_tools,
+            sampling: req.sampling.clone(),
         };
     }
     messages.push(ctx);
@@ -765,6 +802,7 @@ fn inject_context_into(req: &CompletionRequest) -> CompletionRequest {
         messages,
         stream: req.stream,
         has_tools: req.has_tools,
+        sampling: req.sampling.clone(),
     }
 }
 
@@ -1286,6 +1324,50 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_request_extracts_sampling() {
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0.2,"max_tokens":100,"stop":["\n\n"],"seed":7}"#;
+        let req = Proxy::parse_request(body).unwrap();
+        assert_eq!(req.sampling.temperature, Some(0.2));
+        assert_eq!(req.sampling.max_tokens, Some(100));
+        assert_eq!(req.sampling.seed, Some(7));
+        assert_eq!(req.sampling.stop, vec!["\n\n".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_request_max_completion_tokens_alias() {
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":42}"#;
+        let req = Proxy::parse_request(body).unwrap();
+        assert_eq!(req.sampling.max_tokens, Some(42));
+    }
+
+    #[test]
+    fn test_parse_request_stop_as_string() {
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"stop":"END"}"#;
+        let req = Proxy::parse_request(body).unwrap();
+        assert_eq!(req.sampling.stop, vec!["END".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_request_no_sampling_is_empty() {
+        let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let req = Proxy::parse_request(body).unwrap();
+        assert!(req.sampling.is_empty());
+    }
+
+    #[test]
+    fn test_cache_distinguishes_by_temperature() {
+        // Same messages, different temperature -> different cache key, so a
+        // temperature:0 response is never served to a temperature:1 request.
+        let base = r#"{"messages":[{"role":"user","content":"hi"}]"#;
+        let r0 = Proxy::parse_request(&format!("{base},\"temperature\":0}}")).unwrap();
+        let r1 = Proxy::parse_request(&format!("{base},\"temperature\":1}}")).unwrap();
+        assert_ne!(
+            crate::cache::request_key(&r0),
+            crate::cache::request_key(&r1)
+        );
+    }
+
+    #[test]
     fn test_roundtrip_stats_ok() {
         let p = proxy_with(true, true, 100, "/no/such/cost-log.jsonl");
         let (status, body) = roundtrip(p, "GET /v1/stats HTTP/1.1\r\n\r\n".to_string());
@@ -1597,6 +1679,7 @@ mod tests {
             }],
             stream: false,
             has_tools: false,
+            sampling: Default::default(),
         };
         let injected = inject_context_into(&req);
         assert_eq!(injected.messages[0].role, "system");
@@ -1620,6 +1703,7 @@ mod tests {
             ],
             stream: false,
             has_tools: false,
+            sampling: Default::default(),
         };
         let injected = inject_context_into(&req);
         // No duplicate system messages — context merged into the existing one.

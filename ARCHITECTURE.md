@@ -221,6 +221,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-039 Sampling-parameter passthrough (IMP-sampling).** Every peer gateway
+  (LiteLLM, OpenRouter, Ollama, LM Studio, vLLM) honours the client's sampling
+  parameters; Pasture parsed only `messages`/`model`/`stream`/tools and silently
+  dropped `temperature`, `top_p`, `max_tokens`, `stop`, `seed`, and the penalties —
+  so a client requesting `temperature:0` for deterministic output, or `max_tokens`
+  for a cost cap, was ignored. A new `SamplingParams` on `CompletionRequest` is
+  filled by `parse_request` (non-finite numbers rejected; `stop` accepts string or
+  array; `max_completion_tokens` aliases `max_tokens`) and serialised per backend:
+  OpenAI/OpenAI-compat as top-level fields, Ollama under `options` with the length
+  cap renamed `num_predict`, Anthropic honouring the client `max_tokens` (instead of
+  the hardcoded 1024) plus `temperature`/`top_p`/`stop_sequences`. The cache key now
+  includes the sampling params (hashing each `f64` by bit pattern) so a `temperature:0`
+  response is never served to a `temperature:1` request. std-only; 11 tests across
+  parse/build/cache.
 - **ADR-038 Live metrics endpoint (IMP-metrics, IMP-16).** Observability was
   CLI-only (`stats` reads the cost log). Peer gateways expose a live metrics view;
   the proxy now answers `GET /v1/stats` with a JSON snapshot of the same PII-free

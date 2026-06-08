@@ -369,6 +369,7 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
             }],
             stream: false,
             has_tools: false,
+            sampling: Default::default(),
         };
         return match backend.complete(&req) {
             Ok(resp) => {
@@ -392,6 +393,7 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
         }],
         stream: true,
         has_tools: false,
+        sampling: Default::default(),
     };
     use std::io::Write as _;
     let mut out = std::io::stdout();
@@ -983,6 +985,7 @@ fn chat_request(model: &str, text: &str) -> CompletionRequest {
         }],
         stream: false,
         has_tools: false,
+        sampling: Default::default(),
     }
 }
 

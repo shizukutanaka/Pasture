@@ -62,15 +62,39 @@ impl Provider {
             .collect();
         match self {
             Provider::OpenAI => format!(
-                "{{\"model\":\"{}\",\"messages\":[{}]}}",
+                "{{\"model\":\"{}\",\"messages\":[{}]{}}}",
                 escape_string(&req.model),
-                msgs.join(",")
+                msgs.join(","),
+                req.sampling.openai_fields()
             ),
-            Provider::Anthropic => format!(
-                "{{\"model\":\"{}\",\"max_tokens\":1024,\"messages\":[{}]}}",
-                escape_string(&req.model),
-                msgs.join(",")
-            ),
+            Provider::Anthropic => {
+                // Anthropic requires max_tokens; honour the client's value (else
+                // keep the prior 1024 default). temperature/top_p/stop_sequences
+                // map across; OpenAI-only penalties are not supported here.
+                let max_tokens = req.sampling.max_tokens.unwrap_or(1024);
+                let mut extra = String::new();
+                if let Some(t) = req.sampling.temperature {
+                    extra.push_str(&format!(",\"temperature\":{t}"));
+                }
+                if let Some(p) = req.sampling.top_p {
+                    extra.push_str(&format!(",\"top_p\":{p}"));
+                }
+                if !req.sampling.stop.is_empty() {
+                    let items: Vec<String> = req
+                        .sampling
+                        .stop
+                        .iter()
+                        .map(|s| format!("\"{}\"", escape_string(s)))
+                        .collect();
+                    extra.push_str(&format!(",\"stop_sequences\":[{}]", items.join(",")));
+                }
+                format!(
+                    "{{\"model\":\"{}\",\"max_tokens\":{max_tokens},\"messages\":[{}]{}}}",
+                    escape_string(&req.model),
+                    msgs.join(","),
+                    extra
+                )
+            }
         }
     }
 
@@ -534,6 +558,7 @@ mod tests {
             }],
             stream: false,
             has_tools: false,
+            sampling: Default::default(),
         }
     }
 
@@ -627,6 +652,44 @@ mod tests {
         assert!(b.contains("\"model\":\"test-model\""));
         // Still valid JSON.
         assert!(crate::json::parse(&b).is_ok());
+    }
+
+    #[test]
+    fn test_openai_body_threads_sampling() {
+        let mut r = req();
+        r.sampling = crate::backend::SamplingParams {
+            temperature: Some(0.0),
+            max_tokens: Some(256),
+            ..Default::default()
+        };
+        let b = Provider::OpenAI.build_body(&r);
+        assert!(b.contains("\"temperature\":0"), "{b}");
+        assert!(b.contains("\"max_tokens\":256"), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "{b}");
+    }
+
+    #[test]
+    fn test_anthropic_body_honors_max_tokens_override() {
+        let mut r = req();
+        r.sampling = crate::backend::SamplingParams {
+            max_tokens: Some(50),
+            temperature: Some(0.3),
+            stop: vec!["END".to_string()],
+            ..Default::default()
+        };
+        let b = Provider::Anthropic.build_body(&r);
+        assert!(b.contains("\"max_tokens\":50"), "{b}");
+        assert!(!b.contains("\"max_tokens\":1024"), "{b}");
+        assert!(b.contains("\"temperature\":0.3"), "{b}");
+        // Anthropic uses stop_sequences, not stop.
+        assert!(b.contains("\"stop_sequences\":[\"END\"]"), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "{b}");
+    }
+
+    #[test]
+    fn test_anthropic_body_default_max_tokens_when_absent() {
+        let b = Provider::Anthropic.build_body(&req());
+        assert!(b.contains("\"max_tokens\":1024"), "{b}");
     }
 
     #[test]

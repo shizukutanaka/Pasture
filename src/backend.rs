@@ -30,6 +30,106 @@ pub struct CompletionRequest {
     /// (`tools` / `functions` / a non-"none" `tool_choice`). Used as a hard
     /// routing signal — tool use is reliable on the stronger model (IMP-10).
     pub has_tools: bool,
+    /// Sampling parameters the client supplied (temperature, max_tokens, …).
+    /// Forwarded to the backend so client intent (determinism, length, stop
+    /// sequences) is honoured rather than silently dropped — parity with peer
+    /// gateways (LiteLLM/OpenRouter/Ollama/LM Studio/vLLM).
+    pub sampling: SamplingParams,
+}
+
+/// Client-supplied sampling parameters. All optional; absent fields are left to
+/// the backend's own defaults. Non-finite numbers are rejected at parse time, so
+/// builders may assume every present value serialises to valid JSON.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SamplingParams {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub max_tokens: Option<u64>,
+    pub stop: Vec<String>,
+    pub seed: Option<i64>,
+    pub presence_penalty: Option<f64>,
+    pub frequency_penalty: Option<f64>,
+}
+
+impl SamplingParams {
+    /// True when no parameter is set (so builders can omit the wrapper entirely).
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.max_tokens.is_none()
+            && self.stop.is_empty()
+            && self.seed.is_none()
+            && self.presence_penalty.is_none()
+            && self.frequency_penalty.is_none()
+    }
+
+    /// OpenAI-style top-level fields, each prefixed with a comma (empty if none).
+    /// Suitable to splice before the closing brace of a request object.
+    pub fn openai_fields(&self) -> String {
+        let mut out = String::new();
+        if let Some(t) = self.temperature {
+            out.push_str(&format!(",\"temperature\":{t}"));
+        }
+        if let Some(p) = self.top_p {
+            out.push_str(&format!(",\"top_p\":{p}"));
+        }
+        if let Some(m) = self.max_tokens {
+            out.push_str(&format!(",\"max_tokens\":{m}"));
+        }
+        if let Some(s) = self.seed {
+            out.push_str(&format!(",\"seed\":{s}"));
+        }
+        if let Some(pp) = self.presence_penalty {
+            out.push_str(&format!(",\"presence_penalty\":{pp}"));
+        }
+        if let Some(fp) = self.frequency_penalty {
+            out.push_str(&format!(",\"frequency_penalty\":{fp}"));
+        }
+        if !self.stop.is_empty() {
+            out.push_str(&format!(",\"stop\":{}", json_string_array(&self.stop)));
+        }
+        out
+    }
+
+    /// Ollama `options` object, comma-prefixed (empty if none). Ollama nests
+    /// sampling under `options` and calls the length cap `num_predict`.
+    pub fn ollama_options(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(t) = self.temperature {
+            parts.push(format!("\"temperature\":{t}"));
+        }
+        if let Some(p) = self.top_p {
+            parts.push(format!("\"top_p\":{p}"));
+        }
+        if let Some(m) = self.max_tokens {
+            parts.push(format!("\"num_predict\":{m}"));
+        }
+        if let Some(s) = self.seed {
+            parts.push(format!("\"seed\":{s}"));
+        }
+        if let Some(pp) = self.presence_penalty {
+            parts.push(format!("\"presence_penalty\":{pp}"));
+        }
+        if let Some(fp) = self.frequency_penalty {
+            parts.push(format!("\"frequency_penalty\":{fp}"));
+        }
+        if !self.stop.is_empty() {
+            parts.push(format!("\"stop\":{}", json_string_array(&self.stop)));
+        }
+        format!(",\"options\":{{{}}}", parts.join(","))
+    }
+}
+
+/// Serialise a string slice as a JSON array of escaped strings.
+fn json_string_array(items: &[String]) -> String {
+    let parts: Vec<String> = items
+        .iter()
+        .map(|s| format!("\"{}\"", escape_string(s)))
+        .collect();
+    format!("[{}]", parts.join(","))
 }
 
 impl CompletionRequest {
@@ -269,9 +369,10 @@ impl OllamaBackend {
             })
             .collect();
         format!(
-            "{{\"model\":\"{}\",\"stream\":{stream},\"messages\":[{}]}}",
+            "{{\"model\":\"{}\",\"stream\":{stream},\"messages\":[{}]{}}}",
             escape_string(&req.model),
-            msgs.join(",")
+            msgs.join(","),
+            req.sampling.ollama_options()
         )
     }
 
@@ -685,6 +786,7 @@ mod tests {
             ],
             stream: false,
             has_tools: false,
+            sampling: Default::default(),
         }
     }
 
@@ -806,5 +908,47 @@ mod tests {
     fn test_build_body_streaming_sets_stream_true() {
         assert!(OllamaBackend::build_body_streaming(&req()).contains("\"stream\":true"));
         assert!(OllamaBackend::build_body(&req()).contains("\"stream\":false"));
+    }
+
+    #[test]
+    fn test_ollama_body_no_options_when_sampling_empty() {
+        // Default (empty) sampling must not add an options object.
+        assert!(!OllamaBackend::build_body(&req()).contains("\"options\""));
+    }
+
+    #[test]
+    fn test_ollama_body_threads_sampling_into_options() {
+        let mut r = req();
+        r.sampling = SamplingParams {
+            temperature: Some(0.0),
+            max_tokens: Some(128),
+            stop: vec!["STOP".to_string()],
+            ..Default::default()
+        };
+        let body = OllamaBackend::build_body(&r);
+        assert!(body.contains("\"options\":{"), "{body}");
+        assert!(body.contains("\"temperature\":0"), "{body}");
+        // Ollama names the length cap num_predict, not max_tokens.
+        assert!(body.contains("\"num_predict\":128"), "{body}");
+        assert!(body.contains("\"stop\":[\"STOP\"]"), "{body}");
+        assert!(!body.contains("\"max_tokens\""), "{body}");
+    }
+
+    #[test]
+    fn test_sampling_openai_fields_finite_only() {
+        let s = SamplingParams {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_tokens: Some(64),
+            seed: Some(42),
+            ..Default::default()
+        };
+        let f = s.openai_fields();
+        assert!(f.contains("\"temperature\":0.7"));
+        assert!(f.contains("\"top_p\":0.9"));
+        assert!(f.contains("\"max_tokens\":64"));
+        assert!(f.contains("\"seed\":42"));
+        // Empty sampling produces no fields.
+        assert_eq!(SamplingParams::default().openai_fields(), "");
     }
 }

@@ -11,13 +11,33 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
-/// Stable key for a request: model + ordered (role, content) of each message.
+/// Stable key for a request: model + ordered (role, content) of each message +
+/// the sampling parameters. Sampling is part of the key so that, e.g., a
+/// `temperature:0` response is never served to a `temperature:1` request.
 pub fn request_key(req: &CompletionRequest) -> u64 {
     let mut h = DefaultHasher::new();
     req.model.hash(&mut h);
     for m in &req.messages {
         m.role.hash(&mut h);
         m.content.hash(&mut h);
+    }
+    let s = &req.sampling;
+    // f64 has no Hash; hash the bit pattern (None as a fixed sentinel).
+    let hash_opt_f64 = |h: &mut DefaultHasher, x: Option<f64>| match x {
+        Some(v) => {
+            1u8.hash(h);
+            v.to_bits().hash(h);
+        }
+        None => 0u8.hash(h),
+    };
+    hash_opt_f64(&mut h, s.temperature);
+    hash_opt_f64(&mut h, s.top_p);
+    s.max_tokens.hash(&mut h);
+    s.seed.hash(&mut h);
+    hash_opt_f64(&mut h, s.presence_penalty);
+    hash_opt_f64(&mut h, s.frequency_penalty);
+    for stop in &s.stop {
+        stop.hash(&mut h);
     }
     h.finish()
 }
@@ -84,6 +104,7 @@ mod tests {
             }],
             stream: false,
             has_tools: false,
+            sampling: Default::default(),
         }
     }
 

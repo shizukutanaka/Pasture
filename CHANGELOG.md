@@ -5,6 +5,21 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — sampling parameters were silently dropped (IMP-sampling)
+
+- The proxy now **forwards client sampling parameters** to the backend instead of
+  ignoring them — parity with LiteLLM/OpenRouter/Ollama/LM Studio/vLLM. Recognised:
+  `temperature`, `top_p`, `max_tokens` (and the `max_completion_tokens` alias),
+  `stop` (string or array), `seed`, `presence_penalty`, `frequency_penalty`.
+  Previously a client asking for `temperature:0` (determinism) or `max_tokens`
+  (cost/length cap) was silently ignored — a correctness gap vs every peer.
+- Per-backend serialisation: OpenAI/OpenAI-compat as top-level fields; Ollama under
+  `options` (length cap as `num_predict`); Anthropic honours the client `max_tokens`
+  (was hardcoded 1024) plus `temperature`/`top_p`/`stop_sequences`.
+- The **response cache key now includes the sampling params**, so a `temperature:0`
+  answer is never served to a `temperature:1` request. Non-finite numbers are
+  rejected at parse time. New `SamplingParams` type; 11 tests. Grounded in ADR-039.
+
 ### Added — live metrics endpoint (IMP-metrics / IMP-16)
 
 - New **`GET /v1/stats`**: a live JSON snapshot of the cost-log counters —
