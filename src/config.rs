@@ -36,6 +36,8 @@ pub struct Config {
     pub auth_token: Option<String>,
     /// Global rate limit for `/v1/*` in requests per minute (0 = unlimited).
     pub rate_limit: u32,
+    /// CORS allowed origins (comma-separated, or `*`). Empty = CORS disabled.
+    pub cors_origins: String,
 }
 
 impl Default for Config {
@@ -65,6 +67,7 @@ impl Default for Config {
             inject_context: false,
             auth_token: None,
             rate_limit: 0,
+            cors_origins: String::new(),
         }
     }
 }
@@ -179,6 +182,9 @@ impl Config {
                 self.rate_limit = n;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_CORS_ORIGINS") {
+            self.cors_origins = v;
+        }
         self
     }
 
@@ -238,6 +244,7 @@ impl Config {
                     self.rate_limit = n;
                 }
             }
+            "cors_origins" => self.cors_origins = val.to_string(),
             _ => {}
         }
     }

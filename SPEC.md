@@ -142,6 +142,15 @@ All error responses MUST use the OpenAI envelope:
 | no backend available / sensitive-but-no-local / forced-route-unavailable | `503` | `routing_error` |
 | backend (local/cloud) failure with no fallback | `502` | `upstream_error` |
 
+### 3.6 CORS (opt-in)
+When `PASTURE_CORS_ORIGINS` is set (a comma-separated allow-list, or `*`), the proxy
+supports browser clients (IMP-cors): an `OPTIONS` preflight to any path is answered
+`204` with `Access-Control-Allow-Origin/-Methods/-Headers` and `Access-Control-Max-Age`
+**before** the §7 auth/rate-limit gate (preflight carries no credentials), and
+`Access-Control-Allow-Origin` is reflected on all responses (buffered and SSE). A
+specific (non-`*`) allowed origin also receives `Vary: Origin`; a disallowed origin
+receives no CORS header. Default (unset) = no CORS headers, `OPTIONS` ⇒ `404`.
+
 ---
 
 ## 4. Routing engine (deterministic)
@@ -252,6 +261,7 @@ wins). Variables:
 | `PASTURE_INJECT_CONTEXT` | off | prepend date/OS system message for PC-assistant mode |
 | `PASTURE_AUTH_TOKEN` | _(off)_ | require `Authorization: Bearer <token>` on `/v1/*` (ADR-040) |
 | `PASTURE_RATE_LIMIT` | `0` | global requests/min cap on `/v1/*` (0 = unlimited) |
+| `PASTURE_CORS_ORIGINS` | _(off)_ | CORS allow-list (comma-separated, or `*`) for browser clients (§3.6) |
 
 ---
 

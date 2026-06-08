@@ -1056,6 +1056,10 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
             config.rate_limit
         );
     }
+    let cors = crate::proxy::CorsPolicy::parse(&config.cors_origins);
+    if cors.is_some() {
+        eprintln!("pasture: CORS enabled for origins: {}", config.cors_origins);
+    }
     // Security nudge: a non-localhost bind without auth is exposed to the network.
     let localhost = addr.starts_with("127.")
         || addr.starts_with("localhost")
@@ -1076,7 +1080,8 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         .with_fast_model(fast, config.fast_threshold)
         .with_inject_context(config.inject_context)
         .with_auth_token(config.auth_token.clone())
-        .with_rate_limit(config.rate_limit);
+        .with_rate_limit(config.rate_limit)
+        .with_cors(cors);
     print!(
         "{}",
         crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])

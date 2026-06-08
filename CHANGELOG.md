@@ -5,6 +5,19 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — CORS support for browser clients (IMP-cors)
+
+- **`PASTURE_CORS_ORIGINS`** (comma-separated allow-list, or `*`): opt-in CORS so
+  browser-based UIs (Open WebUI web, custom dashboards) can call the proxy — peers
+  (Ollama, LM Studio, LiteLLM) all support this. `OPTIONS` preflight is answered with
+  `204` + `Access-Control-Allow-*` *before* the auth/rate-limit gate (preflight is
+  credential-free); `Access-Control-Allow-Origin` is reflected on all responses,
+  including SSE; a specific origin also sends `Vary: Origin`.
+- **Off by default** — a localhost server with permissive CORS is reachable by any
+  website the user visits, so it must be enabled deliberately. Deterministic, std-only;
+  8 tests (policy parse/match, header building, OPTIONS preflight, reflected header).
+  Grounded in ADR-041.
+
 ### Added — optional auth + rate-limit for exposed deployments (IMP-15)
 
 - **`PASTURE_AUTH_TOKEN`**: when set, all `/v1/*` requests must present

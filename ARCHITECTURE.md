@@ -221,6 +221,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-041 CORS / OPTIONS preflight (IMP-cors).** Browser-based clients (Open WebUI
+  web, custom dashboards) cannot call the proxy without CORS preflight handling, which
+  every peer (Ollama via `OLLAMA_ORIGINS`, LM Studio, LiteLLM) provides. `PASTURE_CORS_ORIGINS`
+  (a comma-separated allow-list, or `*`) opts in: `OPTIONS` is answered with `204` and the
+  `Access-Control-Allow-*` preflight headers *before* the auth/rate-limit gate (preflight
+  is credential-free), and `Access-Control-Allow-Origin` is reflected on every response
+  (buffered and SSE) so the browser can read both success and error bodies; a specific
+  (non-`*`) origin also gets `Vary: Origin`. Off by default — a localhost server with
+  permissive CORS is reachable by any website the user visits, so this is opt-in (the
+  same lesson Ollama learned). The `Origin` header is captured in `read_request`;
+  `CorsPolicy` and the header builders are pure and unit-tested; deterministic, std-only.
 - **ADR-040 Optional auth + rate-limit (IMP-15).** The proxy binds `127.0.0.1` by
   default (I5), but users do expose it (`PASTURE_LISTEN_ADDR=0.0.0.0:…`), and there
   was no gate. Two opt-in, std-only protections now guard `/v1/*` (with `/health`

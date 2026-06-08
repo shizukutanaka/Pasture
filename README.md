@@ -94,6 +94,7 @@ Defaults are sensible; override via environment variables:
 | `PASTURE_INJECT_CONTEXT` | _(off)_ | when set, prepends a system message with the current date and OS — boosts lightweight models as PC assistants |
 | `PASTURE_AUTH_TOKEN` | _(off)_ | require `Authorization: Bearer <token>` on `/v1/*` (for exposed, non-localhost deployments); `/health` stays open |
 | `PASTURE_RATE_LIMIT` | `0` | cap `/v1/*` to this many requests per minute (global; 0 = unlimited) |
+| `PASTURE_CORS_ORIGINS` | _(off)_ | CORS allow-list for browser clients: comma-separated origins, or `*` (off by default — a localhost server with `*` is reachable by any website) |
 
 The local backend talks to [Ollama](https://ollama.com) over plain HTTP. GPU acceleration (CUDA/Metal/ROCm) is handled by Ollama; Pasture writes no GPU code itself.
 

@@ -56,6 +56,61 @@ impl std::fmt::Display for ProxyError {
     }
 }
 
+/// CORS policy for browser clients (IMP-cors). Off by default — a localhost
+/// server with permissive CORS is reachable by any website the user visits, so
+/// this is opt-in via `PASTURE_CORS_ORIGINS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorsPolicy {
+    /// `*`: reflect any origin (echo `Access-Control-Allow-Origin: *`).
+    allow_any: bool,
+    /// Explicit allow-list (exact-match against the request `Origin`).
+    origins: Vec<String>,
+}
+
+impl CorsPolicy {
+    /// Parse a comma-separated origins spec. `*` allows any; an empty spec
+    /// disables CORS (returns `None`).
+    pub fn parse(spec: &str) -> Option<CorsPolicy> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return None;
+        }
+        if spec == "*" {
+            return Some(CorsPolicy {
+                allow_any: true,
+                origins: Vec::new(),
+            });
+        }
+        let origins: Vec<String> = spec
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if origins.is_empty() {
+            None
+        } else {
+            Some(CorsPolicy {
+                allow_any: false,
+                origins,
+            })
+        }
+    }
+
+    /// The `Access-Control-Allow-Origin` value to return for a request's Origin,
+    /// or `None` when the origin is not allowed.
+    fn allow_origin(&self, origin: Option<&str>) -> Option<String> {
+        if self.allow_any {
+            return Some("*".to_string());
+        }
+        let o = origin?;
+        if self.origins.iter().any(|a| a == o) {
+            Some(o.to_string())
+        } else {
+            None
+        }
+    }
+}
+
 /// The proxy: a routing engine plus optional local and cloud backends.
 pub struct Proxy {
     engine: RoutingEngine,
@@ -85,6 +140,8 @@ pub struct Proxy {
     /// Optional global token-bucket rate limiter for `/v1/*` (IMP-15). None =
     /// unlimited (the localhost default).
     rate_limiter: Option<std::sync::Mutex<crate::ratelimit::RateLimiter>>,
+    /// Optional CORS policy for browser clients (IMP-cors). None = no CORS headers.
+    cors: Option<CorsPolicy>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -112,7 +169,49 @@ impl Proxy {
             inject_context: false,
             auth_token: None,
             rate_limiter: None,
+            cors: None,
         }
+    }
+
+    /// Set the CORS policy for browser clients (IMP-cors). None leaves CORS off.
+    pub fn with_cors(mut self, policy: Option<CorsPolicy>) -> Self {
+        self.cors = policy;
+        self
+    }
+
+    /// Build CORS response header lines for a request's Origin (empty when CORS
+    /// is off or the origin is not allowed). Always appended to responses so the
+    /// browser can read both success and error bodies.
+    fn cors_headers(&self, origin: Option<&str>) -> String {
+        let Some(policy) = &self.cors else {
+            return String::new();
+        };
+        match policy.allow_origin(origin) {
+            Some(allow) => {
+                let mut h = format!("Access-Control-Allow-Origin: {allow}\r\n");
+                // A specific origin varies by request; tell caches so.
+                if allow != "*" {
+                    h.push_str("Vary: Origin\r\n");
+                }
+                h
+            }
+            None => String::new(),
+        }
+    }
+
+    /// Build the full preflight (OPTIONS) header block, or None when CORS is off
+    /// or the origin is not allowed.
+    fn cors_preflight(&self, origin: Option<&str>) -> Option<String> {
+        let policy = self.cors.as_ref()?;
+        let allow = policy.allow_origin(origin)?;
+        let mut h = format!("Access-Control-Allow-Origin: {allow}\r\n");
+        if allow != "*" {
+            h.push_str("Vary: Origin\r\n");
+        }
+        h.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+        h.push_str("Access-Control-Allow-Headers: Authorization, Content-Type\r\n");
+        h.push_str("Access-Control-Max-Age: 86400\r\n");
+        Some(h)
     }
 
     /// Require this bearer token on `/v1/*` requests (IMP-15). Empty disables auth.
@@ -600,40 +699,57 @@ impl Proxy {
     }
 
     fn handle_connection(&self, stream: &mut std::net::TcpStream) -> std::io::Result<()> {
-        let (method, path, body, auth) = match read_request(stream)? {
+        let (method, path, body, auth, origin) = match read_request(stream)? {
             ReadOutcome::Request {
                 method,
                 path,
                 body,
                 auth,
-            } => (method, path, body, auth),
+                origin,
+            } => (method, path, body, auth, origin),
             ReadOutcome::TooLarge => {
                 let payload =
                     build_error_response("request body too large", "invalid_request_error");
-                write_response(stream, 413, &payload)?;
+                write_response(stream, 413, &payload, "")?;
                 return Ok(());
             }
             ReadOutcome::Closed => {
                 let payload = build_error_response("malformed request", "invalid_request_error");
-                write_response(stream, 400, &payload)?;
+                write_response(stream, 400, &payload, "")?;
                 return Ok(());
             }
         };
+        // CORS headers reflected on every response so the browser can read it.
+        let cors = self.cors_headers(origin.as_deref());
+        // CORS preflight: answer OPTIONS before the gate (preflight is credential-free).
+        if method == "OPTIONS" {
+            match self.cors_preflight(origin.as_deref()) {
+                Some(h) => write_response(stream, 204, "", &h)?,
+                None => write_response(
+                    stream,
+                    404,
+                    &build_error_response("not found", "invalid_request_error"),
+                    &cors,
+                )?,
+            }
+            return Ok(());
+        }
         // Auth + rate-limit gating (IMP-15); /health is exempt.
         if let Some((status, msg, kind)) = self.check_gate(&path, auth.as_deref()) {
-            write_response(stream, status, &build_error_response(msg, kind))?;
+            write_response(stream, status, &build_error_response(msg, kind), &cors)?;
             return Ok(());
         }
         if method == "POST" && path.starts_with("/v1/chat/completions") {
             match Self::parse_request(&body) {
-                Ok(req) if req.stream => self.stream_chat_to_socket(stream, &req)?,
+                Ok(req) if req.stream => self.stream_chat_to_socket(stream, &req, &cors)?,
                 Ok(req) => match self.complete_buffered(&req) {
-                    Ok(resp) => write_response(stream, 200, &resp)?,
+                    Ok(resp) => write_response(stream, 200, &resp, &cors)?,
                     Err(e) => {
                         write_response(
                             stream,
                             e.status(),
                             &build_error_response(e.message(), e.kind()),
+                            &cors,
                         )?;
                     }
                 },
@@ -642,40 +758,44 @@ impl Proxy {
                         stream,
                         e.status(),
                         &build_error_response(e.message(), e.kind()),
+                        &cors,
                     )?;
                 }
             }
         } else if method == "POST" && path.starts_with("/v1/embeddings") {
             match self.handle_embeddings(&body) {
-                Ok(resp) => write_response(stream, 200, &resp)?,
+                Ok(resp) => write_response(stream, 200, &resp, &cors)?,
                 Err(e) => {
                     write_response(
                         stream,
                         e.status(),
                         &build_error_response(e.message(), e.kind()),
+                        &cors,
                     )?;
                 }
             }
         } else if method == "GET" && path.starts_with("/v1/stats") {
             match self.handle_stats() {
-                Ok(resp) => write_response(stream, 200, &resp)?,
+                Ok(resp) => write_response(stream, 200, &resp, &cors)?,
                 Err(e) => {
                     write_response(
                         stream,
                         e.status(),
                         &build_error_response(e.message(), e.kind()),
+                        &cors,
                     )?;
                 }
             }
         } else if method == "GET" && path.starts_with("/v1/models") {
-            write_response(stream, 200, &build_models_response(&self.models))?;
+            write_response(stream, 200, &build_models_response(&self.models), &cors)?;
         } else if method == "GET" && path.starts_with("/health") {
-            write_response(stream, 200, "{\"status\":\"ok\"}")?;
+            write_response(stream, 200, "{\"status\":\"ok\"}", &cors)?;
         } else {
             write_response(
                 stream,
                 404,
                 &build_error_response("not found", "invalid_request_error"),
+                &cors,
             )?;
         }
         Ok(())
@@ -695,6 +815,7 @@ impl Proxy {
         &self,
         sock: &mut std::net::TcpStream,
         req: &CompletionRequest,
+        cors: &str,
     ) -> std::io::Result<()> {
         let decision = match self.classify_and_decide(req) {
             Ok((d, _)) => d,
@@ -703,6 +824,7 @@ impl Proxy {
                     sock,
                     e.status(),
                     &build_error_response(e.message(), e.kind()),
+                    cors,
                 );
             }
         };
@@ -713,11 +835,12 @@ impl Proxy {
                     sock,
                     e.status(),
                     &build_error_response(e.message(), e.kind()),
+                    cors,
                 );
             }
         };
 
-        write_sse_headers(sock)?;
+        write_sse_headers(sock, cors)?;
         let route_label = decision.route.as_str();
         let mut io_err: Option<std::io::Error> = None;
         let resp = backend.stream_complete(req, &mut |delta| {
@@ -991,8 +1114,10 @@ pub fn sse_frame(payload: &str) -> String {
     format!("data: {payload}\n\n")
 }
 
-fn write_sse_headers(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
-    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+fn write_sse_headers(stream: &mut std::net::TcpStream, cors: &str) -> std::io::Result<()> {
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n{cors}\r\n"
+    );
     stream.write_all(headers.as_bytes())
 }
 /// Maximum request body the proxy will read (SPEC §7). Far above any real chat
@@ -1008,6 +1133,8 @@ enum ReadOutcome {
         body: String,
         /// The `Authorization` header value, if present (used for auth, IMP-15).
         auth: Option<String>,
+        /// The `Origin` header value, if present (used for CORS, IMP-cors).
+        origin: Option<String>,
     },
     /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413.
     TooLarge,
@@ -1042,6 +1169,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
 
     let mut content_length = 0usize;
     let mut auth: Option<String> = None;
+    let mut origin: Option<String> = None;
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
@@ -1050,6 +1178,10 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
             // Preserve original case for the token value (header name is ASCII).
             if let Some((_, v)) = line.split_once(':') {
                 auth = Some(v.trim().to_string());
+            }
+        } else if lower.starts_with("origin:") {
+            if let Some((_, v)) = line.split_once(':') {
+                origin = Some(v.trim().to_string());
             }
         }
     }
@@ -1077,6 +1209,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<ReadOutcome
         path,
         body: String::from_utf8_lossy(&body).into_owned(),
         auth,
+        origin,
     })
 }
 
@@ -1107,13 +1240,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Write an HTTP/1.1 response. `extra` is a block of additional header lines
+/// (each already terminated with `\r\n`, e.g. CORS headers) or empty.
 fn write_response(
     stream: &mut std::net::TcpStream,
     status: u16,
     body: &str,
+    extra: &str,
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
@@ -1124,7 +1261,7 @@ fn write_response(
         _ => "Error",
     };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes())
@@ -1561,6 +1698,106 @@ mod tests {
         let p = proxy_with(true, false, 100, "unused").with_auth_token(Some("k".to_string()));
         let (status, _) = roundtrip(p, "GET /health HTTP/1.1\r\n\r\n".to_string());
         assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn test_cors_policy_parse() {
+        assert_eq!(CorsPolicy::parse(""), None);
+        assert_eq!(CorsPolicy::parse("   "), None);
+        assert!(CorsPolicy::parse("*").unwrap().allow_any);
+        let p = CorsPolicy::parse("https://a.com, https://b.com").unwrap();
+        assert!(!p.allow_any);
+        assert_eq!(p.origins, vec!["https://a.com", "https://b.com"]);
+    }
+
+    #[test]
+    fn test_cors_allow_origin_matching() {
+        let any = CorsPolicy::parse("*").unwrap();
+        assert_eq!(
+            any.allow_origin(Some("https://x.com")).as_deref(),
+            Some("*")
+        );
+        assert_eq!(any.allow_origin(None).as_deref(), Some("*"));
+        let list = CorsPolicy::parse("https://ok.com").unwrap();
+        assert_eq!(
+            list.allow_origin(Some("https://ok.com")).as_deref(),
+            Some("https://ok.com")
+        );
+        assert_eq!(list.allow_origin(Some("https://evil.com")), None);
+        assert_eq!(list.allow_origin(None), None);
+    }
+
+    #[test]
+    fn test_cors_headers_off_by_default() {
+        let p = proxy_with(true, false, 100, "unused");
+        assert_eq!(p.cors_headers(Some("https://x.com")), "");
+        assert!(p.cors_preflight(Some("https://x.com")).is_none());
+    }
+
+    #[test]
+    fn test_cors_headers_wildcard() {
+        let p = proxy_with(true, false, 100, "unused").with_cors(CorsPolicy::parse("*"));
+        let h = p.cors_headers(Some("https://x.com"));
+        assert!(h.contains("Access-Control-Allow-Origin: *"), "{h}");
+        assert!(!h.contains("Vary"), "wildcard needs no Vary: {h}");
+    }
+
+    #[test]
+    fn test_cors_headers_specific_origin_adds_vary() {
+        let p =
+            proxy_with(true, false, 100, "unused").with_cors(CorsPolicy::parse("https://ok.com"));
+        let h = p.cors_headers(Some("https://ok.com"));
+        assert!(
+            h.contains("Access-Control-Allow-Origin: https://ok.com"),
+            "{h}"
+        );
+        assert!(h.contains("Vary: Origin"), "{h}");
+        // Disallowed origin -> no header.
+        assert_eq!(p.cors_headers(Some("https://evil.com")), "");
+    }
+
+    #[test]
+    fn test_roundtrip_options_preflight() {
+        let p = proxy_with(true, false, 100, "unused").with_cors(CorsPolicy::parse("*"));
+        let req = "OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\nAccess-Control-Request-Method: POST\r\n\r\n";
+        let (status, _body) = roundtrip(p, req.to_string());
+        assert_eq!(status, 204);
+    }
+
+    #[test]
+    fn test_roundtrip_preflight_skips_auth() {
+        // Preflight carries no credentials, so it must not be 401'd even with auth on.
+        let p = proxy_with(true, false, 100, "unused")
+            .with_cors(CorsPolicy::parse("*"))
+            .with_auth_token(Some("k".to_string()));
+        let req = "OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\n\r\n";
+        let (status, _) = roundtrip(p, req.to_string());
+        assert_eq!(status, 204);
+    }
+
+    #[test]
+    fn test_roundtrip_cors_header_on_response() {
+        let p = proxy_with(true, false, 100, "unused").with_cors(CorsPolicy::parse("*"));
+        let req = "GET /v1/models HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\n\r\n";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            c.write_all(req.as_bytes()).unwrap();
+            c.shutdown(std::net::Shutdown::Write).ok();
+            let mut resp = String::new();
+            c.read_to_string(&mut resp).unwrap();
+            resp
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        p.handle_connection(&mut s).unwrap();
+        drop(s);
+        let resp = client.join().unwrap();
+        assert!(
+            resp.contains("Access-Control-Allow-Origin: *"),
+            "missing CORS header: {resp}"
+        );
     }
 
     #[test]
