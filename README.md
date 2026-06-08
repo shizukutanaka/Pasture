@@ -49,6 +49,7 @@ pasture models             # recommended local models for your machine
 pasture doctor             # check your setup and how to fix problems
 pasture eval               # measure routing accuracy + threshold sweep
 pasture stats              # summarize the cost log (routes, tokens, spend)
+pasture improvements       # show the self-improvement ledger (verified change history)
 ```
 
 Force a route with `--local` or `--cloud`. Enable cascade (answer locally, escalate to cloud only when the local answer is weak) with `PASTURE_CASCADE=1` (requires the `cloud` feature and a key). Enable an exact-match response cache with `PASTURE_CACHE=<size>` to avoid paying for repeated identical prompts. Set the listen address for the proxy with `--addr host:port`.
@@ -105,6 +106,12 @@ See **[COMPETITIVE.md](COMPETITIVE.md)** for how Pasture compares to peer tools
 (LiteLLM, RouteLLM, vLLM Semantic Router, GPTCache, Portkey, OpenRouter), the
 recent arXiv work behind its routing/cascade/cache design, and the prioritized
 improvement backlog.
+
+The verified change history is tracked as a machine-readable asset in
+**[IMPROVEMENTS.jsonl](IMPROVEMENTS.jsonl)** (`pasture improvements`).
+**[SELF_IMPROVEMENT.md](SELF_IMPROVEMENT.md)** explains the approach — why the
+durable asset is a verified improvement record, not the model — and what is
+deliberately out of scope.
 
 ## License
 

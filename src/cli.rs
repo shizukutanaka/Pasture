@@ -26,6 +26,7 @@ COMMANDS:
     serve                    Start the OpenAI-compatible proxy server
     eval                     Measure routing quality + token-threshold sweep
     stats                    Summarize the cost log (routes, tokens, spend)
+    improvements [path]      Show the self-improvement ledger (verified change history)
     config                   Print the effective configuration (no secrets)
     calibrate [--target R]   Recommend PASTURE_THRESHOLD from your logged usage (R=cloud rate, default 0.2)
     calibrate --logprob       Recommend PASTURE_CASCADE_LOGPROB from logged cascade confidence
@@ -248,6 +249,7 @@ pub fn run(args: &[String]) -> i32 {
             }
         },
         "calibrate" => run_calibrate(&config, rest),
+        "improvements" => run_improvements(positional(rest).first().copied()),
         "config" => run_config(&config),
         "donate" => {
             println!(
@@ -760,6 +762,40 @@ fn run_models(_config: &Config) -> i32 {
     println!("{}", t(lang, "models.mid"));
     println!("{}", t(lang, "models.multilingual"));
     println!("{}", t(lang, "models.note"));
+    0
+}
+
+/// `improvements [path]`: print the self-improvement ledger (IMP-13) — the
+/// verified causal record of every change. Defaults to `IMPROVEMENTS.jsonl`.
+fn run_improvements(path: Option<&str>) -> i32 {
+    let path = path.unwrap_or("IMPROVEMENTS.jsonl");
+    let items = match crate::improve::read_ledger(path) {
+        Ok(items) => items,
+        Err(e) => {
+            eprintln!("cannot read improvement ledger {path}: {e}");
+            return 1;
+        }
+    };
+    if items.is_empty() {
+        println!("no improvement ledger at {path} (run from the repo root)");
+        return 0;
+    }
+    let s = crate::improve::summarize(&items);
+    println!("Self-improvement ledger: {} ({} records)", path, s.total);
+    println!(
+        "  shipped: {}   deferred: {}   retired: {}",
+        s.shipped, s.deferred, s.retired
+    );
+    println!();
+    for it in &items {
+        println!("[{}] {} — {}", it.status.as_str(), it.id, it.title);
+        println!("    change: {}", it.change);
+        println!("    reason: {}", it.reason);
+        println!("    effect: {}", it.effect);
+        if !it.grounding.is_empty() {
+            println!("    grounding: {}", it.grounding);
+        }
+    }
     0
 }
 

@@ -221,6 +221,21 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-037 Self-improvement ledger (IMP-13).** Pasture's improvement history
+  lived only as human prose across `CHANGELOG.md`, this file, and `COMPETITIVE.md`.
+  Framed by the recursive-self-improvement argument that the durable asset is a
+  *verified improvement history* (Compression in `RSI = Search × Verification ×
+  Compression`) rather than the model, the history is now a machine-readable asset:
+  `IMPROVEMENTS.jsonl` records each change as a causal entry (change / reason /
+  effect / status / grounding), parsed by `src/improve.rs` with the crate's own
+  zero-dependency JSON reader and surfaced via `pasture improvements`. A
+  compile-time test (`include_str!` + validator) asserts every bundled entry parses
+  and is a valid, explainable improvement, so the record cannot rot silently — the
+  Verifier applied to the asset itself. Deliberately small and in-philosophy: one
+  data file, one std-only parser, one CLI surface, zero new dependencies. The
+  larger RSI vision (P2P compute, learned routers, evolution engines, self-
+  generating infra, content logging) is rejected as antithetical to I1–I5 / ADR-002
+  / ADR-004; see `SELF_IMPROVEMENT.md` for the full mapping and anti-goals.
 - **ADR-036 Privacy/PII detection hardening (10 categories).** The original 7-category
   classifier missed three common leakage vectors: PEM private keys pasted from key
   files, database/service URLs with embedded credentials (`postgres://user:pass@host`),

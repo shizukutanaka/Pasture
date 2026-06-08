@@ -5,6 +5,26 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — self-improvement ledger (IMP-13)
+
+- New **`IMPROVEMENTS.jsonl`**: a machine-readable, causal record of every change
+  (`change` / `reason` / `effect` / `status` / `grounding`), replacing prose
+  scattered across CHANGELOG/ARCHITECTURE/COMPETITIVE with a queryable asset.
+- New **`src/improve.rs`**: std-only parser/summarizer over the crate's own JSON
+  reader, with lifecycle statuses (`shipped`/`deferred`/`retired`).
+- New **`pasture improvements [path]`** command: summarize + list the verified
+  change history (counts by status; full causal record per entry).
+- A compile-time test (`include_str!` + validator) asserts the bundled ledger
+  parses and every entry is a valid, explainable improvement — the record is
+  CI-checked and cannot rot silently.
+- New **SELF_IMPROVEMENT.md**: honestly maps the recursive-self-improvement framing
+  (`RSI = Search × Verification × Compression`; the asset is verified history, not
+  the model) onto Pasture's existing mechanisms (cost log = Trace Store, `eval` =
+  Hidden Benchmark, `cargo test` = Verifier, IMP→ADR→code = Skill Compiler), and
+  lists the anti-goals rejected to protect I1–I5 / ADR-002 / ADR-004 (P2P compute,
+  learned routers, evolution engines, self-generating infra, content logging).
+- Grounded in ADR-037. Std-only, zero new dependencies.
+
 ### Added — Privacy/PII detection hardening (10 categories)
 
 Expanded `privacy.rs` from 7 to **10 detection categories** — all std-only, zero-dep:

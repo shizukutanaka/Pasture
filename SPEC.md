@@ -51,6 +51,7 @@ library only; the cloud (HTTPS/TLS) path is gated behind the optional `cloud` fe
 | `doctor` | diagnose setup and print fixes |
 | `eval` | routing accuracy + threshold sweep |
 | `stats` | summarize the cost log |
+| `improvements [path]` | print the self-improvement ledger (verified change history) |
 | `config` | print effective configuration |
 | `donate` / `refer` | monetization surfaces (links only) |
 | `version` / `help` | version / usage |

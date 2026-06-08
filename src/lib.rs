@@ -16,6 +16,7 @@ pub mod doctor;
 pub mod eval;
 pub mod hardware;
 pub mod i18n;
+pub mod improve;
 pub mod json;
 pub mod monetize;
 pub mod privacy;
