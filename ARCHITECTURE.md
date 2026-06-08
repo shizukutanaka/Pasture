@@ -221,6 +221,13 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-065 `/health` version field + 501 stubs for audio/images (IMP-health-version).**
+  `/health` now returns `{"status":"ok","version":"<ver>"}` using `concat!/env!` at
+  compile time so version is always correct. `POST /v1/audio/*` and
+  `POST /v1/images/*` return **501 Not Implemented** (not 404) with error type
+  `not_supported`, because 404 misleads SDK clients that call these endpoints
+  unconditionally. `route_allowed_methods` covers them (wrong method → 405).
+  Status reason table (`write_response`) gains 405, 415, 501 entries. 4 tests.
 - **ADR-064 `X-Response-Time` header (IMP-response-time).** Operators and SDK
   clients need per-request latency without parsing JSONL logs. `handle_connection`
   captures `std::time::Instant::now()` after request parsing; a `te()` closure

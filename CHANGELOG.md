@@ -5,6 +5,20 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Changed — `/health` now includes `version` field (IMP-health-version)
+
+- `GET /health` response body is now `{"status":"ok","version":"<ver>"}` (compile-time
+  constant via `env!("CARGO_PKG_VERSION")`). Scripts can detect version mismatches
+  without a separate version endpoint.
+
+### Added — 501 stubs for `/v1/audio` and `/v1/images` (IMP-health-version)
+
+- `POST /v1/audio/*` and `POST /v1/images/*` now return **501 Not Implemented**
+  instead of 404. Clients that probe these endpoints unconditionally get a clear
+  `not_supported` error rather than a confusing 404. Wrong method still returns 405
+  with `Allow: POST, OPTIONS`. Status reason table gains `405`, `415`, `501`
+  entries; 4 tests (ADR-065).
+
 ### Added — `X-Response-Time` response header (IMP-response-time)
 
 - Every HTTP response now includes `X-Response-Time: <N>ms`, measuring elapsed

@@ -286,6 +286,9 @@ impl Proxy {
             Some("GET, OPTIONS")
         } else if path.starts_with("/health") {
             Some("GET, HEAD")
+        } else if path.starts_with("/v1/audio") || path.starts_with("/v1/images") {
+            // Recognised but not implemented; allow POST so the 405 vs 501 distinction is correct.
+            Some("POST, OPTIONS")
         } else {
             None
         }
@@ -1180,12 +1183,33 @@ impl Proxy {
                 }
             } else if (method == "GET" || method == "HEAD") && path.starts_with("/health") {
                 // HEAD: identical headers to GET but no body (RFC 7231 §4.3.2).
-                const HEALTH_BODY: &str = "{\"status\":\"ok\"}";
+                // Include the version so health-check scripts can detect mismatched deploys.
+                const HEALTH_BODY: &str = concat!(
+                    "{\"status\":\"ok\",\"version\":\"",
+                    env!("CARGO_PKG_VERSION"),
+                    "\"}"
+                );
                 if method == "HEAD" {
                     write_head_response(stream, 200, HEALTH_BODY.len(), &te(), keep_alive)?;
                 } else {
                     write_response(stream, 200, HEALTH_BODY, &te(), keep_alive)?;
                 }
+            } else if method == "POST"
+                && (path.starts_with("/v1/audio") || path.starts_with("/v1/images"))
+            {
+                // Audio and image generation are not implemented in Pasture.
+                // Return 501 (not 404) so clients know the path is recognised but unsupported.
+                write_response(
+                    stream,
+                    501,
+                    &build_error_response(
+                        "audio and image endpoints are not supported by Pasture",
+                        "not_supported",
+                    ),
+                    &te(),
+                    false,
+                )?;
+                return Ok(());
             } else if let Some(allow) =
                 Self::route_allowed_methods(path.split('?').next().unwrap_or(&path))
             {
@@ -1988,9 +2012,12 @@ fn write_response(
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         408 => "Request Timeout",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         429 => "Too Many Requests",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Error",
@@ -2292,9 +2319,15 @@ mod tests {
                     .map(|v| v.trim().parse().unwrap_or(0))
             })
             .unwrap_or(0);
+        // Content-Length must match the actual GET body size, which now includes the version field.
+        let expected_body = concat!(
+            "{\"status\":\"ok\",\"version\":\"",
+            env!("CARGO_PKG_VERSION"),
+            "\"}"
+        );
         assert_eq!(
             clen,
-            "{\"status\":\"ok\"}".len(),
+            expected_body.len(),
             "Content-Length must match GET body"
         );
         // Body must be empty (headers end at first \r\n\r\n; nothing follows).
@@ -3091,6 +3124,43 @@ mod tests {
             header_block.to_ascii_lowercase().contains("x-response-time:"),
             "X-Response-Time missing from chat completions response:\n{raw}"
         );
+    }
+
+    // ── /health version field + /v1/audio|images 501 stubs ────────────────────
+
+    #[test]
+    fn test_health_includes_version() {
+        let p = proxy_with(true, false, 100, "unused");
+        let (status, body) = roundtrip(p, "GET /health HTTP/1.1\r\nConnection: close\r\n\r\n".to_string());
+        assert_eq!(status, 200);
+        assert!(body.contains("\"status\":\"ok\""), "missing status: {body}");
+        assert!(body.contains("\"version\":"), "missing version: {body}");
+        assert!(body.contains(env!("CARGO_PKG_VERSION")), "wrong version: {body}");
+    }
+
+    #[test]
+    fn test_audio_returns_501() {
+        let p = proxy_with(true, false, 100, "unused");
+        let raw = http_post("/v1/audio/speech", r#"{"model":"tts-1","input":"hi","voice":"alloy"}"#);
+        let (status, body) = roundtrip(p, raw);
+        assert_eq!(status, 501, "expected 501 for /v1/audio/speech, got {status}");
+        assert!(body.contains("not_supported"), "body: {body}");
+    }
+
+    #[test]
+    fn test_images_returns_501() {
+        let p = proxy_with(true, false, 100, "unused");
+        let raw = http_post("/v1/images/generations", r#"{"prompt":"a cat"}"#);
+        let (status, body) = roundtrip(p, raw);
+        assert_eq!(status, 501, "expected 501 for /v1/images/generations, got {status}");
+        assert!(body.contains("not_supported"), "body: {body}");
+    }
+
+    #[test]
+    fn test_audio_wrong_method_returns_405() {
+        let p = proxy_with(true, false, 100, "unused");
+        let (status, _) = roundtrip(p, "GET /v1/audio/speech HTTP/1.1\r\nConnection: close\r\n\r\n".to_string());
+        assert_eq!(status, 405, "expected 405 for GET /v1/audio, got {status}");
     }
 
     // ── Content-Type: application/json validation (IMP-content-type) ──────────
