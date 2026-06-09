@@ -289,11 +289,19 @@ pub fn looks_like_phone(token: &str) -> bool {
     has_hyphen && (10..=11).contains(&n)
 }
 
-/// Heuristic credential token: a known prefix and enough length.
+/// Heuristic credential token: a known prefix and enough length. Surrounding
+/// punctuation is stripped first so a key quoted in JSON or prose
+/// (`"sk-…"`, `(sk-…)`, `sk-…,`) is still detected — consistent with
+/// `looks_like_jwt`. Stripped characters are the JSON/prose delimiters that
+/// never appear inside a real token; `-` and `_` are preserved because they
+/// are valid in many prefixes (`ghp_`, `glpat-`, `xoxb-`).
 pub fn looks_like_api_key(token: &str) -> bool {
+    let t = token.trim_matches(|c: char| {
+        matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '`' | '<' | '>')
+    });
     KEY_PREFIXES
         .iter()
-        .any(|p| token.starts_with(p) && token.len() >= p.len() + 12)
+        .any(|p| t.starts_with(p) && t.len() >= p.len() + 12)
 }
 
 /// Heuristic JWT / bearer token: header.payload.signature where the header is
@@ -485,6 +493,26 @@ mod tests {
         assert!(classify("HUGGINGFACE_TOKEN=hf_abcdefghijklmnopqrstuvwxyz0123456")
             .categories
             .contains(&"env_secret"));
+    }
+
+    #[test]
+    fn test_api_key_with_surrounding_punctuation(){
+        // ADR-099: a key quoted in JSON or wrapped in prose punctuation must
+        // still be detected. Previously a leading quote/paren broke starts_with,
+        // letting a quoted credential leak to the cloud undetected.
+        assert!(looks_like_api_key("\"sk-abcdefghijklmnop1234\""));
+        assert!(looks_like_api_key("(sk-abcdefghijklmnop1234)"));
+        assert!(looks_like_api_key("`ghp_abcdefghijklmnop1234`"));
+        assert!(looks_like_api_key("<glpat-abcdefghijklmnop1234>"));
+        // classify() now flags a key quoted in prose (a whitespace-delimited
+        // token whose edges are punctuation).
+        assert!(classify(r#"my key is "sk-abcdefghijklmnop1234""#)
+            .categories
+            .contains(&"api_key"));
+        // A `-`/`_` inside a valid prefix is preserved (not trimmed as punctuation).
+        assert!(looks_like_api_key("ghp_abcdefghijklmnop1234"));
+        // No false positive on ordinary punctuated words.
+        assert!(!looks_like_api_key("(hello)"));
     }
 
     #[test]

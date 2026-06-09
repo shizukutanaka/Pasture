@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Quoted API keys are now detected by the privacy classifier (IMP-api-key-punctuation-strip)
+
+- `looks_like_api_key` checked `starts_with(prefix)` on the raw token, so a credential quoted in
+  prose or code (`my key is "sk-…"`, `(sk-…)`) had a leading quote/paren and was **not** flagged
+  as sensitive — making the prompt eligible for cloud routing (a privacy leak). The token is now
+  trimmed of surrounding punctuation before the check, matching `looks_like_jwt`. `-`/`_` inside
+  prefixes are preserved. 1 test. (ADR-099)
+
 ### Fixed — TTL-expired cache entries now removed from the FIFO order deque (IMP-cache-ttl-ghost-entries)
 
 - `ResponseCache::get()` removed TTL-expired entries from the map but not from the FIFO `order`

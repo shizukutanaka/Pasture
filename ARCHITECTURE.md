@@ -280,6 +280,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-099 Strip surrounding punctuation in `looks_like_api_key` so quoted credentials are detected (IMP-api-key-punctuation-strip).**
+  `looks_like_api_key` ran `starts_with(prefix)` on the raw whitespace-split token. A credential
+  quoted in prose or code — the common real form, e.g. `my key is "sk-…"` or `(sk-…)` — has a
+  leading quote/paren, so `starts_with("sk-")` was false and the prompt was **not** classified as
+  sensitive, making it eligible for cloud routing (an I2/I3 leak). The token is now trimmed of
+  JSON/prose delimiters (quotes, commas, parens, brackets, braces, backticks, angle brackets)
+  before the check, mirroring the existing `looks_like_jwt` precedent. `-`/`_` are preserved so
+  `ghp_`/`glpat-`/`xoxb-` still match. Std-only; 1 test.
 - **ADR-098 Remove TTL-expired entries from the FIFO order deque in `cache.get()` (IMP-cache-ttl-ghost-entries).**
   `get()` removed TTL-expired entries from `self.map` but not from `self.order` (the FIFO VecDeque).
   Ghost keys accumulated in the deque indefinitely — the map stayed bounded at `cap`, but `order`
