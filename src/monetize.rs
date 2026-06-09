@@ -49,6 +49,9 @@ pub fn provider(key: &str) -> Option<&'static Provider> {
 
 /// Resolve the configured referral URL for a provider key, using an injected
 /// resolver (e.g. one that reads `PASTURE_REF_<KEY>`). Testable without env.
+/// Returns `None` if the value is absent, blank, or not an HTTP/HTTPS URL
+/// (so a bare affiliate code like `PASTURE_REF_openrouter=mycode123` is
+/// treated as unconfigured rather than surfaced as a broken link).
 pub fn referral_url<F>(key: &str, resolver: F) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
@@ -56,10 +59,13 @@ where
     let url = resolver(key)?;
     let trimmed = url.trim();
     if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+        return None;
     }
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Decide whether to show a donation nudge on this run.
@@ -157,6 +163,20 @@ mod tests {
     fn test_referral_url_blank_is_none() {
         let r = referral_url("openrouter", |_| Some("   ".to_string()));
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn test_referral_url_non_http_scheme_is_none() {
+        // A bare affiliate code or non-URL value must not be surfaced as a link.
+        let r = referral_url("openrouter", |_| Some("mycode123".to_string()));
+        assert!(r.is_none(), "bare code should be None");
+        let r2 = referral_url("openrouter", |_| Some("ftp://example.com".to_string()));
+        assert!(r2.is_none(), "non-HTTP scheme should be None");
+        // HTTP and HTTPS are accepted.
+        let r3 = referral_url("openrouter", |_| Some("https://openrouter.ai/?ref=x".to_string()));
+        assert!(r3.is_some());
+        let r4 = referral_url("openrouter", |_| Some("http://openrouter.ai/?ref=x".to_string()));
+        assert!(r4.is_some());
     }
 
     #[test]

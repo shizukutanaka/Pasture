@@ -49,6 +49,10 @@ pub struct Config {
     /// TTL for cached responses in seconds (IMP-cache-ttl). 0 = no TTL (entries
     /// live until evicted by FIFO). Enabled via `PASTURE_CACHE_TTL`.
     pub cache_ttl_secs: u64,
+    /// Per-request read timeout for the local backend in seconds (IMP-local-timeout).
+    /// Default 120 s suits most single-GPU setups; raise for large models (70B+)
+    /// or lower to fail fast and trigger the cascade sooner.
+    pub local_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -83,6 +87,7 @@ impl Default for Config {
             system_prompt: String::new(),
             access_log: String::new(),
             cache_ttl_secs: 0,
+            local_timeout_secs: 120,
         }
     }
 }
@@ -137,8 +142,9 @@ impl Config {
             self.cost_log_path = v;
         }
         if let Ok(v) = std::env::var("PASTURE_DONATE_URL") {
-            if !v.trim().is_empty() {
-                self.donate_url = Some(v);
+            let trimmed = v.trim().to_string();
+            if !trimmed.is_empty() {
+                self.donate_url = Some(trimmed);
             }
         }
         if std::env::var("PASTURE_NO_NUDGE").is_ok() {
@@ -214,6 +220,11 @@ impl Config {
         if let Ok(v) = std::env::var("PASTURE_CACHE_TTL") {
             if let Ok(n) = v.parse() {
                 self.cache_ttl_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_LOCAL_TIMEOUT") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.local_timeout_secs = n;
             }
         }
         self
@@ -292,6 +303,11 @@ impl Config {
                     self.cache_ttl_secs = n;
                 }
             }
+            "local_timeout" => {
+                if let Ok(n) = val.parse::<u64>() {
+                    self.local_timeout_secs = n;
+                }
+            }
             _ => {}
         }
     }
@@ -334,6 +350,16 @@ mod tests {
         assert_eq!(Config::default().request_timeout_secs, 30);
         let cfg = Config::from_str_with_defaults("request_timeout = 5");
         assert_eq!(cfg.request_timeout_secs, 5);
+    }
+
+    #[test]
+    fn test_local_timeout_default_and_parse() {
+        assert_eq!(Config::default().local_timeout_secs, 120);
+        let cfg = Config::from_str_with_defaults("local_timeout = 300");
+        assert_eq!(cfg.local_timeout_secs, 300);
+        // Invalid value keeps the default.
+        let cfg2 = Config::from_str_with_defaults("local_timeout = notanumber");
+        assert_eq!(cfg2.local_timeout_secs, 120);
     }
 
     #[test]

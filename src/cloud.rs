@@ -411,11 +411,14 @@ fn dechunk(body: &str) -> String {
     out
 }
 
-/// Resolve the API key for a provider from the environment.
+/// Resolve the API key for a provider from the environment. The value is
+/// trimmed so keys set via `export KEY=$(cat file)` or shell substitution
+/// (which often append a trailing newline) still work correctly.
 pub fn api_key_from_env(provider: Provider) -> Option<String> {
     std::env::var(provider.env_key())
         .ok()
-        .filter(|k| !k.trim().is_empty())
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
 }
 
 #[cfg(feature = "cloud")]
@@ -811,5 +814,27 @@ data: {\"type\":\"message_stop\"}\n\n";
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n";
         let (_, body) = parse_http_response(raw).unwrap();
         assert_eq!(body, "hello world");
+    }
+
+    #[test]
+    fn test_api_key_from_env_trims_whitespace() {
+        // api_key_from_env must strip surrounding whitespace so keys written via
+        // `export KEY=$(cat file)` (which appends a newline) still work.
+        std::env::set_var("PASTURE_OPENAI_API_KEY", "sk-test\n");
+        let k = api_key_from_env(Provider::OpenAI).unwrap();
+        assert_eq!(k, "sk-test", "trailing newline should be trimmed");
+        std::env::remove_var("PASTURE_OPENAI_API_KEY");
+
+        std::env::set_var("PASTURE_OPENAI_API_KEY", "  sk-padded  ");
+        let k2 = api_key_from_env(Provider::OpenAI).unwrap();
+        assert_eq!(k2, "sk-padded", "surrounding spaces should be trimmed");
+        std::env::remove_var("PASTURE_OPENAI_API_KEY");
+
+        std::env::set_var("PASTURE_ANTHROPIC_API_KEY", "   \n  ");
+        assert!(
+            api_key_from_env(Provider::Anthropic).is_none(),
+            "all-whitespace key should be None after trimming"
+        );
+        std::env::remove_var("PASTURE_ANTHROPIC_API_KEY");
     }
 }

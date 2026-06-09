@@ -5,6 +5,29 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Configurable local backend timeout (`PASTURE_LOCAL_TIMEOUT`) (IMP-local-timeout)
+
+- Set `PASTURE_LOCAL_TIMEOUT=<secs>` (or `local_timeout = <secs>` in the config file)
+  to control how long the proxy waits for the local model before treating it as a
+  Transport error. Default 120 s is unchanged; raise for 70B+ models on slow CPU
+  (`local_timeout = 600`); lower to fail fast and trigger the cascade sooner.
+  Both Ollama and OpenAI-compatible backends (LM Studio / vLLM / llama.cpp) respect
+  the setting. 1 test (ADR-084).
+
+### Fixed — API key trailing-whitespace strips before auth headers (IMP-api-key-trim)
+
+- API keys set via `export KEY=$(cat ~/.api_key)` or shell substitution (which appends
+  a trailing newline) were passed verbatim into `Authorization` / `x-api-key` headers,
+  causing silent 401 failures. Keys are now trimmed before use. `PASTURE_DONATE_URL`
+  was fixed by the same pattern. 3 tests (ADR-082).
+
+### Fixed — Non-HTTP referral URLs rejected in `pasture refer` (IMP-referral-url-scheme)
+
+- A bare affiliate code like `PASTURE_REF_openrouter=mycode123` was displayed as a
+  clickable link instead of being treated as unconfigured. `referral_url` now requires
+  an `http://` or `https://` prefix; non-URL values fall back to the provider's
+  homepage. 2 tests (ADR-083).
+
 ### Changed — More reasoning/format routing markers (IMP-routing-markers)
 
 - The router now escalates more genuinely-hard short prompts to the strong model:

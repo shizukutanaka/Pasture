@@ -360,14 +360,16 @@ pub struct OllamaBackend {
     host: String,
     port: u16,
     model: String,
+    timeout: Duration,
 }
 
 impl OllamaBackend {
-    pub fn new(host: &str, port: u16, model: &str) -> Self {
+    pub fn new(host: &str, port: u16, model: &str, timeout: Duration) -> Self {
         Self {
             host: host.to_string(),
             port,
             model: model.to_string(),
+            timeout,
         }
     }
 
@@ -425,7 +427,7 @@ impl Backend for OllamaBackend {
             self.port,
             "/api/chat",
             &body,
-            Duration::from_secs(120),
+            self.timeout,
         )?;
         let content = Self::parse_response(&response)?;
         let prompt_tokens = crate::routing::estimate_tokens(&req.routing_text()) as u64;
@@ -450,7 +452,7 @@ impl Backend for OllamaBackend {
             self.port,
             "/api/chat",
             &body,
-            Duration::from_secs(120),
+            self.timeout,
             &mut |line| {
                 if let Some(OllamaStreamEvent::Delta(d)) = parse_ollama_stream_line(line) {
                     content.push_str(&d);
@@ -479,7 +481,7 @@ impl Backend for OllamaBackend {
             self.port,
             "/api/embed",
             &body,
-            Duration::from_secs(120),
+            self.timeout,
         )?;
         let v = parse(&resp).map_err(|e| BackendError::Protocol(e.to_string()))?;
         let vectors: Vec<Vec<f64>> = v
@@ -541,15 +543,17 @@ pub struct OpenAiCompatBackend {
     port: u16,
     path: String,
     model: String,
+    timeout: Duration,
 }
 
 impl OpenAiCompatBackend {
-    pub fn new(host: &str, port: u16, path: &str, model: &str) -> Self {
+    pub fn new(host: &str, port: u16, path: &str, model: &str, timeout: Duration) -> Self {
         Self {
             host: host.to_string(),
             port,
             path: path.to_string(),
             model: model.to_string(),
+            timeout,
         }
     }
 }
@@ -568,7 +572,7 @@ impl Backend for OpenAiCompatBackend {
             self.port,
             &self.path,
             &body,
-            Duration::from_secs(120),
+            self.timeout,
         )?;
         let (content, prompt_tokens, completion_tokens) =
             Provider::OpenAI.parse_response(&resp_body)?;
@@ -592,7 +596,7 @@ impl Backend for OpenAiCompatBackend {
             self.port,
             &self.path,
             &body,
-            Duration::from_secs(120),
+            self.timeout,
         )?;
         let (content, prompt_tokens, completion_tokens) =
             Provider::OpenAI.parse_response(&resp_body)?;
@@ -622,7 +626,7 @@ impl Backend for OpenAiCompatBackend {
             self.port,
             &self.path,
             &body,
-            Duration::from_secs(120),
+            self.timeout,
             &mut |line| {
                 if let Some(crate::cloud::OpenAiStreamEvent::Delta(d)) =
                     crate::cloud::parse_openai_stream_line(line)
@@ -654,7 +658,7 @@ impl Backend for OpenAiCompatBackend {
             self.port,
             &path,
             &body,
-            Duration::from_secs(120),
+            self.timeout,
         )?;
         let v = parse(&resp).map_err(|e| BackendError::Protocol(e.to_string()))?;
         if let Some(err) = v.get("error") {

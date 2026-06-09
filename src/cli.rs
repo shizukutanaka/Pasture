@@ -1053,6 +1053,7 @@ fn local_is_openai(config: &Config) -> bool {
 
 /// Build the local backend (Ollama or an OpenAI-compatible server like LM Studio).
 fn make_local_backend(config: &Config) -> Box<dyn Backend> {
+    let timeout = std::time::Duration::from_secs(config.local_timeout_secs);
     if local_is_openai(config) {
         let (host, port, base) = crate::doctor::parse_base_url(&config.local_openai_url);
         let path = format!("{base}/chat/completions");
@@ -1061,12 +1062,14 @@ fn make_local_backend(config: &Config) -> Box<dyn Backend> {
             port,
             &path,
             &config.local_model,
+            timeout,
         ))
     } else {
         Box::new(OllamaBackend::new(
             &config.ollama_host,
             config.ollama_port,
             &config.local_model,
+            timeout,
         ))
     }
 }

@@ -221,6 +221,31 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-084 Configurable local backend timeout (IMP-local-timeout).** The 120 s
+  hardcoded read timeout for local inference calls (Ollama, LM Studio, vLLM) served
+  all model sizes equally poorly: a 70B model on a slow CPU can take several minutes
+  per token, while a 7B model on a fast GPU should fail within 10–30 s so the cascade
+  can escalate. `Config` gains `local_timeout_secs` (default 120); the value is exposed
+  as `PASTURE_LOCAL_TIMEOUT` env var and `local_timeout =` config key.
+  `OllamaBackend` and `OpenAiCompatBackend` store the timeout as a `Duration` field
+  set at construction time; `make_local_backend` forwards the config value.
+  All `http_post` and `http_post_streaming` calls now use `self.timeout` — no hardcoded
+  constant remains. Existing deployments see no behaviour change (default preserved).
+  Std-only; 1 test.
+- **ADR-083 Reject non-HTTP referral URLs (IMP-referral-url-scheme).** A misconfigured
+  `PASTURE_REF_<KEY>` like `mycode123` (a bare affiliate code, not a URL) was silently
+  treated as a configured referral URL and displayed verbatim in `pasture refer` output,
+  producing a non-navigable link. `referral_url` now validates the scheme after trimming:
+  `None` unless the value starts with `http://` or `https://` (case-folded).
+  FTP and other schemes are also rejected. Matches the existing blank-guard contract and
+  the `donate_url` validation pattern. Std-only; 2 tests.
+- **ADR-082 Trim API key and donate URL env vars (IMP-api-key-trim).** `api_key_from_env`
+  checked `!k.trim().is_empty()` but returned the raw untrimmed value, so a key set via
+  `export KEY=$(cat ~/.api_key)` — a common pattern that appends a trailing newline —
+  embedded whitespace in `Authorization`/`x-api-key` HTTP headers, causing silent 401
+  auth failures. `PASTURE_DONATE_URL` had the same pattern. Both now `.trim()` the value
+  before storing or returning it. Zero behaviour change for keys without surrounding
+  whitespace. Std-only; 3 tests.
 - **ADR-081 More reasoning/format hard-signal markers (IMP-routing-markers).**
   Genuinely hard but short prompts (`write a unit test for foo`, `walk me through
   the proof`, `give me a bash script`) were under-routed to the weak local model:
