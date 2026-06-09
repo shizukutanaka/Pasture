@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — `PASTURE_AUTH_TOKEN` env var now trimmed, fixing 401 on all valid auth requests (IMP-auth-token-trim)
+
+- A bearer token set via `PASTURE_AUTH_TOKEN=$(cat ~/.token)` includes a trailing newline.
+  `proxy.rs` `auth_ok()` trims the client's bearer token from the `Authorization` header
+  but compared against the untrimmed stored token — `constant_time_eq` failed on the length
+  mismatch and rejected all valid requests with 401. The env var value is now trimmed before
+  storing. Same root cause as ADR-082 (API key trim). Config-file path was already safe.
+  1 test. (ADR-094)
+
 ### Fixed — `PASTURE_ALLOW_SENSITIVE_CLOUD=false` no longer silently enables cloud routing of PII (IMP-bool-env-var-value-check)
 
 - `PASTURE_ALLOW_SENSITIVE_CLOUD`, `PASTURE_NO_NUDGE`, `PASTURE_CASCADE`,

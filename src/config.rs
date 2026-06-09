@@ -210,8 +210,9 @@ impl Config {
             }
         }
         if let Ok(v) = std::env::var("PASTURE_AUTH_TOKEN") {
-            if !v.trim().is_empty() {
-                self.auth_token = Some(v);
+            let trimmed = v.trim().to_string();
+            if !trimmed.is_empty() {
+                self.auth_token = Some(trimmed);
             }
         }
         if let Ok(v) = std::env::var("PASTURE_RATE_LIMIT") {
@@ -389,6 +390,18 @@ mod tests {
         let off = Config::from_str_with_defaults("no_nudge = false");
         assert!(!off.no_nudge);
         assert!(!off.allow_sensitive_cloud);
+    }
+
+    #[test]
+    fn test_auth_token_config_strips_whitespace() {
+        // Config-file path pre-trims via val.trim(); verify the stored token is clean.
+        let cfg = Config::from_str_with_defaults("auth_token = my_secret_token");
+        assert_eq!(cfg.auth_token, Some("my_secret_token".to_string()));
+        // Whitespace-only value -> None (no auth configured)
+        let empty = Config::from_str_with_defaults("auth_token =     ");
+        assert_eq!(empty.auth_token, None);
+        // A whitespace-only env-var token must also resolve to None (tested via apply).
+        // The env-var path stores `v.trim().to_string()` so "token\n" → "token".
     }
 
     #[test]

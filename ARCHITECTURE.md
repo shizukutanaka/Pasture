@@ -280,6 +280,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-094 Trim `PASTURE_AUTH_TOKEN` env var before storing (IMP-auth-token-trim).**
+  `auth_ok()` in `proxy.rs` trims the client's bearer token from the `Authorization` header
+  before comparing (`h.strip_prefix("Bearer ").trim()`), but compared against the stored
+  `expected` value which was not trimmed. A token set via
+  `PASTURE_AUTH_TOKEN=$(cat ~/.token)` (common pattern, appends a trailing `\n`) was stored
+  with the `\n`; `constant_time_eq` returned false on the length mismatch, rejecting all
+  valid auth requests with 401. Same root cause as ADR-082 (API key trim). The config-file
+  `apply()` path was already safe (`val.trim()` before `apply()`). Std-only; 1 test.
 - **ADR-093 Boolean env vars require truthy value, not mere presence (IMP-bool-env-var-value-check).**
   `with_env()` used `std::env::var(...).is_ok()` for five flags: `PASTURE_NO_NUDGE`,
   `PASTURE_ALLOW_SENSITIVE_CLOUD`, `PASTURE_CASCADE`, `PASTURE_LOCAL_ONLY`,
