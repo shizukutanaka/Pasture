@@ -1098,8 +1098,21 @@ impl Proxy {
                     Some(secs) => format!("Retry-After: {secs}\r\n{}", te()),
                     None => te(),
                 };
+                // Populate OpenAI's error `code` where it is unambiguous so SDK
+                // retry/branch logic keyed on it works (rate-limit / auth).
+                let code = match status {
+                    429 => Some("rate_limit_exceeded"),
+                    401 => Some("invalid_api_key"),
+                    _ => None,
+                };
                 access_log!(status);
-                write_response(stream, status, &build_error_response(msg, kind), &gate_extra, false)?;
+                write_response(
+                    stream,
+                    status,
+                    &build_error_response_coded(msg, kind, code),
+                    &gate_extra,
+                    false,
+                )?;
                 return Ok(());
             }
             // 415 Unsupported Media Type: POST requests must carry JSON bodies.
@@ -1515,10 +1528,25 @@ fn inject_context_into(req: &CompletionRequest) -> CompletionRequest {
 /// Build an OpenAI-compatible error body: `{"error":{"message":..,"type":..}}`
 /// (SPEC §3.5). Both fields are JSON-escaped.
 pub fn build_error_response(message: &str, kind: &str) -> String {
+    build_error_response_coded(message, kind, None)
+}
+
+/// OpenAI-shape error envelope including the optional `code` field. OpenAI always
+/// includes `param` and `code` keys (null when unknown); strict SDK deserializers
+/// (openai-python `APIError.param`/`.code`, LiteLLM) read them, so they are always
+/// emitted. `param` is null here — our call sites rarely know the offending field —
+/// while `code` is populated for the cases where it is unambiguous (e.g. a
+/// rate-limit or auth rejection).
+pub fn build_error_response_coded(message: &str, kind: &str, code: Option<&str>) -> String {
+    let code_field = match code {
+        Some(c) => format!("\"{}\"", escape_string(c)),
+        None => "null".to_string(),
+    };
     format!(
-        "{{\"error\":{{\"message\":\"{}\",\"type\":\"{}\"}}}}",
+        "{{\"error\":{{\"message\":\"{}\",\"type\":\"{}\",\"param\":null,\"code\":{}}}}}",
         escape_string(message),
         escape_string(kind),
+        code_field,
     )
 }
 
@@ -2466,11 +2494,51 @@ mod tests {
 
     #[test]
     fn test_build_error_response_envelope() {
-        // SPEC §3.5: nested {"error":{"message","type"}}, escaped.
+        // SPEC §3.5: nested {"error":{"message","type","param","code"}}, escaped.
+        // param/code always present (null when unknown) for OpenAI SDK parity.
         let body = build_error_response("bad \"thing\"", "invalid_request_error");
         assert_eq!(
             body,
-            "{\"error\":{\"message\":\"bad \\\"thing\\\"\",\"type\":\"invalid_request_error\"}}"
+            "{\"error\":{\"message\":\"bad \\\"thing\\\"\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}"
+        );
+        // Round-trips as valid JSON with the expected keys.
+        let v = crate::json::parse(&body).unwrap();
+        let err = v.get("error").unwrap();
+        assert!(err.get("param").is_some());
+        assert!(err.get("code").is_some());
+    }
+
+    #[test]
+    fn test_build_error_response_coded_emits_code() {
+        let body = build_error_response_coded("nope", "rate_limit_error", Some("rate_limit_exceeded"));
+        assert!(body.contains("\"code\":\"rate_limit_exceeded\""), "{body}");
+        assert!(body.contains("\"param\":null"), "{body}");
+    }
+
+    #[test]
+    fn test_roundtrip_429_error_code_is_rate_limit_exceeded() {
+        let p = proxy_with(true, false, 100, "unused").with_rate_limit(1);
+        let raw = "GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n\
+                   GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n"
+            .to_string();
+        let resp = roundtrip_raw(p, raw);
+        assert!(
+            resp.contains("\"code\":\"rate_limit_exceeded\""),
+            "429 body missing rate_limit_exceeded code: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_401_error_code_is_invalid_api_key() {
+        let p = proxy_with(true, false, 100, "unused").with_auth_token(Some("s3cret".to_string()));
+        let resp = roundtrip_raw(
+            p,
+            "GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_string(),
+        );
+        assert!(resp.contains("401"), "expected 401: {resp}");
+        assert!(
+            resp.contains("\"code\":\"invalid_api_key\""),
+            "401 body missing invalid_api_key code: {resp}"
         );
     }
 

@@ -221,6 +221,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-074 OpenAI error envelope `param`/`code` fields (IMP-error-envelope-fields).**
+  OpenAI's error object always includes `param` and `code` keys (null when unknown);
+  strict SDK deserializers (`openai-python` `APIError.param`/`.code`, LiteLLM) read
+  them, and SDK retry/branch logic keys on `code`. Pasture emitted only
+  `{message,type}`, breaking strict clients and dropping the rate-limit/auth signal.
+  `build_error_response` now emits `param:null,code:null` on every error body; a new
+  `build_error_response_coded(message,type,code)` helper populates `code` where it is
+  unambiguous, and the rate-limit/auth gate sets `rate_limit_exceeded` (429) and
+  `invalid_api_key` (401). Purely additive — no routing or security *decision*
+  changes, only the error body shape (the ledger entry carries an explicit
+  `risk:low` because the gate's keyword inference flags the literal "api key"/"auth"
+  in the code strings as a false positive). Std-only; 4 tests.
 - **ADR-073 Generate `X-Request-ID` when the client omits one (IMP-request-id-gen).**
   OpenAI and LiteLLM return an `x-request-id` on *every* response — minted
   server-side when the caller doesn't supply one — so every call is traceable.

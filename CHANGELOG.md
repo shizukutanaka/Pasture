@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Changed — Error responses now include OpenAI `param`/`code` fields (IMP-error-envelope-fields)
+
+- Every error body is now full OpenAI shape `{"error":{"message","type","param","code"}}`
+  (`param`/`code` null when unknown) instead of `{message,type}` only, so strict SDK
+  deserializers no longer fail. Rate-limit `429` responses carry
+  `"code":"rate_limit_exceeded"` and auth `401` responses `"code":"invalid_api_key"`
+  so SDK retry/branch logic works. Purely additive (no decision changed). Std-only;
+  4 tests (ADR-074).
+
 ### Changed — `X-Request-ID` now present on every response (IMP-request-id-gen)
 
 - When the client does not send an `X-Request-ID`, Pasture now mints a unique
