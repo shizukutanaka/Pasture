@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Changed — More reasoning/format routing markers (IMP-routing-markers)
+
+- The router now escalates more genuinely-hard short prompts to the strong model:
+  added `chain-of-thought` / `show your work` / `show your reasoning` /
+  `walk me through` / `理由を説明` (reasoning) and `as xml` / `csv format` /
+  `write a test` / `unit test` / `shell script` / `bash script` / `dockerfile` /
+  `単体テスト` (format). Markers are specific to avoid false escalations; the curated
+  18-case routing regression still scores 100%. 1 test (ADR-081).
+
 ### Added — `--json` output for `eval` and `stats` (IMP-cli-json-output)
 
 - `pasture eval --json` prints `{total,correct,accuracy,cloud_rate,…,threshold}` and

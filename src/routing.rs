@@ -106,6 +106,10 @@ const REASONING_MARKERS: &[&str] = &[
     "reason through",
     "think through",
     "chain of thought",
+    "chain-of-thought",
+    "show your work",
+    "show your reasoning",
+    "walk me through",
     "prove that",
     "derive",
     "explain why",
@@ -116,6 +120,7 @@ const REASONING_MARKERS: &[&str] = &[
     "なぜ",
     "段階的",
     "推論",
+    "理由を説明",
 ];
 
 /// Strict-format / code-generation requests that reward a stronger model.
@@ -124,6 +129,8 @@ const FORMAT_MARKERS: &[&str] = &[
     "in json",
     "valid json",
     "json format",
+    "as xml",
+    "csv format",
     "markdown table",
     "regex",
     "sql query",
@@ -133,11 +140,17 @@ const FORMAT_MARKERS: &[&str] = &[
     "implement a",
     "write code",
     "write a program",
+    "write a test",
+    "unit test",
+    "shell script",
+    "bash script",
+    "dockerfile",
     "json形式",
     "表形式",
     "正規表現",
     "関数を実装",
     "コードを書",
+    "単体テスト",
 ];
 
 /// Characters that, in density, suggest a mathematical / formal query.
@@ -612,6 +625,21 @@ mod tests {
     fn test_hard_signals_strict_format() {
         assert!(hard_signals("return the answer as JSON").contains(&"format"));
         assert!(hard_signals("write a function to sort").contains(&"format"));
+    }
+
+    #[test]
+    fn test_hard_signals_added_markers_escalate() {
+        // Strong, specific task markers added to lift genuinely-hard short prompts
+        // that the length threshold alone would route local (IMP-4 continuation).
+        assert!(hard_signals("show your work for this").contains(&"reasoning"));
+        assert!(hard_signals("walk me through the proof").contains(&"reasoning"));
+        assert!(hard_signals("理由を説明してください").contains(&"reasoning"));
+        assert!(hard_signals("write a unit test for foo").contains(&"format"));
+        assert!(hard_signals("give me a bash script").contains(&"format"));
+        assert!(hard_signals("write a Dockerfile").contains(&"format"));
+        assert!(hard_signals("output as XML").contains(&"format"));
+        // A plain factual prompt is still untouched (no false escalation).
+        assert!(hard_signals("what time is it in Tokyo").is_empty());
     }
 
     #[test]

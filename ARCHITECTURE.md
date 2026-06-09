@@ -221,6 +221,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-081 More reasoning/format hard-signal markers (IMP-routing-markers).**
+  Genuinely hard but short prompts (`write a unit test for foo`, `walk me through
+  the proof`, `give me a bash script`) were under-routed to the weak local model:
+  they fell below the length threshold and matched no existing marker — the same
+  under-routing IMP-4 set out to fix. Added strong, *specific* markers to
+  `REASONING_MARKERS` (`chain-of-thought`, `show your work`, `show your reasoning`,
+  `walk me through`, `理由を説明`) and `FORMAT_MARKERS` (`as xml`, `csv format`,
+  `write a test`, `unit test`, `shell script`, `bash script`, `dockerfile`,
+  `単体テスト`). The markers are specific enough to avoid broad false escalations,
+  and the change is **verified eval-safe** — the curated 18-case regression still
+  scores 100% because no Local case matches a new marker. Std-only; 1 test.
 - **ADR-080 Machine-readable `--json` for `eval` / `stats` (IMP-cli-json-output).**
   `eval` and `stats` were human-text only, so CI pipelines and dashboards had to
   scrape prose to gate on routing accuracy or cloud spend. `EvalReport::to_json`
