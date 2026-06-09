@@ -145,6 +145,28 @@ impl CostSummary {
             self.cache as f64 / self.total as f64
         }
     }
+
+    /// Machine-readable summary for `pasture stats --json` (CI / dashboards).
+    /// `cloud_cost_usd` is guaranteed finite by `summarize`.
+    pub fn to_json(&self) -> String {
+        let cost = if self.cloud_cost_usd.is_finite() {
+            self.cloud_cost_usd
+        } else {
+            0.0
+        };
+        format!(
+            "{{\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\"cloud_rate\":{:.6},\"cache_rate\":{:.6},\"prompt_tokens\":{},\"completion_tokens\":{},\"cloud_cost_usd\":{:.6}}}",
+            self.total,
+            self.local,
+            self.cloud,
+            self.cache,
+            self.cloud_rate(),
+            self.cache_rate(),
+            self.prompt_tokens,
+            self.completion_tokens,
+            cost
+        )
+    }
 }
 
 /// Summarise parsed records by route, tokens, and spend.
@@ -376,6 +398,41 @@ mod tests {
         assert!((st.mean - (-0.55)).abs() < 1e-9, "{}", st.mean);
         assert!((st.min - (-1.0)).abs() < 1e-9);
         assert!(st.p10 <= st.median);
+    }
+
+    #[test]
+    fn test_summary_to_json_roundtrips() {
+        let recs = vec![
+            LoggedRecord {
+                route: "cloud".into(),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cost_usd: 0.0125,
+                logprob: None,
+            },
+            LoggedRecord {
+                route: "local".into(),
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cost_usd: 0.0,
+                logprob: None,
+            },
+        ];
+        let json = summarize(&recs).to_json();
+        let v = crate::json::parse(&json).expect("stats --json must be valid JSON");
+        assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(2.0));
+        assert_eq!(v.get("cloud").and_then(|x| x.as_f64()), Some(1.0));
+        assert_eq!(v.get("prompt_tokens").and_then(|x| x.as_f64()), Some(110.0));
+        assert!((v.get("cloud_rate").and_then(|x| x.as_f64()).unwrap() - 0.5).abs() < 1e-9);
+        assert!((v.get("cloud_cost_usd").and_then(|x| x.as_f64()).unwrap() - 0.0125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_summary_to_json_empty_is_valid() {
+        let json = summarize(&[]).to_json();
+        let v = crate::json::parse(&json).expect("empty stats --json must be valid JSON");
+        assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(0.0));
+        assert_eq!(v.get("cloud_rate").and_then(|x| x.as_f64()), Some(0.0));
     }
 
     #[test]

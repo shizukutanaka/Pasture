@@ -43,6 +43,21 @@ impl EvalReport {
             self.cloud_count as f64 / self.total as f64
         }
     }
+
+    /// Machine-readable summary for `pasture eval --json` (CI / scripting).
+    pub fn to_json(&self, threshold: usize) -> String {
+        format!(
+            "{{\"total\":{},\"correct\":{},\"accuracy\":{:.6},\"cloud_count\":{},\"cloud_rate\":{:.6},\"false_escalations\":{},\"missed_escalations\":{},\"threshold\":{}}}",
+            self.total,
+            self.correct,
+            self.accuracy(),
+            self.cloud_count,
+            self.cloud_rate(),
+            self.false_escalations,
+            self.missed_escalations,
+            threshold
+        )
+    }
 }
 
 /// Run the engine over labelled cases and tally correctness. Sensitivity is
@@ -301,6 +316,24 @@ mod tests {
             "expected 100% accuracy, got {}/{} (false_esc={}, missed_esc={})",
             report.correct, report.total, report.false_escalations, report.missed_escalations
         );
+    }
+
+    #[test]
+    fn test_report_to_json_roundtrips() {
+        let r = EvalReport {
+            total: 18,
+            correct: 18,
+            cloud_count: 7,
+            false_escalations: 0,
+            missed_escalations: 0,
+        };
+        let json = r.to_json(300);
+        let v = crate::json::parse(&json).expect("eval --json must be valid JSON");
+        assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(18.0));
+        assert_eq!(v.get("correct").and_then(|x| x.as_f64()), Some(18.0));
+        assert_eq!(v.get("threshold").and_then(|x| x.as_f64()), Some(300.0));
+        assert_eq!(v.get("missed_escalations").and_then(|x| x.as_f64()), Some(0.0));
+        assert!((v.get("accuracy").and_then(|x| x.as_f64()).unwrap() - 1.0).abs() < 1e-9);
     }
 
     #[test]

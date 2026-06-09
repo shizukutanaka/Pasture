@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `--json` output for `eval` and `stats` (IMP-cli-json-output)
+
+- `pasture eval --json` prints `{total,correct,accuracy,cloud_rate,…,threshold}` and
+  `pasture stats --json` prints the cost aggregates as compact JSON, for CI gating and
+  dashboards (pipe to `jq`). `stats --json` emits valid zero-filled JSON even with no
+  log. Human output is unchanged without the flag. 4 tests (ADR-080).
+
 ### Fixed — Parse UTF-16 surrogate-pair `\u` escapes / emoji (IMP-json-surrogate-pairs)
 
 - The JSON parser now combines surrogate-pair escapes like `😀` into the

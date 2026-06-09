@@ -221,6 +221,15 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-080 Machine-readable `--json` for `eval` / `stats` (IMP-cli-json-output).**
+  `eval` and `stats` were human-text only, so CI pipelines and dashboards had to
+  scrape prose to gate on routing accuracy or cloud spend. `EvalReport::to_json`
+  and `CostSummary::to_json` build compact, parser-validated JSON; `pasture eval
+  --json` emits `{total,correct,accuracy,cloud_rate,false/missed_escalations,
+  threshold}` and `pasture stats --json` the cost aggregates (zeros — still valid
+  JSON — when the log is empty). Human output is unchanged without the flag. The
+  builders are pure and unit-tested by round-tripping through the in-tree JSON
+  parser. Std-only; 4 tests.
 - **ADR-079 `Server` response header (IMP-server-header).** nginx, LiteLLM and
   Ollama all identify themselves with a `Server` header; Pasture sent none, so
   proxies/clients/debuggers could not identify the software or detect its version.

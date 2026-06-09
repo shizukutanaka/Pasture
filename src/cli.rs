@@ -24,8 +24,8 @@ COMMANDS:
     route <text>             Dry-run: show where a prompt would be routed
     chat  <text>             Send one prompt through the router (needs Ollama)
     serve                    Start the OpenAI-compatible proxy server
-    eval [--external <file>] Measure routing quality + token-threshold sweep
-    stats                    Summarize the cost log (routes, tokens, spend)
+    eval [--external <file>] Measure routing quality + token-threshold sweep (--json for machine output)
+    stats [--json]           Summarize the cost log (routes, tokens, spend)
     improvements [path]      Show the self-improvement ledger (verified change history)
     improvements --review    Show only entries the machine gate cannot auto-approve
     config                   Print the effective configuration (no secrets)
@@ -217,6 +217,10 @@ pub fn run(args: &[String]) -> i32 {
                 return 0;
             }
             let report = crate::eval::run_eval(&engine, &crate::eval::default_cases());
+            if rest.iter().any(|a| a == "--json") {
+                println!("{}", report.to_json(engine.threshold()));
+                return 0;
+            }
             println!(
                 "Routing eval ({} cases, threshold {}):",
                 report.total,
@@ -248,6 +252,11 @@ pub fn run(args: &[String]) -> i32 {
         "stats" => match crate::cost::read_log(&config.cost_log_path) {
             Ok(recs) => {
                 let s = crate::cost::summarize(&recs);
+                if rest.iter().any(|a| a == "--json") {
+                    // Always valid JSON (zeros when the log is empty) for scripting.
+                    println!("{}", s.to_json());
+                    return 0;
+                }
                 if s.total == 0 {
                     println!(
                         "no cost log yet at {} (run some requests first)",
