@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — `http_post` write timeout prevents indefinite block on overloaded backend (IMP-backend-write-timeout)
+
+- `http_post` and `http_post_streaming` set a read timeout but no write timeout. A very large
+  prompt sent to a heavily loaded local backend could fill the kernel socket buffer and block
+  `write_all` indefinitely, pinning a worker thread. Both now also set a write timeout equal to
+  `PASTURE_LOCAL_TIMEOUT` (default 120 s), returning `Transport` error if the write stalls.
+  (ADR-095)
+
 ### Fixed — `PASTURE_AUTH_TOKEN` env var now trimmed, fixing 401 on all valid auth requests (IMP-auth-token-trim)
 
 - A bearer token set via `PASTURE_AUTH_TOKEN=$(cat ~/.token)` includes a trailing newline.

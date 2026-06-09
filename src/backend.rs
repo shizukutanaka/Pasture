@@ -704,6 +704,9 @@ fn http_post(
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| BackendError::Transport(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| BackendError::Transport(e.to_string()))?;
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -741,6 +744,9 @@ fn http_post_streaming(
         .map_err(|e| BackendError::Transport(format!("connect {addr}: {e}")))?;
     stream
         .set_read_timeout(Some(timeout))
+        .map_err(|e| BackendError::Transport(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
         .map_err(|e| BackendError::Transport(e.to_string()))?;
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

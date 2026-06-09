@@ -280,6 +280,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-095 Add write timeout to `http_post` and `http_post_streaming` (IMP-backend-write-timeout).**
+  Both functions set a read timeout (to bound inference latency) but not a write timeout. If the
+  local backend's kernel socket receive buffer fills — possible with very large prompts to a
+  loaded backend — `write_all` blocks indefinitely, pinning the worker thread and its bounded
+  pool slot. Both functions now call `set_write_timeout(Some(timeout))` immediately after
+  `set_read_timeout`, reusing the same `PASTURE_LOCAL_TIMEOUT` value (default 120 s). A timed-out
+  write returns `BackendError::Transport` and is retryable if `PASTURE_CLOUD_RETRY` is set.
+  Defensive; write blocking is rare on localhost but the protection is free. Std-only; no new tests.
 - **ADR-094 Trim `PASTURE_AUTH_TOKEN` env var before storing (IMP-auth-token-trim).**
   `auth_ok()` in `proxy.rs` trims the client's bearer token from the `Authorization` header
   before comparing (`h.strip_prefix("Bearer ").trim()`), but compared against the stored
