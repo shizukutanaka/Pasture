@@ -1018,6 +1018,9 @@ impl Proxy {
                     }
                     ReadOutcome::Closed => return Ok(()), // normal EOF / graceful close
                 };
+            // Every response is traceable: echo the caller's X-Request-ID, or mint
+            // one server-side when absent (OpenAI/LiteLLM always return x-request-id).
+            let request_id = Some(request_id.unwrap_or_else(next_request_id));
             // CORS headers reflected on every response so the browser can read it.
             let cors = self.cors_headers(origin.as_deref());
             // Echo X-Request-ID back to the caller so clients can correlate responses.
@@ -1619,6 +1622,18 @@ fn next_completion_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("chatcmpl-{}{:08}", unix_now(), n)
+}
+
+/// A unique request id (`req_…`), matching OpenAI's per-response `x-request-id`
+/// that clients and support tooling key on for tracing. Generated server-side
+/// when the caller did not supply an `X-Request-ID`, so every response is
+/// correlatable. Uniqueness within the process is guaranteed by an atomic
+/// counter; the wall-clock prefix adds cross-run variety.
+fn next_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("req_{}{:08}", unix_now(), n)
 }
 
 /// Return a deterministic `system_fingerprint` string for a given model name.
@@ -4127,14 +4142,22 @@ mod tests {
     }
 
     #[test]
-    fn test_request_id_absent_when_not_sent() {
+    fn test_request_id_generated_when_not_sent() {
+        // When the client omits X-Request-ID, Pasture mints one (req_…) so every
+        // response is traceable, matching OpenAI/LiteLLM (IMP-request-id-gen).
         let p = proxy_with(true, false, 100, "unused");
         let raw = "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = raw_roundtrip(p, raw.to_string());
         assert!(
-            !resp.contains("X-Request-ID:"),
-            "unexpected request-id header in response: {resp}"
+            resp.contains("X-Request-ID: req_"),
+            "expected a generated req_ request-id: {resp}"
         );
+    }
+
+    #[test]
+    fn test_generated_request_ids_are_unique() {
+        assert_ne!(next_request_id(), next_request_id());
+        assert!(next_request_id().starts_with("req_"));
     }
 
     #[test]

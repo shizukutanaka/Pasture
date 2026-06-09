@@ -221,6 +221,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-073 Generate `X-Request-ID` when the client omits one (IMP-request-id-gen).**
+  OpenAI and LiteLLM return an `x-request-id` on *every* response — minted
+  server-side when the caller doesn't supply one — so every call is traceable.
+  Pasture (IMP-request-id) only *echoed* a client-supplied id and emitted nothing
+  otherwise, leaving most responses untraceable and most access-log lines without
+  a `request_id`. `next_request_id()` mints a unique `req_<clock><counter>` id
+  (atomic counter, mirroring `next_completion_id()`); `handle_connection` now sets
+  `request_id = Some(supplied‑or‑generated)` immediately after parsing, so the
+  existing echo header and access-log path carry it unchanged. No PII (clock +
+  counter only). Purely additive, std-only; 2 tests.
 - **ADR-072 `X-RateLimit-*` response headers (IMP-ratelimit-headers).** Pasture
   signalled rate state only reactively (a `429` with `Retry-After`). OpenAI, Azure,
   Anthropic and LiteLLM all expose `X-RateLimit-*` on *every* response so clients

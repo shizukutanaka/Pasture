@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Changed — `X-Request-ID` now present on every response (IMP-request-id-gen)
+
+- When the client does not send an `X-Request-ID`, Pasture now mints a unique
+  `req_…` id server-side (instead of omitting the header), so every response is
+  traceable and every access-log line has a correlation id. A client-supplied id
+  is still echoed unchanged. Matches OpenAI / LiteLLM. No PII (clock + counter
+  only). Std-only; 2 tests (ADR-073).
+
 ### Added — `X-RateLimit-*` response headers (IMP-ratelimit-headers)
 
 - When `PASTURE_RATE_LIMIT` is set, every response now carries
