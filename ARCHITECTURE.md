@@ -261,6 +261,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   filtered with `.is_finite()` before sorting; all-NaN input returns the safe
   `(0.0, 0.0)` default; `sort_by` uses `.expect("filtered to finite")` to document
   the invariant. Std-only; 1 test.
+- **ADR-090 Eliminate all compiler warnings (IMP-proxy-warnings).** Three categories
+  of pre-existing warnings silently accumulated in `proxy.rs`: (1) `use std::io::Write`
+  inside `append_access_log` (already imported at module level); (2) `mut self` in
+  `with_cache_ttl` (builder consumes self by value — `mut` not needed); (3) six
+  redundant `TcpListener`/`TcpStream` imports in individual test functions (already
+  in scope via `use super::*`). All removed. Zero-warning build from both
+  `cargo build` and `cargo test`.
+- **ADR-089 Log cascade cloud failure in CLI `chat` command (IMP-cascade-cli-error-log).**
+  The CLI `pasture chat` cascade path had the same silent `Err(_)` discard that ADR-087
+  fixed in the proxy. Added `eprintln!("pasture: cascade cloud failed (…); using local
+  answer")` matching the proxy pattern, so cloud outages during cascade are visible
+  regardless of the client path used.
 - **ADR-085 `doctor::tcp_get` validates HTTP status (IMP-doctor-status-check).**
   A non-Ollama HTTP service on the Ollama port (nginx, a proxy, another app) returns
   a 200 or error body for unknown paths; `tcp_get` returned the body regardless of

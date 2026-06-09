@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — CLI `pasture chat` cascade cloud failure now logged (IMP-cascade-cli-error-log)
+
+- Same fix as the proxy cascade path (ADR-087): the CLI chat command's cascade
+  fallback silently discarded cloud errors. Now logs matching stderr message. (ADR-089)
+
+### Fixed — Zero compiler warnings in library and test builds (IMP-proxy-warnings)
+
+- Removed redundant `Write` import inside `append_access_log`, unnecessary `mut self`
+  in `with_cache_ttl` builder, and six redundant `TcpListener`/`TcpStream` imports in
+  test functions. `cargo build` and `cargo test` now produce zero warnings. (ADR-090)
+
 ### Fixed — Emoji correctly counted in token estimation (IMP-emoji-token-count)
 
 - Emoji (😀🎉🔥 etc.) were counted as Latin characters (1 token per 4 chars), which

@@ -386,7 +386,10 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
                         let creq = chat_request(&config.cloud_model, text);
                         match cloud_b.complete(&creq) {
                             Ok(cr) => println!("{}", cr.content),
-                            Err(_) => println!("{}", lr.content), // fallback to local
+                            Err(ce) => {
+                                eprintln!("pasture: cascade cloud failed ({ce}); using local answer");
+                                println!("{}", lr.content);
+                            }
                         }
                     } else {
                         println!("{}", lr.content);

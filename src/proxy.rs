@@ -436,7 +436,7 @@ impl Proxy {
         self
     }
 
-    pub fn with_cache_ttl(mut self, ttl_secs: u64) -> Self {
+    pub fn with_cache_ttl(self, ttl_secs: u64) -> Self {
         if ttl_secs > 0 {
             if let Some(ref cache_mutex) = self.cache {
                 if let Ok(mut guard) = cache_mutex.lock() {
@@ -2117,7 +2117,6 @@ fn append_access_log(
     ms: u128,
     request_id: Option<&str>,
 ) {
-    use std::io::Write;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -2251,7 +2250,7 @@ mod tests {
     /// all HTTP response status codes. Parses responses using Content-Length so
     /// that the second status line isn't merged with the first response body.
     fn keepalive_statuses(proxy: Proxy, req1: String, req2: String) -> Vec<u16> {
-        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::net::Shutdown;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
@@ -2334,7 +2333,7 @@ mod tests {
         // roundtrip() reads everything the server writes; headers appear before body.
         let _ = raw; // body stripped by roundtrip; check via a second helper approach
                      // Re-use the raw roundtrip: use the full raw response from the socket.
-        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::net::Shutdown;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
@@ -2361,7 +2360,7 @@ mod tests {
     #[test]
     fn test_http10_request_defaults_to_close() {
         let p = proxy_with(true, false, 100, "unused");
-        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::net::Shutdown;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
@@ -2386,7 +2385,7 @@ mod tests {
     #[test]
     fn test_head_health_returns_200_no_body() {
         let p = proxy_with(true, false, 100, "unused");
-        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::net::Shutdown;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
@@ -2595,7 +2594,7 @@ mod tests {
     /// Send `raw_request` to a one-shot server backed by `proxy`; return
     /// (status_code, body) of the HTTP response.
     fn roundtrip(proxy: Proxy, raw_request: String) -> (u16, String) {
-        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::net::Shutdown;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
@@ -2623,7 +2622,7 @@ mod tests {
     /// Like `roundtrip` but returns the full raw HTTP response string so tests
     /// can inspect response headers.
     fn roundtrip_raw(proxy: Proxy, raw_request: String) -> String {
-        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::net::Shutdown;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
