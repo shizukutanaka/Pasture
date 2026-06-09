@@ -280,6 +280,13 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-096 Escape `method` and `path` in access log to prevent JSON injection (IMP-access-log-json-escape).**
+  `append_access_log` directly interpolated `method` and `norm_path` into the JSONL format string
+  without escaping. Both come from the HTTP request line (user-supplied); a client sending
+  `GET"evil /path"injected":1,"x HTTP/1.1` would inject arbitrary JSON into the access log,
+  corrupting the file and breaking all downstream log consumers. The `request_id` field was
+  already wrapped in `escape_string()`; this brings `method` and `norm_path` to the same
+  standard. Grounded in OWASP A09:2021 Security Logging and Monitoring Failures. Std-only; 1 test.
 - **ADR-095 Add write timeout to `http_post` and `http_post_streaming` (IMP-backend-write-timeout).**
   Both functions set a read timeout (to bound inference latency) but not a write timeout. If the
   local backend's kernel socket receive buffer fills — possible with very large prompts to a

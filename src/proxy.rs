@@ -2126,7 +2126,9 @@ fn append_access_log(
         None => String::new(),
     };
     let line = format!(
-        "{{\"ts\":{ts},\"method\":\"{method}\",\"path\":\"{norm_path}\",\"status\":{status},\"ms\":{ms}{req_id_field}}}\n"
+        "{{\"ts\":{ts},\"method\":\"{}\",\"path\":\"{}\",\"status\":{status},\"ms\":{ms}{req_id_field}}}\n",
+        escape_string(method),
+        escape_string(norm_path),
     );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -3368,6 +3370,36 @@ mod tests {
         let line = entries.trim_end_matches('\n').lines().next().unwrap_or("{}");
         let parsed: crate::json::JsonValue = crate::json::parse(line).unwrap();
         assert_eq!(parsed.get("request_id").and_then(|v| v.as_str()), Some("test-id-1"), "line: {line}");
+    }
+
+    #[test]
+    fn test_access_log_escapes_method_and_path() {
+        // A malicious or malformed client sending quotes/backslashes in the HTTP
+        // request line must not inject arbitrary JSON into the access log.
+        // We verify this by calling append_access_log directly with hostile inputs.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "pasture-access-log-escape-test-{}.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let p = path.to_str().unwrap();
+        // Method and path containing JSON-breaking characters.
+        append_access_log(p, "GET\"evil", "/path\\n\\\"injected\":1,\"x", 200, 1, None);
+        let line = std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .trim_end_matches('\n')
+            .to_string();
+        let _ = std::fs::remove_file(p);
+        let v = crate::json::parse(&line).expect("access log line must be valid JSON");
+        // The escaping must preserve the original hostile string (escaped), not
+        // allow it to break the JSON structure.
+        let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("");
+        assert!(method.contains("evil"), "method should contain the original value");
+        let path_val = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
+        assert!(path_val.contains("injected"), "path should contain the original value");
     }
 
     #[test]

@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Access log `method` and `path` fields are now JSON-escaped (IMP-access-log-json-escape)
+
+- A malicious client sending quotes or backslashes in the HTTP request line (method or path)
+  could inject arbitrary JSON into the access log JSONL file, corrupting all downstream log
+  consumers. `request_id` was already escaped; `method` and `path` now also go through
+  `escape_string()`. OWASP A09:2021 Security Logging and Monitoring Failures. 1 test. (ADR-096)
+
 ### Fixed — `http_post` write timeout prevents indefinite block on overloaded backend (IMP-backend-write-timeout)
 
 - `http_post` and `http_post_streaming` set a read timeout but no write timeout. A very large
