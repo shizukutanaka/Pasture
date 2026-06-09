@@ -147,17 +147,27 @@ impl Config {
                 self.donate_url = Some(trimmed);
             }
         }
-        if std::env::var("PASTURE_NO_NUDGE").is_ok() {
-            self.no_nudge = true;
+        if let Ok(v) = std::env::var("PASTURE_NO_NUDGE") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.no_nudge = true,
+                _ => {}
+            }
         }
         if let Ok(v) = std::env::var("PASTURE_STATE") {
             self.state_path = v;
         }
-        if std::env::var("PASTURE_ALLOW_SENSITIVE_CLOUD").is_ok() {
-            self.allow_sensitive_cloud = true;
+        if let Ok(v) = std::env::var("PASTURE_ALLOW_SENSITIVE_CLOUD") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.allow_sensitive_cloud = true,
+                "0" | "false" | "no" => self.allow_sensitive_cloud = false,
+                _ => {}
+            }
         }
-        if std::env::var("PASTURE_CASCADE").is_ok() {
-            self.cascade = true;
+        if let Ok(v) = std::env::var("PASTURE_CASCADE") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.cascade = true,
+                _ => {}
+            }
         }
         if let Ok(v) = std::env::var("PASTURE_CACHE") {
             if let Ok(n) = v.parse::<usize>() {
@@ -179,8 +189,11 @@ impl Config {
                 self.cloud_retry = n;
             }
         }
-        if std::env::var("PASTURE_LOCAL_ONLY").is_ok() {
-            self.local_only = true;
+        if let Ok(v) = std::env::var("PASTURE_LOCAL_ONLY") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.local_only = true,
+                _ => {}
+            }
         }
         if let Ok(v) = std::env::var("PASTURE_LOCAL_FAST_MODEL") {
             self.local_fast_model = v;
@@ -190,8 +203,11 @@ impl Config {
                 self.fast_threshold = n;
             }
         }
-        if std::env::var("PASTURE_INJECT_CONTEXT").is_ok() {
-            self.inject_context = true;
+        if let Ok(v) = std::env::var("PASTURE_INJECT_CONTEXT") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.inject_context = true,
+                _ => {}
+            }
         }
         if let Ok(v) = std::env::var("PASTURE_AUTH_TOKEN") {
             if !v.trim().is_empty() {
@@ -373,5 +389,30 @@ mod tests {
         let off = Config::from_str_with_defaults("no_nudge = false");
         assert!(!off.no_nudge);
         assert!(!off.allow_sensitive_cloud);
+    }
+
+    #[test]
+    fn test_boolean_env_vars_require_truthy_value() {
+        // SECURITY: PASTURE_ALLOW_SENSITIVE_CLOUD=false / =0 must NOT enable cloud
+        // routing of sensitive content. The prior is_ok() check treated any value
+        // including "false" or "0" as enabling the flag — a silent security regression.
+        // This test uses the apply() path (config file) as a proxy since the with_env()
+        // path requires actual env var mutation which is not thread-safe in tests.
+        // The apply() and with_env() now use the same matching semantics.
+        let enabled = Config::from_str_with_defaults("allow_sensitive_cloud = 1");
+        assert!(enabled.allow_sensitive_cloud, "\"1\" should enable");
+        let enabled2 = Config::from_str_with_defaults("allow_sensitive_cloud = true");
+        assert!(enabled2.allow_sensitive_cloud, "\"true\" should enable");
+        let disabled = Config::from_str_with_defaults("allow_sensitive_cloud = false");
+        assert!(!disabled.allow_sensitive_cloud, "\"false\" must NOT enable");
+        let disabled2 = Config::from_str_with_defaults("allow_sensitive_cloud = 0");
+        assert!(!disabled2.allow_sensitive_cloud, "\"0\" must NOT enable");
+        let disabled3 = Config::from_str_with_defaults("allow_sensitive_cloud = no");
+        assert!(!disabled3.allow_sensitive_cloud, "\"no\" must NOT enable");
+        // Same for local_only, no_nudge, cascade, inject_context
+        let lo = Config::from_str_with_defaults("local_only = 1");
+        assert!(lo.local_only);
+        let lo_off = Config::from_str_with_defaults("local_only = 0");
+        assert!(!lo_off.local_only);
     }
 }

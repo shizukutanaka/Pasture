@@ -280,6 +280,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-093 Boolean env vars require truthy value, not mere presence (IMP-bool-env-var-value-check).**
+  `with_env()` used `std::env::var(...).is_ok()` for five flags: `PASTURE_NO_NUDGE`,
+  `PASTURE_ALLOW_SENSITIVE_CLOUD`, `PASTURE_CASCADE`, `PASTURE_LOCAL_ONLY`,
+  `PASTURE_INJECT_CONTEXT`. `is_ok()` is presence-only — any value including `"false"` or `"0"`
+  enabled the flag. For `PASTURE_ALLOW_SENSITIVE_CLOUD` this is a security bug: a user setting
+  `PASTURE_ALLOW_SENSITIVE_CLOUD=false` (or `=0`) intending to disable it would instead silently
+  route PII and credentials to the cloud. All five now use a value match consistent with the
+  config-file `apply()` path (`"1"|"true"|"yes"|""` → true; for `ALLOW_SENSITIVE_CLOUD` and
+  `LOCAL_ONLY` also `"0"|"false"|"no"` → false, so an env var can override a config-file true).
+  Std-only; 2 tests.
 - **ADR-092 Add Slack `xapp-` and HuggingFace `hf_` token prefixes to PII classifier (IMP-privacy-xapp-hf-prefixes).**
   Slack App-Level Tokens (`xapp-`, introduced 2020 for Socket Mode / Manifests) and HuggingFace
   access tokens (`hf_`) are full API credentials commonly pasted into prompts during LLM

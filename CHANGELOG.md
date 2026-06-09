@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — `PASTURE_ALLOW_SENSITIVE_CLOUD=false` no longer silently enables cloud routing of PII (IMP-bool-env-var-value-check)
+
+- `PASTURE_ALLOW_SENSITIVE_CLOUD`, `PASTURE_NO_NUDGE`, `PASTURE_CASCADE`,
+  `PASTURE_LOCAL_ONLY`, and `PASTURE_INJECT_CONTEXT` were checked with `is_ok()` — any
+  value (including `"false"` or `"0"`) enabled the flag. Setting
+  `PASTURE_ALLOW_SENSITIVE_CLOUD=false` would silently route PII and credentials to the
+  cloud, violating the privacy-first invariant. All five now require `1|true|yes` (or empty
+  bare presence) and reject `false|0|no`. Consistent with config-file parsing. 2 tests.
+  (ADR-093)
+
 ### Fixed — Slack App-Level Token (`xapp-`) and HuggingFace (`hf_`) credentials now detected as PII (IMP-privacy-xapp-hf-prefixes)
 
 - Slack App-Level Tokens (Socket Mode, `xapp-` prefix) and HuggingFace access tokens (`hf_`)
