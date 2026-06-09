@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — TTL-expired cache entries now removed from the FIFO order deque (IMP-cache-ttl-ghost-entries)
+
+- `ResponseCache::get()` removed TTL-expired entries from the map but not from the FIFO `order`
+  VecDeque. Ghost keys accumulated indefinitely — the map was bounded at `cap`, but the deque
+  was not. At 1 req/s with TTL=3600s and cap=512, the deque would grow ~87k entries/day.
+  `get()` now calls `order.retain()` to remove the ghost entry on TTL expiry. 1 test. (ADR-098)
+
 ### Fixed — Header line count limit prevents header-flood DoS in `read_request` (IMP-header-count-limit)
 
 - The header parsing loop had no bound on line count. A crafted request with 1 MiB of

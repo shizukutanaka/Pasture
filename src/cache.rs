@@ -136,6 +136,10 @@ impl ResponseCache {
                 if let Some(max_age) = self.max_age {
                     if inserted.elapsed() > max_age {
                         self.map.remove(&key);
+                        // Also remove from the FIFO queue; without this the ghost key
+                        // stays in `order` indefinitely, causing unbounded deque growth
+                        // when the cache has a TTL and entries expire on get() (ADR-098).
+                        self.order.retain(|&k| k != key);
                         self.misses.fetch_add(1, Ordering::Relaxed);
                         return None;
                     }
@@ -321,5 +325,31 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1));
         let _ = c.get(1); // expired, removed
         assert_eq!(c.len(), 1, "expired entry should be removed, leaving only key 2");
+    }
+
+    #[test]
+    fn test_ttl_expiry_removes_ghost_from_order_deque() {
+        // Regression test for ADR-098: TTL expiry on get() must remove the key
+        // from the FIFO order deque, not just from the map. Without the fix,
+        // ghost keys accumulate in `order` without bound.
+        let mut c = ResponseCache::new(4);
+        c.max_age = Some(Duration::from_nanos(1));
+        c.put(1, resp("a"));
+        c.put(2, resp("b"));
+        std::thread::sleep(Duration::from_millis(1));
+        let _ = c.get(1); // expired → must remove from both map and order
+        let _ = c.get(2); // expired → must remove from both map and order
+        // After both expire and are evicted on get(), the order deque must be empty.
+        assert_eq!(c.order.len(), 0, "order deque must not retain ghost entries after TTL expiry");
+        // Re-fill to capacity: FIFO eviction must still work correctly (no phantom pops).
+        c.max_age = None;
+        c.put(3, resp("c"));
+        c.put(4, resp("d"));
+        c.put(5, resp("e"));
+        c.put(6, resp("f"));
+        assert_eq!(c.len(), 4);
+        c.put(7, resp("g")); // evicts key 3
+        assert!(c.get(3).is_none(), "FIFO eviction must still work after TTL-expiry cleanup");
+        assert!(c.get(7).is_some());
     }
 }

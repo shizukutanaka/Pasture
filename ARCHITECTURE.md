@@ -280,6 +280,12 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-098 Remove TTL-expired entries from the FIFO order deque in `cache.get()` (IMP-cache-ttl-ghost-entries).**
+  `get()` removed TTL-expired entries from `self.map` but not from `self.order` (the FIFO VecDeque).
+  Ghost keys accumulated in the deque indefinitely — the map stayed bounded at `cap`, but `order`
+  grew without bound. For a 512-entry, TTL=3600s cache at ~1 req/s the deque would accumulate ~87k
+  ghost entries per day. The fix: after removing from the map, call `order.retain(|&k| k != key)`.
+  `retain()` is O(n) but only runs on TTL-expired misses (infrequent). Std-only; 1 test.
 - **ADR-097 Header line count limit in `read_request` to prevent header-flood DoS (IMP-header-count-limit).**
   The header parsing loop iterated without a line count bound. A crafted request with 1 MiB of
   minimal `\r\n` pairs generates ~500k iterations — each calling `to_ascii_lowercase()` — pinning a
