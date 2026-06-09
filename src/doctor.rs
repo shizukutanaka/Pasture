@@ -111,7 +111,11 @@ pub fn port_available(addr: &str) -> bool {
     TcpListener::bind(addr).is_ok()
 }
 
-/// Minimal plain-HTTP GET returning the response body, or None on any failure.
+/// Minimal plain-HTTP GET returning the response body on 200 OK, or None on
+/// any failure (connection error, non-200 status). A non-200 response means
+/// the server exists but is not a recognized Ollama/OpenAI-compat endpoint;
+/// treating it as "reachable" would produce a false-positive doctor report
+/// ("running but no models") for proxies or other services on the same port.
 fn tcp_get(host: &str, port: u16, path: &str, timeout: Duration) -> Option<String> {
     let mut stream = TcpStream::connect((host, port)).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
@@ -122,8 +126,19 @@ fn tcp_get(host: &str, port: u16, path: &str, timeout: Duration) -> Option<Strin
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).ok()?;
     let text = String::from_utf8_lossy(&raw);
-    text.split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    let status: u16 = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .unwrap_or(0);
+    if status == 200 {
+        Some(body.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -194,5 +209,27 @@ mod tests {
             vec!["llama-3.2-3b-instruct", "qwen2.5-7b"]
         );
         assert!(parse_openai_model_names("{}").is_empty());
+    }
+
+    #[test]
+    fn test_probe_ollama_non_200_is_unreachable() {
+        // A server that exists but returns 404 must not be reported as reachable.
+        // Pre-existing behaviour: tcp_get returned the body regardless of status,
+        // so `probe_ollama` set reachable:true even for 404/500 responses (a proxy
+        // or wrong service on the port would appear as "Ollama running, no models").
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}\n",
+                );
+            }
+        });
+        let st = probe_ollama("127.0.0.1", addr.port());
+        assert!(!st.reachable, "404 response must not be treated as reachable");
+        assert!(st.models.is_empty());
     }
 }

@@ -5,6 +5,34 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Emoji correctly counted in token estimation (IMP-emoji-token-count)
+
+- Emoji (😀🎉🔥 etc.) were counted as Latin characters (1 token per 4 chars), which
+  under-estimated emoji-heavy prompts by 4–12×, keeping them local when the cloud
+  model was more appropriate. Emoji blocks (U+1F000–U+1FAFF) are now counted as
+  1 token per character, matching the same rule as CJK. 1 test (ADR-088).
+
+### Fixed — Cascade cloud failures now logged to stderr (IMP-cascade-cloud-error-log)
+
+- When the cascade path attempted cloud and it failed, the error was silently
+  discarded. The proxy returned a local answer with no visibility into the failure.
+  Now logs `pasture: cascade cloud failed (...); using local answer`, matching the
+  existing non-cascade fallback log. (ADR-087)
+
+### Fixed — `calibrate_logprob_threshold` drops NaN/inf before sorting (IMP-logprob-nan-filter)
+
+- NaN values in the logprob input silently broke the sort (NaN compared equal to
+  everything), producing wrong quantile thresholds. Non-finite values are now
+  filtered out before sorting; all-NaN input returns the safe `(0.0, 0.0)` default.
+  1 test (ADR-086).
+
+### Fixed — `pasture doctor` no longer reports a non-Ollama server as reachable (IMP-doctor-status-check)
+
+- A proxy or other HTTP service on the Ollama port returned non-200 responses;
+  `tcp_get` returned the body regardless of status, so `probe_ollama` reported
+  "Ollama running (no models)" when Ollama wasn't running. Now only 200 OK is
+  treated as success. 1 test (ADR-085).
+
 ### Added — Configurable local backend timeout (`PASTURE_LOCAL_TIMEOUT`) (IMP-local-timeout)
 
 - Set `PASTURE_LOCAL_TIMEOUT=<secs>` (or `local_timeout = <secs>` in the config file)

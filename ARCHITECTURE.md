@@ -239,6 +239,35 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   `None` unless the value starts with `http://` or `https://` (case-folded).
   FTP and other schemes are also rejected. Matches the existing blank-guard contract and
   the `donate_url` validation pattern. Std-only; 2 tests.
+- **ADR-088 Emoji counted as dense tokens in `estimate_tokens` (IMP-emoji-token-count).**
+  Emoji (U+1F000–U+1FAFF) were counted as Latin characters (1 token per 4 chars)
+  in `is_dense_script`, under-estimating emoji-heavy prompts by 4–12×. Common
+  tokenizers (GPT-4 cl100k, LLaMA-3 BPE) assign 1–3 tokens per emoji. The
+  Emoticons / Misc Symbols and Pictographs blocks are added to `is_dense_script`'s
+  match, matching the same 1-token-per-char heuristic used for CJK. Conservative:
+  over-estimating is safer than under-estimating for routing quality. The curated
+  18-case eval still passes 100%. Additive range extension, std-only; 1 test.
+- **ADR-087 Log cascade cloud failure (IMP-cascade-cloud-error-log).**
+  The cascade path silently discarded cloud errors (`Err(_)`) when falling back to
+  the local answer. The non-cascade cloud route already logged
+  `"pasture: cloud failed; falling back to local"` at line 703. The cascade arm now
+  logs the same pattern (`Err(e)` + `eprintln!`), making cloud outages visible
+  during cascade usage. No change to request/response behavior.
+- **ADR-086 Defensive NaN filter in `calibrate_logprob_threshold` (IMP-logprob-nan-filter).**
+  `partial_cmp` returns `None` for NaN, and the prior `unwrap_or(Equal)` silently
+  treated NaN as equal to every value, breaking the sort invariant and producing
+  wrong quantile thresholds. Although the normal call path filters non-finite values
+  via ADR-078, the function had no contract enforcement. Finite-only values are now
+  filtered with `.is_finite()` before sorting; all-NaN input returns the safe
+  `(0.0, 0.0)` default; `sort_by` uses `.expect("filtered to finite")` to document
+  the invariant. Std-only; 1 test.
+- **ADR-085 `doctor::tcp_get` validates HTTP status (IMP-doctor-status-check).**
+  A non-Ollama HTTP service on the Ollama port (nginx, a proxy, another app) returns
+  a 200 or error body for unknown paths; `tcp_get` returned the body regardless of
+  status, so `probe_ollama` set `reachable: true` with an empty model list — the
+  doctor printed "Ollama is running (no models downloaded)" when Ollama was not
+  running. The function now parses the first response line and returns `None` on any
+  non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
 - **ADR-082 Trim API key and donate URL env vars (IMP-api-key-trim).** `api_key_from_env`
   checked `!k.trim().is_empty()` but returned the raw untrimmed value, so a key set via
   `export KEY=$(cat ~/.api_key)` — a common pattern that appends a trailing newline —

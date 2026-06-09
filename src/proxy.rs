@@ -687,7 +687,11 @@ impl Proxy {
                 match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
                     Ok(cloud_resp) => (cloud_resp, Route::Cloud, confidence),
                     // Cloud failed: fall back to the local answer rather than error.
-                    Err(_) => (local_resp, Route::Local, confidence),
+                    // Log the failure so the operator knows the cascade attempted.
+                    Err(e) => {
+                        eprintln!("pasture: cascade cloud failed ({e}); using local answer");
+                        (local_resp, Route::Local, confidence)
+                    }
                 }
             } else {
                 (local_resp, Route::Local, confidence)

@@ -81,7 +81,10 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 /// True for characters that tokenize at roughly one token each (CJK, kana,
-/// Hangul, fullwidth/halfwidth forms).
+/// Hangul, fullwidth/halfwidth forms, emoji).
+/// Emoji (U+1F000–U+1FAFF) average 1-3 tokens per character in common
+/// tokenizers (GPT-4, LLaMA 3); counting them as 0.25 tok/char (Latin default)
+/// under-estimates prompts with many emoji by 4-12×.
 fn is_dense_script(c: char) -> bool {
     matches!(c as u32,
         0x3040..=0x30FF   // Hiragana + Katakana
@@ -90,6 +93,7 @@ fn is_dense_script(c: char) -> bool {
         | 0xF900..=0xFAFF // CJK Compatibility Ideographs
         | 0xAC00..=0xD7A3 // Hangul syllables
         | 0xFF66..=0xFF9D // halfwidth Katakana
+        | 0x1F000..=0x1FAFF // Emoji & Symbols (Misc Symbols, Emoticons, etc.)
     )
 }
 
@@ -432,6 +436,15 @@ mod tests {
             // "code あい" = 'c','o','d','e',' ' (5 latin -> 2) + 'あ','い' (2 dense)
             2 + 2
         });
+    }
+
+    #[test]
+    fn test_estimate_tokens_emoji_counted_as_dense() {
+        // Emoji (U+1F000-U+1FAFF) used to score 0.25 tok/char (Latin fallback),
+        // under-estimating emoji-heavy prompts by 4-12×. They are now dense (1/char).
+        // 😀 = U+1F600 (in Emoticons block), 🎉 = U+1F389 (Misc Symbols & Pictographs).
+        assert_eq!(estimate_tokens("😀😀😀😀"), 4); // 4 emoji -> 4 dense tokens
+        assert_eq!(estimate_tokens("hi 🎉"), 1 + 1); // 3 latin (ceil/4=1) + 1 emoji
     }
 
     #[test]

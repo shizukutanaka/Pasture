@@ -70,9 +70,15 @@ pub fn calibrate_logprob_threshold(logprobs: &[f64], target_escalation_rate: f64
         return (0.0, 0.0);
     }
     let target = target_escalation_rate.clamp(0.0, 1.0);
-    let n = logprobs.len();
-    let mut sorted: Vec<f64> = logprobs.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Drop non-finite values before sorting: NaN breaks sort invariants because
+    // `partial_cmp` returns None for NaN, and unwrap_or(Equal) treats NaN as equal
+    // to every value, producing an unsorted result and wrong quantile thresholds.
+    let mut sorted: Vec<f64> = logprobs.iter().copied().filter(|v| v.is_finite()).collect();
+    if sorted.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = sorted.len();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("filtered to finite"));
 
     if target <= 0.0 {
         // Escalate nothing: threshold just below the smallest observed logprob.
@@ -145,5 +151,20 @@ mod tests {
         let t = [5, 15, 25];
         assert_eq!(calibrate_threshold(&t, 5.0), (0, 1.0));
         assert_eq!(calibrate_threshold(&t, -1.0).1, 0.0);
+    }
+
+    #[test]
+    fn test_logprob_threshold_filters_non_finite() {
+        // NaN and inf in the input must be silently dropped before sorting.
+        // Prior behaviour: partial_cmp returned None for NaN and was treated as
+        // Equal, breaking the sort and producing an incorrect threshold.
+        let lps = vec![-0.1, f64::NAN, -0.5, f64::INFINITY, -0.3];
+        let (thr, _) = calibrate_logprob_threshold(&lps, 0.5);
+        // Three finite values: -0.5, -0.3, -0.1. Sorted: [-0.5, -0.3, -0.1].
+        // 50% of 3 → idx 1 → threshold = -0.3.
+        assert!(thr.is_finite(), "threshold must be finite after NaN filter");
+        // All-NaN input must return the safe (0.0, 0.0) default.
+        let all_nan = vec![f64::NAN, f64::NAN];
+        assert_eq!(calibrate_logprob_threshold(&all_nan, 0.5), (0.0, 0.0));
     }
 }
