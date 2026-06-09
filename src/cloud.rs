@@ -379,15 +379,17 @@ pub fn parse_http_response(raw: &str) -> Result<(u16, String), BackendError> {
         .to_ascii_lowercase()
         .contains("transfer-encoding: chunked");
     let body = if chunked {
-        dechunk(body)
+        dechunk(body)?
     } else {
         body.to_string()
     };
     Ok((status, body))
 }
 
-/// Decode a chunked transfer-encoding body.
-fn dechunk(body: &str) -> String {
+/// Decode a chunked transfer-encoding body (RFC 7230 §4.1).
+/// Returns Err if a declared chunk size exceeds available bytes — that means
+/// the response was truncated in transit and the data would be silently wrong.
+fn dechunk(body: &str) -> Result<String, BackendError> {
     let mut out = String::new();
     let mut rest = body;
     loop {
@@ -400,15 +402,17 @@ fn dechunk(body: &str) -> String {
         if size == 0 {
             break;
         }
+        // ADR-107: truncated chunk → protocol error, not silent data loss.
         if after.len() < size {
-            out.push_str(after);
-            break;
+            return Err(BackendError::Protocol(
+                format!("chunked body truncated: declared {size} bytes, got {}", after.len()).into(),
+            ));
         }
         out.push_str(&after[..size]);
         // Skip the chunk data and its trailing CRLF.
         rest = after.get(size + 2..).unwrap_or("");
     }
-    out
+    Ok(out)
 }
 
 /// Resolve the API key for a provider from the environment. The value is
@@ -814,6 +818,16 @@ data: {\"type\":\"message_stop\"}\n\n";
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n";
         let (_, body) = parse_http_response(raw).unwrap();
         assert_eq!(body, "hello world");
+    }
+
+    #[test]
+    fn test_dechunk_truncated_returns_error() {
+        // ADR-107: a chunked body that declares more bytes than are present must
+        // return a protocol error, not silently return partial data.
+        // "a\r\n" declares 10 bytes but only 5 ("hello") follow.
+        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\nhello";
+        let err = parse_http_response(raw);
+        assert!(err.is_err(), "truncated chunk must be an error, not silent partial data");
     }
 
     #[test]

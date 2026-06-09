@@ -294,8 +294,8 @@ impl Parser<'_> {
                                         let c = 0x10000
                                             + ((code - 0xD800) << 10)
                                             + (low - 0xDC00);
-                                        char::from_u32(c)
-                                            .ok_or_else(|| self.err("invalid surrogate pair"))?
+                                        // ADR-108: c ∈ U+10000..U+10FFFF, always valid.
+                                        char::from_u32(c).unwrap()
                                     } else {
                                         return Err(self.err("expected low surrogate"));
                                     }
