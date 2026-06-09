@@ -283,6 +283,10 @@ impl Config {
             }
             "system_prompt" => self.system_prompt = val.to_string(),
             "access_log" => self.access_log = val.to_string(),
+            "no_nudge" => self.no_nudge = matches!(val, "1" | "true" | "yes"),
+            "allow_sensitive_cloud" => {
+                self.allow_sensitive_cloud = matches!(val, "1" | "true" | "yes")
+            }
             "cache_ttl_secs" => {
                 if let Ok(n) = val.parse() {
                     self.cache_ttl_secs = n;
@@ -330,5 +334,18 @@ mod tests {
         assert_eq!(Config::default().request_timeout_secs, 30);
         let cfg = Config::from_str_with_defaults("request_timeout = 5");
         assert_eq!(cfg.request_timeout_secs, 5);
+    }
+
+    #[test]
+    fn test_config_file_boolean_parity_with_env() {
+        // These flags were env-only (PASTURE_NO_NUDGE / PASTURE_ALLOW_SENSITIVE_CLOUD)
+        // and silently ignored in config files before; now they have file parity.
+        let cfg = Config::from_str_with_defaults("no_nudge = true\nallow_sensitive_cloud = yes");
+        assert!(cfg.no_nudge);
+        assert!(cfg.allow_sensitive_cloud);
+        // Defaults remain false when unset / falsey.
+        let off = Config::from_str_with_defaults("no_nudge = false");
+        assert!(!off.no_nudge);
+        assert!(!off.allow_sensitive_cloud);
     }
 }

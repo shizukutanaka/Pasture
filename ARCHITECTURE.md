@@ -221,6 +221,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-076 Config-file parity for `no_nudge` / `allow_sensitive_cloud` (IMP-config-file-parity).**
+  Both flags were settable via env (`PASTURE_NO_NUDGE`, `PASTURE_ALLOW_SENSITIVE_CLOUD`)
+  but the config-file `apply()` match silently ignored them — a recognised key dropped
+  on the floor. `apply()` now handles both with the standard `matches!(val,
+  "1"|"true"|"yes")` boolean parse used by `cascade`/`local_only`/`inject_context`.
+  Defaults stay `false`, so the privacy-preserving behaviour is unchanged unless
+  explicitly enabled. Std-only; 1 test.
+- **ADR-075 Detect `ghu_`/`ghs_`/`ghr_` and AWS STS `ASIA` credentials (IMP-detect-cred-variants).**
+  The PII classifier already flags `ghp_` and `AKIA`; the GitHub user/server/refresh
+  token variants (`ghu_`, `ghs_`, `ghr_`) and AWS STS temporary credentials (`ASIA…`)
+  are equally sensitive but went undetected, so a leaked one could reach the cloud.
+  Added to `KEY_PREFIXES`, gated by the same `prefix + 12` length check (no short
+  false positives). Detection is label-only, never values (I3); the over-classification
+  bias is intentional (a false positive merely keeps a prompt local). Std-only; 1 test.
 - **ADR-074 OpenAI error envelope `param`/`code` fields (IMP-error-envelope-fields).**
   OpenAI's error object always includes `param` and `code` keys (null when unknown);
   strict SDK deserializers (`openai-python` `APIError.param`/`.code`, LiteLLM) read

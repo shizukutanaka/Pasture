@@ -77,6 +77,9 @@ const KEY_PREFIXES: &[&str] = &[
     // GitHub
     "ghp_",
     "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
     "github_pat_",
     // Slack
     "xoxb-",
@@ -85,6 +88,7 @@ const KEY_PREFIXES: &[&str] = &[
     "glpat-",
     // AWS
     "AKIA",
+    "ASIA",
     // Google (service account / OAuth)
     "AIza",
     "ya29.",
@@ -448,6 +452,18 @@ mod tests {
         assert!(looks_like_api_key("glpat-abcdefghijklmnop1234"));
         assert!(!looks_like_api_key("sk-short"));
         assert!(!looks_like_api_key("skiing"));
+    }
+
+    #[test]
+    fn test_api_key_github_and_aws_sts_variants() {
+        // GitHub server/user/refresh tokens are as sensitive as ghp_.
+        assert!(looks_like_api_key("ghu_abcdefghijklmnop1234"));
+        assert!(looks_like_api_key("ghs_abcdefghijklmnop1234"));
+        assert!(looks_like_api_key("ghr_abcdefghijklmnop1234"));
+        // AWS STS temporary credentials start with ASIA (vs long-lived AKIA).
+        assert!(looks_like_api_key("ASIAABCDEFGH12345678"));
+        // Still require sufficient length (no short false positives).
+        assert!(!looks_like_api_key("ghu_short"));
     }
 
     #[test]

@@ -5,6 +5,20 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Detect more credential formats (IMP-detect-cred-variants)
+
+- The privacy classifier now flags GitHub `ghu_` / `ghs_` / `ghr_` tokens and AWS STS
+  `ASIA…` temporary credentials (in addition to the existing `ghp_` / `AKIA`). These
+  are kept local, never cached, and never sent to the cloud unless
+  `PASTURE_ALLOW_SENSITIVE_CLOUD` is set. Labels only, never values. 1 test (ADR-075).
+
+### Fixed — Config-file parity for `no_nudge` and `allow_sensitive_cloud` (IMP-config-file-parity)
+
+- These two flags were settable via `PASTURE_NO_NUDGE` / `PASTURE_ALLOW_SENSITIVE_CLOUD`
+  but were silently ignored when set in a config file. They now work from the config
+  file too (`no_nudge = true`, `allow_sensitive_cloud = yes`). Defaults remain `false`.
+  1 test (ADR-076).
+
 ### Changed — Error responses now include OpenAI `param`/`code` fields (IMP-error-envelope-fields)
 
 - Every error body is now full OpenAI shape `{"error":{"message","type","param","code"}}`
