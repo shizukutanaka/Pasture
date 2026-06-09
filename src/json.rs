@@ -279,8 +279,36 @@ impl Parser<'_> {
                         b'b' => out.push('\u{0008}'),
                         b'f' => out.push('\u{000C}'),
                         b'u' => {
-                            let cp = self.parse_unicode_escape()?;
-                            out.push(cp);
+                            let code = self.parse_unicode_escape()?;
+                            let ch = if (0xD800..=0xDBFF).contains(&code) {
+                                // High surrogate: a low surrogate `\uXXXX` must follow
+                                // (UTF-16 pair). Python's json.dumps default-encodes
+                                // non-BMP chars like emoji this way, so we must combine
+                                // them rather than reject the request.
+                                if self.peek() == Some(b'\\')
+                                    && self.bytes.get(self.pos + 1) == Some(&b'u')
+                                {
+                                    self.pos += 2; // consume the "\u"
+                                    let low = self.parse_unicode_escape()?;
+                                    if (0xDC00..=0xDFFF).contains(&low) {
+                                        let c = 0x10000
+                                            + ((code - 0xD800) << 10)
+                                            + (low - 0xDC00);
+                                        char::from_u32(c)
+                                            .ok_or_else(|| self.err("invalid surrogate pair"))?
+                                    } else {
+                                        return Err(self.err("expected low surrogate"));
+                                    }
+                                } else {
+                                    return Err(self.err("unpaired high surrogate"));
+                                }
+                            } else if (0xDC00..=0xDFFF).contains(&code) {
+                                return Err(self.err("unexpected low surrogate"));
+                            } else {
+                                char::from_u32(code)
+                                    .ok_or_else(|| self.err("invalid unicode code point"))?
+                            };
+                            out.push(ch);
                         }
                         _ => return Err(self.err("invalid escape")),
                     }
@@ -305,7 +333,9 @@ impl Parser<'_> {
         Ok(out)
     }
 
-    fn parse_unicode_escape(&mut self) -> Result<char, ParseError> {
+    /// Parse the four hex digits after a `\u`, returning the raw 16-bit code unit
+    /// (which may be a UTF-16 surrogate half — the caller combines pairs).
+    fn parse_unicode_escape(&mut self) -> Result<u32, ParseError> {
         if self.pos + 4 > self.bytes.len() {
             return Err(self.err("truncated \\u escape"));
         }
@@ -313,7 +343,7 @@ impl Parser<'_> {
             .map_err(|_| self.err("invalid \\u escape"))?;
         let code = u32::from_str_radix(hex, 16).map_err(|_| self.err("invalid \\u hex"))?;
         self.pos += 4;
-        char::from_u32(code).ok_or_else(|| self.err("invalid unicode code point"))
+        Ok(code)
     }
 
     fn parse_bool(&mut self) -> Result<JsonValue, ParseError> {
@@ -460,6 +490,28 @@ mod tests {
     fn test_parse_multibyte_utf8_passthrough() {
         let v = parse("\"日本語\"").unwrap();
         assert_eq!(v.as_str(), Some("日本語"));
+    }
+
+    #[test]
+    fn test_parse_surrogate_pair_emoji() {
+        // Python's json.dumps (ensure_ascii=True, the default) encodes U+1F600 as
+        // the UTF-16 surrogate-pair escape "😀"; the parser must combine
+        // it. Built with doubled backslashes so the JSON input is the escaped form.
+        let v = parse("\"\\uD83D\\uDE00\"").unwrap();
+        assert_eq!(v.as_str(), Some("\u{1F600}"));
+        // Mixed with BMP text on both sides.
+        let v2 = parse("\"hi \\uD83D\\uDE00!\"").unwrap();
+        assert_eq!(v2.as_str(), Some("hi \u{1F600}!"));
+    }
+
+    #[test]
+    fn test_parse_rejects_lone_surrogates() {
+        // A high surrogate with no following low surrogate is invalid.
+        assert!(parse(r#""\uD83D""#).is_err());
+        // A lone low surrogate is invalid.
+        assert!(parse(r#""\uDE00""#).is_err());
+        // A high surrogate followed by a non-low-surrogate escape is invalid.
+        assert!(parse(r#""\uD83DA""#).is_err());
     }
 
     #[test]

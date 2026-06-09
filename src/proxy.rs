@@ -1032,7 +1032,11 @@ impl Proxy {
             // limiter is disabled — the localhost default). Snapshotted before the
             // gate consumes a token, so `remaining` includes the in-flight request.
             let rl_hdr = self.ratelimit_headers();
-            let extra = format!("{cors}{req_id_hdr}{rl_hdr}");
+            // Server header identifies the proxy + version (peer parity: nginx,
+            // LiteLLM, Ollama all send one); compile-time constant.
+            const SERVER_HDR: &str =
+                concat!("Server: pasture/", env!("CARGO_PKG_VERSION"), "\r\n");
+            let extra = format!("{cors}{req_id_hdr}{rl_hdr}{SERVER_HDR}");
             // Append X-Response-Time (elapsed ms) to every response's header block.
             // Timing begins after request parsing, just before dispatch, so it covers
             // routing + backend time but not TCP accept or header reading.
@@ -4206,6 +4210,19 @@ mod tests {
         assert!(
             resp.contains("X-Request-ID: abc-123"),
             "missing echoed request-id: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_response_carries_server_header() {
+        let p = proxy_with(true, false, 100, "unused");
+        let resp = raw_roundtrip(
+            p,
+            "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_string(),
+        );
+        assert!(
+            resp.contains("Server: pasture/"),
+            "missing Server header: {resp}"
         );
     }
 

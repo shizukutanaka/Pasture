@@ -162,7 +162,13 @@ pub struct LogprobStats {
 /// Lower values mean the local model was less confident; the low percentiles
 /// are what `calibrate --logprob` uses to pick an escalation threshold.
 pub fn logprob_summary(records: &[LoggedRecord]) -> Option<LogprobStats> {
-    let mut lps: Vec<f64> = records.iter().filter_map(|r| r.logprob).collect();
+    // Skip non-finite values: a corrupt log line (e.g. "logprob":1e400 parses to
+    // inf) must not poison the mean/percentiles used by `calibrate --logprob`.
+    let mut lps: Vec<f64> = records
+        .iter()
+        .filter_map(|r| r.logprob)
+        .filter(|v| v.is_finite())
+        .collect();
     if lps.is_empty() {
         return None;
     }
@@ -197,7 +203,11 @@ pub fn summarize(records: &[LoggedRecord]) -> CostSummary {
         }
         s.prompt_tokens += r.prompt_tokens;
         s.completion_tokens += r.completion_tokens;
-        s.cloud_cost_usd += r.cost_usd;
+        // Ignore non-finite costs (corrupt log line) so one bad record cannot
+        // turn the whole spend total into NaN/inf.
+        if r.cost_usd.is_finite() {
+            s.cloud_cost_usd += r.cost_usd;
+        }
     }
     s
 }
@@ -366,5 +376,34 @@ mod tests {
         assert!((st.mean - (-0.55)).abs() < 1e-9, "{}", st.mean);
         assert!((st.min - (-1.0)).abs() < 1e-9);
         assert!(st.p10 <= st.median);
+    }
+
+    #[test]
+    fn test_non_finite_records_do_not_poison_aggregates() {
+        // A corrupt log line (inf/NaN) must not make the spend total or logprob
+        // stats non-finite. inf cost is ignored; inf logprob is filtered out.
+        let recs = vec![
+            LoggedRecord {
+                route: "cloud".into(),
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cost_usd: 0.02,
+                logprob: Some(-0.5),
+            },
+            LoggedRecord {
+                route: "cloud".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cost_usd: f64::INFINITY, // corrupt
+                logprob: Some(f64::NAN), // corrupt
+            },
+        ];
+        let s = summarize(&recs);
+        assert!(s.cloud_cost_usd.is_finite());
+        assert!((s.cloud_cost_usd - 0.02).abs() < 1e-9);
+        let st = logprob_summary(&recs).unwrap();
+        assert_eq!(st.count, 1); // only the finite logprob counts
+        assert!(st.mean.is_finite());
+        assert!((st.mean - (-0.5)).abs() < 1e-9);
     }
 }

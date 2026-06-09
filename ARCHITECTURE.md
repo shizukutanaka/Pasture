@@ -221,6 +221,29 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   that rejects an oversized body (`MAX_BODY_BYTES`, 16 MiB) with `413` instead of an
   unbounded read — closing a remote-DoS vector beyond the existing header/recursion
   caps (IMP-21, partial). All std-only; covered by socket round-trip tests.
+- **ADR-079 `Server` response header (IMP-server-header).** nginx, LiteLLM and
+  Ollama all identify themselves with a `Server` header; Pasture sent none, so
+  proxies/clients/debuggers could not identify the software or detect its version.
+  Every response now carries `Server: pasture/<version>` via the shared `extra`
+  header block, using a compile-time `concat!/env!("CARGO_PKG_VERSION")` constant
+  (zero runtime cost). Additive, std-only; 1 test.
+- **ADR-078 Ignore non-finite values in cost/logprob aggregation (IMP-cost-finite-guard).**
+  A corrupt or hand-edited cost-log line — e.g. `"cost_usd":1e400` parses to `inf`,
+  or `"logprob":NaN` — propagated through `summarize`'s sum and `logprob_summary`'s
+  mean/percentiles, turning the whole `stats` / `calibrate` report into NaN/inf.
+  `summarize` now adds `cost_usd` only when `is_finite()`, and `logprob_summary`
+  filters non-finite logprobs before aggregating. One bad record can no longer poison
+  the totals. Std-only; 1 test.
+- **ADR-077 Parse UTF-16 surrogate-pair `\u` escapes (IMP-json-surrogate-pairs).**
+  Python's `json.dumps` defaults to `ensure_ascii=True`, encoding non-BMP characters
+  (emoji, CJK extensions) as surrogate-pair escapes such as `😀`. The
+  hand-written JSON parser rejected these with "invalid unicode code point", so any
+  Python client sending an emoji via default `json.dumps` got a `400`.
+  `parse_unicode_escape` now returns the raw `u32` code unit, and `parse_string`
+  combines a high surrogate (`D800–DBFF`) with a following low surrogate
+  (`DC00–DFFF`) into the real scalar (`0x10000 + ((hi−D800)<<10) + (lo−DC00)`);
+  lone or mismatched surrogates error cleanly. Literal UTF-8 emoji still works.
+  Std-only; 2 tests.
 - **ADR-076 Config-file parity for `no_nudge` / `allow_sensitive_cloud` (IMP-config-file-parity).**
   Both flags were settable via env (`PASTURE_NO_NUDGE`, `PASTURE_ALLOW_SENSITIVE_CLOUD`)
   but the config-file `apply()` match silently ignored them — a recognised key dropped

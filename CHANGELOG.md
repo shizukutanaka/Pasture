@@ -5,6 +5,25 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Parse UTF-16 surrogate-pair `\u` escapes / emoji (IMP-json-surrogate-pairs)
+
+- The JSON parser now combines surrogate-pair escapes like `😀` into the
+  correct character (😀). Previously these were rejected with a 400, which broke
+  Python clients using `json.dumps` (whose default `ensure_ascii=True` emits
+  surrogate escapes for emoji and other non-BMP characters). Literal UTF-8 emoji
+  still works; lone surrogates are rejected. 2 tests (ADR-077).
+
+### Fixed — Non-finite cost/logprob log lines no longer poison reports (IMP-cost-finite-guard)
+
+- A corrupt cost-log line (e.g. `cost_usd` parsing to infinity, or a `NaN` logprob)
+  no longer turns the entire `stats` / `calibrate` summary into NaN/inf — non-finite
+  values are skipped during aggregation. 1 test (ADR-078).
+
+### Added — `Server` response header (IMP-server-header)
+
+- All responses now include `Server: pasture/<version>`, matching nginx / LiteLLM /
+  Ollama, so the proxy is identifiable and its version detectable. 1 test (ADR-079).
+
 ### Added — Detect more credential formats (IMP-detect-cred-variants)
 
 - The privacy classifier now flags GitHub `ghu_` / `ghs_` / `ghr_` tokens and AWS STS
