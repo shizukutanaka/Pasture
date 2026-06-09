@@ -280,6 +280,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-106 Fix `doctor` `tcp_get` for IPv6 backend URLs (IMP-doctor-ipv6-host).**
+  `TcpStream::connect(("[::1]", 8080))` received a bracketed IPv6 string; `ToSocketAddrs` for the
+  `(&str, u16)` form expects a bare address (`::1`). The brackets are now stripped before connecting.
+  The HTTP `Host` header also omitted the port number, which RFC 7230 §5.4 requires for non-standard
+  ports. Both are fixed; IPv4/hostname behaviour is unchanged. Std-only; 1 test.
+- **ADR-105 Add Thai and Devanagari to dense-script token estimation (IMP-dense-script-thai-devanagari).**
+  A 400-char Thai or Hindi (Devanagari) prompt scored only 100 estimated tokens under the Latin
+  4-chars-per-token heuristic. Both scripts tokenize at ~1 char per token in cl100k_base (same as
+  CJK/kana). Without this fix, a 400-token Thai prompt would route local instead of cloud (4× miss).
+  Mirrors the existing CJK/emoji dense-script extension pattern. Std-only; 1 test.
 - **ADR-104 Clamp rate-limiter token bucket to ≥ 0.0 after subtraction (IMP-ratelimit-token-floor-clamp).**
   `step()` guarded with `tokens >= 1.0` before subtracting, but IEEE 754 arithmetic can produce
   `-0.0` or a tiny negative residue (e.g. `-2.2e-16`) under repeated refill+consume cycles. This

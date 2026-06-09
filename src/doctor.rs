@@ -117,11 +117,18 @@ pub fn port_available(addr: &str) -> bool {
 /// treating it as "reachable" would produce a false-positive doctor report
 /// ("running but no models") for proxies or other services on the same port.
 fn tcp_get(host: &str, port: u16, path: &str, timeout: Duration) -> Option<String> {
-    let mut stream = TcpStream::connect((host, port)).ok()?;
+    // RFC 3986: an IPv6 address in a URL authority is bracketed, e.g. `[::1]`.
+    // TcpStream::connect((&str, u16)) expects a bare address (`::1`), not the
+    // bracketed form. Strip the brackets before connecting.
+    let connect_host = host.trim_matches(|c| c == '[' || c == ']');
+    let mut stream = TcpStream::connect((connect_host, port)).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
+    // RFC 7230 §5.4: the Host header must include the port for non-standard
+    // ports. Keep the original `host` (with brackets if IPv6) for the header.
+    let host_header = format!("{host}:{port}");
     let req =
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: */*\r\n\r\n");
+        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nAccept: */*\r\n\r\n");
     stream.write_all(req.as_bytes()).ok()?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).ok()?;
@@ -199,6 +206,23 @@ mod tests {
             parse_base_url("localhost/v1"),
             ("localhost".to_string(), 1234, "/v1".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_base_url_ipv6() {
+        // ADR-106: IPv6 addresses in URL authority are bracketed per RFC 3986.
+        // parse_base_url must preserve the brackets in the host field so tcp_get
+        // can use them for the Host header while stripping them for TcpStream::connect.
+        let (host, port, path) = parse_base_url("http://[::1]:8080/v1");
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/v1");
+        // tcp_get's bracket-strip logic: connect_host must be bare for ToSocketAddrs.
+        let connect_host = host.trim_matches(|c| c == '[' || c == ']');
+        assert_eq!(connect_host, "::1");
+        // Host header must include port (non-standard) and keep IPv6 brackets.
+        let host_header = format!("{host}:{port}");
+        assert_eq!(host_header, "[::1]:8080");
     }
 
     #[test]

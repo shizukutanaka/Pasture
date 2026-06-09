@@ -81,13 +81,19 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 /// True for characters that tokenize at roughly one token each (CJK, kana,
-/// Hangul, fullwidth/halfwidth forms, emoji).
+/// Hangul, fullwidth/halfwidth forms, emoji, Thai, Devanagari).
 /// Emoji (U+1F000–U+1FAFF) average 1-3 tokens per character in common
 /// tokenizers (GPT-4, LLaMA 3); counting them as 0.25 tok/char (Latin default)
 /// under-estimates prompts with many emoji by 4-12×.
+/// Thai (U+0E00–0E7F) and Devanagari (U+0900–097F, used for Hindi, Sanskrit,
+/// Marathi, Nepali) are each ~1 char per token in cl100k_base; treating them as
+/// Latin (0.25 tok/char) under-estimates a Thai or Hindi technical prompt by 4×,
+/// potentially leaving a genuinely long prompt on the local model.
 fn is_dense_script(c: char) -> bool {
     matches!(c as u32,
-        0x3040..=0x30FF   // Hiragana + Katakana
+        0x0900..=0x097F   // Devanagari (Hindi, Sanskrit, Marathi, Nepali)
+        | 0x0E00..=0x0E7F // Thai
+        | 0x3040..=0x30FF   // Hiragana + Katakana
         | 0x3400..=0x4DBF // CJK Extension A
         | 0x4E00..=0x9FFF // CJK Unified Ideographs
         | 0xF900..=0xFAFF // CJK Compatibility Ideographs
@@ -445,6 +451,21 @@ mod tests {
         // 😀 = U+1F600 (in Emoticons block), 🎉 = U+1F389 (Misc Symbols & Pictographs).
         assert_eq!(estimate_tokens("😀😀😀😀"), 4); // 4 emoji -> 4 dense tokens
         assert_eq!(estimate_tokens("hi 🎉"), 1 + 1); // 3 latin (ceil/4=1) + 1 emoji
+    }
+
+    #[test]
+    fn test_estimate_tokens_thai_and_devanagari_dense() {
+        // ADR-105: Thai and Devanagari are ~1 token/char in cl100k_base.
+        // Without the fix these would score 0.25 tok/char (Latin), under-
+        // estimating a 400-char Thai or Hindi prompt by 4× and leaving it
+        // on the local model instead of escalating.
+        // Thai: สวัสดีครับ (10 chars) → 10 dense tokens
+        assert_eq!(estimate_tokens("สวัสดีครับ"), 10);
+        // Devanagari: नमस्ते (6 chars) → 6 dense tokens
+        assert_eq!(estimate_tokens("नमस्ते"), 6);
+        // Mixed: 4 Latin chars (ceil(4/4)=1) + 6 Thai codepoints (สวัสดี
+        // has 6 Unicode codepoints including combining vowel marks) = 7.
+        assert_eq!(estimate_tokens("hi! สวัสดี"), 1 + 6);
     }
 
     #[test]

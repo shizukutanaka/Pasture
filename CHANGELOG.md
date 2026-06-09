@@ -14,6 +14,20 @@ Format follows Keep a Changelog; versioning follows SemVer.
   followed by ≥12 non-whitespace characters. This covers the most common real-world credential leak
   form (API key in an HTTP request body, curl example, or LLM tool-call output). 1 test. (ADR-101)
 
+### Fixed — Thai and Devanagari prompts now correctly estimated as dense-script (IMP-dense-script-thai-devanagari)
+
+- Thai and Devanagari (Hindi) characters tokenize at ~1 char/token in cl100k_base, but were counted
+  at 0.25 tok/char (Latin default), under-estimating a 400-char Thai prompt as 100 tokens instead
+  of ~400. Long Thai/Hindi prompts that should escalate to cloud were kept local. Both scripts are
+  now in the dense-script block alongside CJK/kana/emoji. 1 test. (ADR-105)
+
+### Fixed — `doctor` IPv6 backend URL connection and Host header (IMP-doctor-ipv6-host)
+
+- `TcpStream::connect` received a bracketed IPv6 host (`[::1]`) from `parse_base_url`; the `(&str,
+  u16)` form of `ToSocketAddrs` expects a bare address. Brackets are now stripped before connecting.
+  The Host header also omitted the port, violating RFC 7230 §5.4 for non-standard ports. Both fixed.
+  1 test. (ADR-106)
+
 ### Fixed — Three latent defensive hardening fixes (ADR-102–104)
 
 - **cost.rs** `logprob_summary`: quantile closure now uses `n.saturating_sub(1)` instead of `n-1`
