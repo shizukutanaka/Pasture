@@ -280,6 +280,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-092 Add Slack `xapp-` and HuggingFace `hf_` token prefixes to PII classifier (IMP-privacy-xapp-hf-prefixes).**
+  Slack App-Level Tokens (`xapp-`, introduced 2020 for Socket Mode / Manifests) and HuggingFace
+  access tokens (`hf_`) are full API credentials commonly pasted into prompts during LLM
+  workflow development, yet both were undetected by the privacy classifier — they would be sent
+  to the cloud unredacted, violating the privacy-first policy. Added to `KEY_PREFIXES` alongside
+  existing credential prefixes; the existing `+12` minimum-suffix-length check prevents false
+  positives on short tokens. The over-classification bias is intentional: false positive = stays
+  local (cheap); false negative = leaks credentials (unacceptable). Std-only; 1 test.
 - **ADR-091 Guard `format_cost`/`format_logprob` against non-finite values (IMP-cost-format-finite-guard).**
   `format!("{:.6}", f64::INFINITY)` = `"inf"` and `format!("{:.4}", f64::NAN)` = `"NaN"` — both are
   invalid JSON numbers. A `CostRecord` carrying a non-finite `cost_usd` or `logprob` (propagated

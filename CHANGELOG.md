@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Slack App-Level Token (`xapp-`) and HuggingFace (`hf_`) credentials now detected as PII (IMP-privacy-xapp-hf-prefixes)
+
+- Slack App-Level Tokens (Socket Mode, `xapp-` prefix) and HuggingFace access tokens (`hf_`)
+  are full API credentials that were previously undetected by the privacy classifier and could
+  be sent to the cloud. Both are now added to `KEY_PREFIXES`, flagged as `api_key` sensitive,
+  and kept local. The minimum-suffix-length check prevents false positives on short tokens.
+  1 test. (ADR-092)
+
 ### Fixed — `format_cost`/`format_logprob` produce valid JSON for non-finite values (IMP-cost-format-finite-guard)
 
 - `format!("{:.6}", f64::INFINITY)` = `"inf"` — an invalid JSON literal that silently corrupts the

@@ -81,9 +81,10 @@ const KEY_PREFIXES: &[&str] = &[
     "ghs_",
     "ghr_",
     "github_pat_",
-    // Slack
+    // Slack (bot, user, and app-level tokens)
     "xoxb-",
     "xoxp-",
+    "xapp-",
     // GitLab
     "glpat-",
     // AWS
@@ -105,6 +106,8 @@ const KEY_PREFIXES: &[&str] = &[
     "dop_v1_",
     // HashiCorp Vault
     "hvs.",
+    // HuggingFace (user/org/fine-grained access tokens)
+    "hf_",
     // Twilio (auth token is 32 hex chars, but SID starts with AC — too generic; skip)
     // Cloudflare
     "v1.0-",
@@ -464,6 +467,24 @@ mod tests {
         assert!(looks_like_api_key("ASIAABCDEFGH12345678"));
         // Still require sufficient length (no short false positives).
         assert!(!looks_like_api_key("ghu_short"));
+    }
+
+    #[test]
+    fn test_api_key_slack_xapp_and_huggingface() {
+        // Slack App-Level Token (Socket Mode, xapp- prefix, real format is ~70 chars)
+        assert!(looks_like_api_key("xapp-1-A01BCDEF234-5678901234-abcdefgh0123456789abcdef0"));
+        // Shorter xapp- tokens below the minimum length threshold must not false-positive
+        assert!(!looks_like_api_key("xapp-short"));
+        // HuggingFace access tokens: hf_ + 37 chars typical
+        assert!(looks_like_api_key("hf_abcdefghijklmnopqrstuvwxyz0123456"));
+        assert!(!looks_like_api_key("hf_tiny"));
+        // classify() propagates both
+        assert!(classify("use this token: xapp-1-A01BCDEF234-5678901234-abcdef01234567890")
+            .categories
+            .contains(&"api_key"));
+        assert!(classify("HUGGINGFACE_TOKEN=hf_abcdefghijklmnopqrstuvwxyz0123456")
+            .categories
+            .contains(&"env_secret"));
     }
 
     #[test]
