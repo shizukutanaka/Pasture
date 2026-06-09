@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — `format_cost`/`format_logprob` produce valid JSON for non-finite values (IMP-cost-format-finite-guard)
+
+- `format!("{:.6}", f64::INFINITY)` = `"inf"` — an invalid JSON literal that silently corrupts the
+  cost log. Any `CostRecord` with a non-finite `cost_usd` or `logprob` (from a cloud backend bug)
+  would write an invalid JSONL line that `parse_log_line` then silently drops (record lost, no error).
+  Both formatters now return `"0"` for any non-finite input before calling `format!`. Closes the
+  serialisation gap complementing the ADR-078 aggregation guard. 3 tests. (ADR-091)
+
 ### Fixed — CLI `pasture chat` cascade cloud failure now logged (IMP-cascade-cli-error-log)
 
 - Same fix as the proxy cascade path (ADR-087): the CLI chat command's cascade

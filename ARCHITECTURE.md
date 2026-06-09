@@ -280,6 +280,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-091 Guard `format_cost`/`format_logprob` against non-finite values (IMP-cost-format-finite-guard).**
+  `format!("{:.6}", f64::INFINITY)` = `"inf"` and `format!("{:.4}", f64::NAN)` = `"NaN"` — both are
+  invalid JSON numbers. A `CostRecord` carrying a non-finite `cost_usd` or `logprob` (propagated
+  from a cloud backend bug) would write an invalid JSONL line, silently corrupting the cost log;
+  `parse_log_line` would then silently drop that record (the in-tree parser correctly rejects `inf`/`NaN`
+  literals). Both functions now return `"0"` on any non-finite input, before the `format!` call.
+  Complements ADR-078 (which guards the read/aggregate path); closes the serialisation path.
+  Grounded in RFC 8259 §6. Std-only; 3 tests.
 - **ADR-082 Trim API key and donate URL env vars (IMP-api-key-trim).** `api_key_from_env`
   checked `!k.trim().is_empty()` but returned the raw untrimmed value, so a key set via
   `export KEY=$(cat ~/.api_key)` — a common pattern that appends a trailing newline —

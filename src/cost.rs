@@ -235,7 +235,12 @@ pub fn summarize(records: &[LoggedRecord]) -> CostSummary {
 }
 
 /// Format a USD cost with up to 6 decimal places, trimming trailing zeros.
+/// Non-finite values (inf/NaN) are serialised as `0` — they are invalid JSON
+/// numbers and would corrupt the log file.
 fn format_cost(cost: f64) -> String {
+    if !cost.is_finite() {
+        return "0".to_string();
+    }
     let s = format!("{cost:.6}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     if trimmed.is_empty() {
@@ -247,7 +252,11 @@ fn format_cost(cost: f64) -> String {
 
 /// Format a (typically negative) log-probability with up to 4 decimals,
 /// trimming trailing zeros, as a valid JSON number.
+/// Non-finite values are serialised as `0` — they are invalid JSON numbers.
 fn format_logprob(v: f64) -> String {
+    if !v.is_finite() {
+        return "0".to_string();
+    }
     let s = format!("{v:.4}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     if trimmed.is_empty() || trimmed == "-" {
@@ -433,6 +442,39 @@ mod tests {
         let v = crate::json::parse(&json).expect("empty stats --json must be valid JSON");
         assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(0.0));
         assert_eq!(v.get("cloud_rate").and_then(|x| x.as_f64()), Some(0.0));
+    }
+
+    #[test]
+    fn test_format_cost_non_finite_is_zero() {
+        assert_eq!(format_cost(f64::INFINITY), "0");
+        assert_eq!(format_cost(f64::NEG_INFINITY), "0");
+        assert_eq!(format_cost(f64::NAN), "0");
+    }
+
+    #[test]
+    fn test_format_logprob_non_finite_is_zero() {
+        assert_eq!(format_logprob(f64::INFINITY), "0");
+        assert_eq!(format_logprob(f64::NEG_INFINITY), "0");
+        assert_eq!(format_logprob(f64::NAN), "0");
+    }
+
+    #[test]
+    fn test_to_jsonl_non_finite_cost_is_valid_json() {
+        // A CostRecord with a non-finite cost (e.g. from upstream bug) must
+        // still produce a valid JSON line — not "inf" or "NaN".
+        let r = CostRecord {
+            ts_secs: 1,
+            route: "cloud",
+            model: "m".to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cost_usd: f64::INFINITY,
+            logprob: Some(f64::NAN),
+        };
+        let line = r.to_jsonl();
+        assert!(crate::json::parse(&line).is_ok(), "line must be valid JSON: {line}");
+        assert!(!line.contains("inf"), "inf must not appear in JSONL");
+        assert!(!line.contains("NaN"), "NaN must not appear in JSONL");
     }
 
     #[test]
