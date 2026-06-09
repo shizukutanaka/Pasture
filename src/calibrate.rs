@@ -48,8 +48,10 @@ pub fn calibrate_threshold(tokens: &[u64], target_cloud_rate: f64) -> (usize, f6
     sorted.sort_unstable();
 
     // We want the smallest threshold T such that the fraction of prompts with
-    // tokens >= T is <= target. Walk the (1 - target) quantile.
-    let idx = (((1.0 - target) * n as f64).floor() as usize).min(n - 1);
+    // tokens >= T is <= target. That requires k = ceil((1-target)*n) so the
+    // achieved fraction (n-k)/n never exceeds target. floor() would let the
+    // achieved rate exceed the budget when (1-target)*n is non-integer (ADR-109).
+    let idx = (((1.0 - target) * n as f64).ceil() as usize).min(n - 1);
     let threshold = sorted[idx];
     let cloud = sorted.iter().filter(|&&t| t >= threshold).count();
     let achieved = cloud as f64 / n as f64;
@@ -144,6 +146,21 @@ mod tests {
         let (thr, rate) = calibrate_threshold(&tokens, 0.2);
         let actual = tokens.iter().filter(|&&t| t >= thr as u64).count() as f64 / 5.0;
         assert!((rate - actual).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_achieved_rate_never_exceeds_target() {
+        // ADR-109: when (1-target)*n is non-integer, floor() gave an index that
+        // let the achieved rate exceed the target budget (e.g. n=3, target=0.5
+        // → floor(1.5)=1 → achieved=2/3=0.667 > 0.5). ceil() fixes this.
+        let tokens = [10u64, 20, 30]; // n=3
+        let (thr, rate) = calibrate_threshold(&tokens, 0.5);
+        let actual = tokens.iter().filter(|&&t| t >= thr as u64).count() as f64 / 3.0;
+        assert!(
+            actual <= 0.5 + 1e-9,
+            "achieved {actual} must not exceed target 0.5 (threshold {thr})"
+        );
+        assert!((rate - actual).abs() < 1e-9, "reported rate must match actual");
     }
 
     #[test]
