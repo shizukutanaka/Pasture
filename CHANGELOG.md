@@ -5,6 +5,25 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — API keys embedded in JSON without surrounding whitespace are now detected (IMP-embedded-api-key-scan)
+
+- `classify()` split on whitespace before checking for API-key prefixes. A credential in a JSON
+  value with no spaces — `{"authorization":"sk-…"}` — was one token whose trimmed form still had
+  `authorization":"` as a prefix, making `starts_with("sk-")` fail. A new `contains_embedded_api_key`
+  scan finds any known prefix in the full text when preceded by a non-alphanumeric character and
+  followed by ≥12 non-whitespace characters. This covers the most common real-world credential leak
+  form (API key in an HTTP request body, curl example, or LLM tool-call output). 1 test. (ADR-101)
+
+### Fixed — Three latent defensive hardening fixes (ADR-102–104)
+
+- **cost.rs** `logprob_summary`: quantile closure now uses `n.saturating_sub(1)` instead of `n-1`
+  to make the `n>=1` invariant self-documenting and panic-safe if the guard is ever moved. (ADR-102)
+- **json.rs** `utf8_len`: invalid UTF-8 lead bytes (continuation 0x80–0xBF, overlong 0xC0–0xC1,
+  above-Unicode 0xF5–0xFF) now return 1 instead of 4, keeping the parser aligned on bad input
+  rather than jumping 4 bytes before the `from_utf8` error. (ADR-103)
+- **ratelimit.rs** `step()`: token subtraction now uses `(tokens - 1.0).max(0.0)` to prevent an
+  IEEE 754 residue (`-2.2e-16`) from inflating `Retry-After` by one second. (ADR-104)
+
 ### Fixed — Quoted/parenthesised JWTs are now detected; shared delimiter-trim helper (IMP-jwt-punctuation-strip)
 
 - After the API-key fix, `looks_like_jwt` still trimmed only `"`, `,`, `;`, so a JWT wrapped in

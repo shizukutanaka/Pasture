@@ -394,8 +394,16 @@ fn utf8_len(first_byte: u8) -> usize {
         2
     } else if first_byte >> 4 == 0b1110 {
         3
-    } else {
+    } else if first_byte >> 3 == 0b11110 {
+        // Valid 4-byte lead: 0xF0–0xF4 (Unicode range U+10000..=U+10FFFF).
         4
+    } else {
+        // 0x80–0xBF (continuation bytes as lead), 0xF5–0xFF (above Unicode max),
+        // 0xC0–0xC1 (overlong 2-byte): all invalid UTF-8 lead bytes. Returning 1
+        // advances past the bad byte, letting the subsequent from_utf8() call
+        // return the correct "invalid UTF-8" error rather than jumping ahead 4
+        // bytes and potentially misaligning the parser.
+        1
     }
 }
 

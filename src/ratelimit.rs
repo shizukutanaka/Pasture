@@ -41,7 +41,9 @@ impl RateLimiter {
     fn step(&mut self, elapsed_secs: f64) -> bool {
         self.tokens = (self.tokens + elapsed_secs * self.refill_per_sec).min(self.capacity);
         if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+            // Clamp to 0.0 so floating-point rounding can never leave tokens
+            // slightly negative, which would produce an inflated retry_after_secs.
+            self.tokens = (self.tokens - 1.0).max(0.0);
             true
         } else {
             false

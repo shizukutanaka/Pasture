@@ -196,7 +196,9 @@ pub fn logprob_summary(records: &[LoggedRecord]) -> Option<LogprobStats> {
     }
     lps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = lps.len();
-    let quantile = |q: f64| lps[((q * n as f64).floor() as usize).min(n - 1)];
+    // n >= 1 guaranteed by the is_empty() guard above; n.saturating_sub(1)
+    // makes the invariant self-documenting and safe if the guard is ever moved.
+    let quantile = |q: f64| lps[((q * n as f64).floor() as usize).min(n.saturating_sub(1))];
     Some(LogprobStats {
         count: n,
         mean: lps.iter().sum::<f64>() / n as f64,

@@ -280,6 +280,28 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-104 Clamp rate-limiter token bucket to ≥ 0.0 after subtraction (IMP-ratelimit-token-floor-clamp).**
+  `step()` guarded with `tokens >= 1.0` before subtracting, but IEEE 754 arithmetic can produce
+  `-0.0` or a tiny negative residue (e.g. `-2.2e-16`) under repeated refill+consume cycles. This
+  would inflate `retry_after_secs()` by one second. Changed to `(tokens - 1.0).max(0.0)`. Std-only;
+  no new tests needed (behaviour identical for all normal inputs).
+- **ADR-103 Return 1 for invalid UTF-8 lead bytes in `utf8_len` to keep the parser aligned (IMP-json-utf8-len-invalid-bytes).**
+  The old catch-all returned 4 for continuation bytes (0x80–0xBF), super-max bytes (0xF5–0xFF), and
+  overlong leads (0xC0–0xC1). These are invalid UTF-8 lead bytes; returning 4 jumped 4 bytes before
+  the `from_utf8` error, potentially skipping valid content. Returning 1 (advance past the bad byte)
+  is the minimal-advance behaviour and keeps the parser aligned. Valid 4-byte leads (0xF0–0xF4) now
+  have an explicit arm. Std-only; existing error-path tests cover the change.
+- **ADR-102 Use `saturating_sub(1)` in `logprob_summary` quantile closure (IMP-cost-quantile-saturating-sub).**
+  `n - 1` for `usize` when `n = 0` underflows. An `is_empty()` guard makes it unreachable today,
+  but `n.saturating_sub(1)` encodes the invariant at the call site and is panic-safe if the guard
+  is ever moved. Std-only; behaviour identical.
+- **ADR-101 Full-text scan for API keys adjacent to non-whitespace JSON content (IMP-embedded-api-key-scan).**
+  `classify()` split on whitespace and ran `looks_like_api_key` per token. A credential embedded in
+  JSON without spaces — `{"authorization":"sk-…"}` — is one whitespace token; trimming its ends
+  leaves `authorization":"sk-…` which fails `starts_with("sk-")`. `contains_embedded_api_key()`
+  scans the full text for any prefix occurrence where the preceding character is non-alphanumeric and
+  ≥12 non-whitespace characters follow — the most common real-world form of a leaked credential.
+  Std-only; 1 test.
 - **ADR-100 Extract shared `trim_token_delimiters`; fix JWT-in-parens detection gap (IMP-jwt-punctuation-strip).**
   After ADR-099, `looks_like_jwt` still trimmed only `"`, `,`, `;`, so a JWT wrapped in parens
   (`(eyJ…)`) or backticks failed `starts_with("eyJ")` and could leak to the cloud — the same class

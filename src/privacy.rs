@@ -147,7 +147,9 @@ pub fn classify(text: &str) -> SensitivityReport {
     if text.split_whitespace().any(looks_like_phone) {
         categories.push("phone");
     }
-    if text.split_whitespace().any(looks_like_api_key) {
+    if text.split_whitespace().any(looks_like_api_key)
+        || contains_embedded_api_key(text)
+    {
         categories.push("api_key");
     }
     if text.split_whitespace().any(looks_like_jwt) {
@@ -308,6 +310,46 @@ pub fn looks_like_api_key(token: &str) -> bool {
     KEY_PREFIXES
         .iter()
         .any(|p| t.starts_with(p) && t.len() >= p.len() + 12)
+}
+
+/// Full-text scan for API-key prefixes that are adjacent to non-whitespace
+/// content with no surrounding spaces — the case that `split_whitespace` +
+/// `trim_token_delimiters` cannot reach (ADR-101).
+///
+/// Example: `{"authorization":"sk-abcdef1234567890"}` is a single whitespace
+/// token whose ends trim to `"authorization":"sk-abcdef1234567890"` — the
+/// interior `sk-` is never exposed to `starts_with`. This function finds the
+/// prefix anywhere in the text as long as (a) the preceding character is not
+/// alphanumeric (so "skiing" never matches "sk-") and (b) at least 12
+/// non-whitespace characters follow the prefix (same minimum as
+/// `looks_like_api_key`).
+pub fn contains_embedded_api_key(text: &str) -> bool {
+    for prefix in KEY_PREFIXES {
+        let mut haystack = text;
+        while let Some(pos) = haystack.find(prefix) {
+            // Preceding character must not be alphanumeric to avoid false
+            // positives from longer words that happen to contain the prefix.
+            let preceding_ok = pos == 0
+                || haystack[..pos]
+                    .chars()
+                    .last()
+                    .map(|c| !c.is_alphanumeric())
+                    .unwrap_or(true);
+            if preceding_ok {
+                let after = &haystack[pos + prefix.len()..];
+                let non_ws = after
+                    .chars()
+                    .take_while(|c| !c.is_whitespace())
+                    .count();
+                if non_ws >= 12 {
+                    return true;
+                }
+            }
+            // Advance past this occurrence to keep searching.
+            haystack = &haystack[pos + prefix.len()..];
+        }
+    }
+    false
 }
 
 /// Heuristic JWT / bearer token: header.payload.signature where the header is
@@ -475,6 +517,28 @@ mod tests {
         assert!(classify(&format!("my token is ({jwt})"))
             .categories
             .contains(&"jwt"));
+    }
+
+    #[test]
+    fn test_embedded_api_key_no_whitespace() {
+        // ADR-101: a credential immediately adjacent to other JSON content
+        // (no surrounding spaces) must be caught by contains_embedded_api_key.
+        assert!(contains_embedded_api_key(
+            r#"{"authorization":"sk-abcdefghijklmnop1234"}"#
+        ));
+        assert!(contains_embedded_api_key(
+            r#"token=ghp_abcdefghijklmnopqr123456789012"#
+        ));
+        // classify() must propagate the detection.
+        assert!(classify(r#"{"key":"sk-abcdefghijklmnop1234"}"#)
+            .categories
+            .contains(&"api_key"));
+        // Partial-word false-positive guard: "skiing" must NOT match "sk-".
+        assert!(!contains_embedded_api_key("skiing is fun today"));
+        // Too-short suffix must not match.
+        assert!(!contains_embedded_api_key("prefix:sk-short"));
+        // Alphanumeric prefix must not match (e.g. a variable named "mysk-...").
+        assert!(!contains_embedded_api_key("mysk-abcdefghijklmnop1234"));
     }
 
     #[test]
