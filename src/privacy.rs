@@ -289,16 +289,22 @@ pub fn looks_like_phone(token: &str) -> bool {
     has_hyphen && (10..=11).contains(&n)
 }
 
+/// Strip the JSON/prose delimiters that wrap a credential quoted in code or
+/// text (`"sk-…"`, `(sk-…)`, `[eyJ…]`, `` `tok` ``). These characters never
+/// appear inside a real token, so trimming them from both ends lets the prefix
+/// checks see the bare token. `-` and `_` are deliberately **not** stripped —
+/// they are valid inside prefixes (`ghp_`, `glpat-`, `xoxb-`) and JWT segments.
+fn trim_token_delimiters(token: &str) -> &str {
+    token.trim_matches(|c: char| {
+        matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '`' | '<' | '>')
+    })
+}
+
 /// Heuristic credential token: a known prefix and enough length. Surrounding
 /// punctuation is stripped first so a key quoted in JSON or prose
-/// (`"sk-…"`, `(sk-…)`, `sk-…,`) is still detected — consistent with
-/// `looks_like_jwt`. Stripped characters are the JSON/prose delimiters that
-/// never appear inside a real token; `-` and `_` are preserved because they
-/// are valid in many prefixes (`ghp_`, `glpat-`, `xoxb-`).
+/// (`"sk-…"`, `(sk-…)`, `sk-…,`) is still detected.
 pub fn looks_like_api_key(token: &str) -> bool {
-    let t = token.trim_matches(|c: char| {
-        matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '`' | '<' | '>')
-    });
+    let t = trim_token_delimiters(token);
     KEY_PREFIXES
         .iter()
         .any(|p| t.starts_with(p) && t.len() >= p.len() + 12)
@@ -306,8 +312,10 @@ pub fn looks_like_api_key(token: &str) -> bool {
 
 /// Heuristic JWT / bearer token: header.payload.signature where the header is
 /// base64url of `{"...` (begins with `eyJ`). Near-zero false positives.
+/// Surrounding punctuation is stripped first (shared with `looks_like_api_key`)
+/// so a JWT quoted or parenthesised in prose is still detected.
 pub fn looks_like_jwt(token: &str) -> bool {
-    let t = token.trim_matches(|c: char| c == '"' || c == ',' || c == ';');
+    let t = trim_token_delimiters(token);
     if !t.starts_with("eyJ") {
         return false;
     }
@@ -454,6 +462,19 @@ mod tests {
             .contains(&"jwt"));
         assert!(!looks_like_jwt("eyJ-not-a-jwt"));
         assert!(!looks_like_jwt("hello.world.foo"));
+    }
+
+    #[test]
+    fn test_jwt_with_surrounding_punctuation() {
+        // ADR-100: a JWT quoted or parenthesised in prose must still be detected
+        // (shared trim helper with looks_like_api_key).
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dBjftJeZ4CVPmB92K27uhbUJU1p1r";
+        assert!(looks_like_jwt(&format!("\"{jwt}\"")));
+        assert!(looks_like_jwt(&format!("({jwt})")));
+        assert!(looks_like_jwt(&format!("`{jwt}`")));
+        assert!(classify(&format!("my token is ({jwt})"))
+            .categories
+            .contains(&"jwt"));
     }
 
     #[test]

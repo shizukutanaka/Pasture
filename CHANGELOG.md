@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Quoted/parenthesised JWTs are now detected; shared delimiter-trim helper (IMP-jwt-punctuation-strip)
+
+- After the API-key fix, `looks_like_jwt` still trimmed only `"`, `,`, `;`, so a JWT wrapped in
+  parens (`(eyJ…)`) or backticks failed `starts_with("eyJ")` and could leak to the cloud. Both
+  detectors now share a `trim_token_delimiters` helper covering the full delimiter set, fixing the
+  gap and removing the duplication. 1 test. (ADR-100)
+
 ### Fixed — Quoted API keys are now detected by the privacy classifier (IMP-api-key-punctuation-strip)
 
 - `looks_like_api_key` checked `starts_with(prefix)` on the raw token, so a credential quoted in

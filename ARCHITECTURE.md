@@ -280,6 +280,12 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-100 Extract shared `trim_token_delimiters`; fix JWT-in-parens detection gap (IMP-jwt-punctuation-strip).**
+  After ADR-099, `looks_like_jwt` still trimmed only `"`, `,`, `;`, so a JWT wrapped in parens
+  (`(eyJ…)`) or backticks failed `starts_with("eyJ")` and could leak to the cloud — the same class
+  of bug ADR-099 fixed for API keys. A shared `trim_token_delimiters` helper now backs both
+  detectors, fixing the JWT gap and removing the duplication so future prefix detectors get
+  consistent delimiter handling. Std-only; 1 test.
 - **ADR-099 Strip surrounding punctuation in `looks_like_api_key` so quoted credentials are detected (IMP-api-key-punctuation-strip).**
   `looks_like_api_key` ran `starts_with(prefix)` on the raw whitespace-split token. A credential
   quoted in prose or code — the common real form, e.g. `my key is "sk-…"` or `(sk-…)` — has a
