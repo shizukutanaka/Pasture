@@ -280,6 +280,13 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-097 Header line count limit in `read_request` to prevent header-flood DoS (IMP-header-count-limit).**
+  The header parsing loop iterated without a line count bound. A crafted request with 1 MiB of
+  minimal `\r\n` pairs generates ~500k iterations — each calling `to_ascii_lowercase()` — pinning a
+  worker thread for milliseconds per connection. The loop now uses `enumerate()` and returns
+  `ReadOutcome::Closed` on the 1001st header field. 1000 is far above any legitimate request
+  (verbose reverse-proxy chains rarely exceed 40 headers). Mirrors the ADR-026 recursion depth cap
+  and the 1 MiB size guard as concentric defence-in-depth layers. Std-only; 1 test.
 - **ADR-096 Escape `method` and `path` in access log to prevent JSON injection (IMP-access-log-json-escape).**
   `append_access_log` directly interpolated `method` and `norm_path` into the JSONL format string
   without escaping. Both come from the HTTP request line (user-supplied); a client sending

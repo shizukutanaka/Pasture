@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Header line count limit prevents header-flood DoS in `read_request` (IMP-header-count-limit)
+
+- The header parsing loop had no bound on line count. A crafted request with 1 MiB of
+  minimal `\r\n` pairs generates ~500k iterations, each calling `to_ascii_lowercase()`,
+  pinning a worker thread. The loop now returns `ReadOutcome::Closed` on the 1001st header
+  field (1000 lines is far above any legitimate request). Defence-in-depth alongside the
+  1 MiB total header size cap and the ADR-026 recursion depth cap. 1 test. (ADR-097)
+
 ### Fixed — Access log `method` and `path` fields are now JSON-escaped (IMP-access-log-json-escape)
 
 - A malicious client sending quotes or backslashes in the HTTP request line (method or path)

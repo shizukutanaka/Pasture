@@ -1935,7 +1935,11 @@ fn read_request(
     let mut connection_close = !http11; // HTTP/1.0 default = close
     let mut request_id: Option<String> = None;
     let mut content_type: Option<String> = None;
-    for line in lines {
+    for (header_idx, line) in lines.enumerate() {
+        if header_idx >= 1000 {
+            // Too many header fields — reject as malformed (DoS guard, ADR-097).
+            return Ok(ReadOutcome::Closed);
+        }
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
@@ -4447,5 +4451,25 @@ mod tests {
             .handle_chat(r#"{"messages":[{"role":"user","content":"hello"}]}"#)
             .unwrap();
         assert!(resp.contains("local-reply"));
+    }
+
+    // ── Header line count DoS guard (ADR-097) ─────────────────────────────────
+
+    #[test]
+    fn test_excessive_header_count_closes_connection() {
+        // A request with > 1000 header fields must be silently closed (DoS guard,
+        // ADR-097). read_request returns ReadOutcome::Closed; the client receives
+        // no response bytes.
+        let p = proxy_with(true, false, 100, "unused");
+        let mut headers = String::new();
+        for i in 0..1001usize {
+            headers.push_str(&format!("X-Pad-{i}: v\r\n"));
+        }
+        let raw = format!("GET /health HTTP/1.1\r\n{headers}\r\n");
+        let resp = roundtrip_raw(p, raw);
+        assert!(
+            resp.is_empty(),
+            "expected empty response (connection closed on excess headers), got: {resp}"
+        );
     }
 }
