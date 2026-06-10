@@ -1499,40 +1499,11 @@ fn prepend_system_prompt(req: &CompletionRequest, prompt: &str) -> CompletionReq
     }
 }
 
+/// Prepend the PC-assistant system context. Same merge semantics as
+/// `prepend_system_prompt`: merged before an existing system message, or
+/// inserted as a new first message.
 fn inject_context_into(req: &CompletionRequest) -> CompletionRequest {
-    let ctx = Message {
-        role: "system".to_string(),
-        content: system_context_text(),
-    };
-    let mut messages = Vec::with_capacity(req.messages.len() + 1);
-    // Insert context before any existing system messages, or at the front.
-    let has_system = req
-        .messages
-        .first()
-        .map(|m| m.role == "system")
-        .unwrap_or(false);
-    if has_system {
-        // Merge with existing system message rather than duplicating.
-        let mut merged = req.messages.clone();
-        let existing = merged[0].content.clone();
-        merged[0].content = format!("{}\n\n{}", ctx.content, existing);
-        return CompletionRequest {
-            model: req.model.clone(),
-            messages: merged,
-            stream: req.stream,
-            has_tools: req.has_tools,
-            sampling: req.sampling.clone(),
-        };
-    }
-    messages.push(ctx);
-    messages.extend_from_slice(&req.messages);
-    CompletionRequest {
-        model: req.model.clone(),
-        messages,
-        stream: req.stream,
-        has_tools: req.has_tools,
-        sampling: req.sampling.clone(),
-    }
+    prepend_system_prompt(req, &system_context_text())
 }
 
 /// Build an OpenAI-compatible error body: `{"error":{"message":..,"type":..}}`
