@@ -410,10 +410,10 @@ mod tests {
         use std::io::Write;
         let p = tmp_path("skip");
         let mut f = std::fs::File::create(&p).unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "// this is a comment").unwrap();
         writeln!(f, r#"{{"prompt":"hello","expected":"local"}}"#).unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         let cases = load_eval_cases(p.to_str().unwrap()).unwrap();
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].prompt, "hello");

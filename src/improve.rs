@@ -35,6 +35,9 @@ impl Status {
         }
     }
 
+    // Fallible label parse returning Option (not the Result the FromStr trait
+    // mandates), so this is an inherent method, not a trait impl.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Status> {
         match s {
             "shipped" => Some(Status::Shipped),
@@ -71,6 +74,9 @@ impl Risk {
         }
     }
 
+    // Fallible label parse returning Option (not the Result the FromStr trait
+    // mandates), so this is an inherent method, not a trait impl.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Risk> {
         match s {
             "low" => Some(Risk::Low),

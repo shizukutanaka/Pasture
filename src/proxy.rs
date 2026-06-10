@@ -290,9 +290,11 @@ impl Proxy {
             || path.starts_with("/v1/moderations")
         {
             Some("POST, OPTIONS")
-        } else if path.starts_with("/v1/stats") || path.starts_with("/metrics") {
-            Some("GET, OPTIONS")
-        } else if path.starts_with("/v1/models") || path.starts_with("/v1/engines") {
+        } else if path.starts_with("/v1/stats")
+            || path.starts_with("/metrics")
+            || path.starts_with("/v1/models")
+            || path.starts_with("/v1/engines")
+        {
             Some("GET, OPTIONS")
         } else if path.starts_with("/health") {
             Some("GET, HEAD")
@@ -2429,7 +2431,7 @@ mod tests {
             "Content-Length must match GET body"
         );
         // Body must be empty (headers end at first \r\n\r\n; nothing follows).
-        let body = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
+        let body = resp.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("");
         assert!(body.is_empty(), "HEAD must have no body: {body:?}");
     }
 
@@ -3280,7 +3282,7 @@ mod tests {
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("x-response-time:"));
         assert!(xrt.is_some(), "X-Response-Time header missing from /health response:\n{raw}");
-        let val = xrt.unwrap().splitn(2, ':').nth(1).unwrap_or("").trim();
+        let val = xrt.unwrap().split_once(':').map(|x| x.1).unwrap_or("").trim();
         assert!(val.ends_with("ms"), "X-Response-Time value must end with ms, got: {val}");
         let ms: u64 = val.trim_end_matches("ms").parse().expect("X-Response-Time not a number");
         assert!(ms < 5000, "X-Response-Time suspiciously large: {ms}ms");
@@ -3338,7 +3340,7 @@ mod tests {
         assert_eq!(status, 200);
         let entries = std::fs::read_to_string(&access).unwrap_or_default();
         assert!(!entries.is_empty(), "access log should not be empty");
-        let parsed: crate::json::JsonValue = crate::json::parse(&entries.trim_end_matches('\n').lines().next().unwrap_or("{}")).unwrap();
+        let parsed: crate::json::JsonValue = crate::json::parse(entries.trim_end_matches('\n').lines().next().unwrap_or("{}")).unwrap();
         assert_eq!(parsed.get("status").and_then(|v| v.as_f64()), Some(200.0), "status: {parsed:?}");
         assert_eq!(parsed.get("method").and_then(|v| v.as_str()), Some("POST"));
         assert_eq!(parsed.get("path").and_then(|v| v.as_str()), Some("/v1/chat/completions"));

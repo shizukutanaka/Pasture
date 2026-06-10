@@ -998,8 +998,10 @@ mod tests {
 
     #[test]
     fn test_openai_fields_includes_response_format() {
-        let mut s = SamplingParams::default();
-        s.response_format = Some(crate::json::parse(r#"{"type":"json_object"}"#).unwrap());
+        let s = SamplingParams {
+            response_format: Some(crate::json::parse(r#"{"type":"json_object"}"#).unwrap()),
+            ..Default::default()
+        };
         let f = s.openai_fields();
         assert!(
             f.contains("\"response_format\":{\"type\":\"json_object\"}"),

@@ -404,9 +404,10 @@ fn dechunk(body: &str) -> Result<String, BackendError> {
         }
         // ADR-107: truncated chunk → protocol error, not silent data loss.
         if after.len() < size {
-            return Err(BackendError::Protocol(
-                format!("chunked body truncated: declared {size} bytes, got {}", after.len()).into(),
-            ));
+            return Err(BackendError::Protocol(format!(
+                "chunked body truncated: declared {size} bytes, got {}",
+                after.len()
+            )));
         }
         out.push_str(&after[..size]);
         // Skip the chunk data and its trailing CRLF.
