@@ -18,6 +18,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
   products the achieved rate exceeded the target (n=3, target=0.5 → 0.667). `ceil()` guarantees
   achieved ≤ target. 1 test. (ADR-109)
 
+### Changed — cli request construction reuses `chat_request` (IMP-refactor-chat-request-reuse)
+
+- The non-cascade cloud/local paths reimplemented the `chat_request` helper's body inline. They
+  now call it (the local path via `{ stream: true, ..chat_request(…) }`); `fast_request` uses
+  `{ model, ..req.clone() }`. `prepend_system_prompt` stays explicit to avoid double-cloning
+  `messages`. Behaviour identical. (ADR-122)
+
 ### Fixed — Intermittent `test_connection_close` failure eliminated (IMP-fix-connection-close-test-flake)
 
 - The test closed the server socket with a pipelined second request unread, triggering a TCP RST

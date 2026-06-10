@@ -280,6 +280,13 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-122 Reuse `chat_request` helper; struct-update for clone-modify sites (IMP-refactor-chat-request-reuse).**
+  The cli non-cascade cloud/local paths reimplemented the body of the existing `chat_request`
+  helper inline (already used by the cascade path). The cloud path now calls it directly; the
+  local path uses `CompletionRequest { stream: true, ..chat_request(…) }` since it differs only
+  in the stream flag; `proxy.rs::fast_request` likewise uses `{ model, ..req.clone() }`. Applied
+  only where the discarded field is cheap — `prepend_system_prompt` is intentionally left explicit
+  because `..req.clone()` would clone its `messages` Vec twice. Behaviour identical; std-only.
 - **ADR-121 Deterministic `Connection: close` pipelining test (IMP-fix-connection-close-test-flake).**
   The session-long flake in `test_connection_close_terminates_after_first_request` had a real
   root cause: the server honours `Connection: close` and drops the socket with the pipelined
