@@ -5,6 +5,38 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Truncated chunked cloud responses now error instead of silently losing data (IMP-dechunk-truncation-error)
+
+- `dechunk()` accepted a chunked body whose declared chunk size exceeded the available bytes and
+  returned the partial data with no signal — downstream code then saw corrupt JSON. It now returns
+  `BackendError::Protocol` with declared-vs-actual byte counts; the cloud retry path handles it.
+  1 test. (ADR-107)
+
+### Fixed — `calibrate` threshold can no longer exceed the requested cloud-rate budget (IMP-calibrate-quantile-ceil)
+
+- `calibrate_threshold` used `floor()` on the `(1-target)·n` quantile index; for non-integer
+  products the achieved rate exceeded the target (n=3, target=0.5 → 0.667). `ceil()` guarantees
+  achieved ≤ target. 1 test. (ADR-109)
+
+### Changed — Code health: zero clippy warnings, duplication sweep, structural decomposition (ADR-108, 110–119)
+
+- Removed the unreachable surrogate-pair error path in the JSON parser (`char::from_u32` cannot
+  fail for a combined valid pair); the invariant is now documented at the call site. (ADR-108)
+- `cargo clippy --all-targets` is clean again: merged the duplicate-arm `route_allowed_methods`
+  branches (deny-level lint), fixed a `useless_conversion` regression, annotated the
+  `Option`-returning `from_str` label parsers, applied mechanical test lints. (ADR-110)
+- Duplication sweep — one source of truth for: backend HTTP wire format (`send_json_post`,
+  ADR-111), doctor's model-list JSON traversal (`extract_string_field`, ADR-112) and model-list
+  printing (`print_doctor_models`, ADR-114), system-message merge semantics
+  (`prepend_system_prompt`, ADR-115), cloud TLS setup (`tls_send`, ADR-116, verified under
+  `--features cloud`), and cost-log JSON number formatting (`format_number`, ADR-117 — the cost
+  path also gains the negative-zero guard it was missing).
+- Structural decomposition — cli `run()` is a thin dispatch (~248 → ~70 lines; `run_route`,
+  `run_eval`, `run_stats`, `run_refer`, ADR-113); `handle_connection`'s endpoint dispatch is one
+  line per route via `wr_result!`/`wr_err!` local macros (ADR-118); `run_completion`'s three
+  completion strategies are named methods (`complete_cascade`, `complete_cloud_with_fallback`,
+  `complete_direct` + `fast_request`, ADR-119). All behaviour-equivalent; 454 tests pass.
+
 ### Fixed — API keys embedded in JSON without surrounding whitespace are now detected (IMP-embedded-api-key-scan)
 
 - `classify()` split on whitespace before checking for API-key prefixes. A credential in a JSON

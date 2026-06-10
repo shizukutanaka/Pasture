@@ -280,6 +280,65 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-119 Extract completion strategies from `run_completion` (IMP-refactor-completion-strategies).**
+  The three completion strategies (cascade, cloud-with-local-fallback, direct-with-fast-model)
+  were inlined in one 90-line if/else expression. Each is now a named, documented method
+  (`complete_cascade`, `complete_cloud_with_fallback`, `complete_direct`, plus `fast_request`
+  for dual-local substitution); `run_completion` reads classify → cache → strategy → store
+  in ~50 lines. Behaviour-equivalent: same calls, order, log lines, and fallbacks. Std-only.
+- **ADR-118 Collapse `handle_connection` endpoint dispatch with `wr_result!`/`wr_err!` (IMP-refactor-dispatch-result-macros).**
+  The `Ok ⇒ 200 / Err ⇒ error-envelope-and-close` shape was written out seven times across
+  the endpoint dispatch. Two local macros (the established idiom — `stream` is mutably
+  borrowed) reduce each endpoint arm to one line; expansion is token-identical to the old
+  code, so keep-alive/close semantics are unchanged. ~298 → ~260 lines. Std-only.
+- **ADR-117 Unify `format_cost`/`format_logprob` onto `format_number` (IMP-refactor-format-number).**
+  Both implemented the same finite-guard + fixed-decimals + trim-trailing-zeros JSON-number
+  logic (6 vs 4 places); the cost copy was missing the negative-zero (`"-"`) guard the
+  logprob copy had. The unified helper keeps the stronger guard — a strict superset for
+  non-negative costs. Std-only.
+- **ADR-116 Extract `tls_send()` for the cloud TLS transport (IMP-refactor-tls-send).**
+  `stream_complete` and `https_exchange` each carried the identical 12-line TLS
+  connect/handshake/write sequence with per-step error mapping. One helper, two callers;
+  verified under `--features cloud` (build, clippy, tests). Std-only default unchanged.
+- **ADR-115 Collapse `inject_context_into` onto `prepend_system_prompt` (IMP-refactor-system-message-merge).**
+  `inject_context_into` reimplemented the exact merge-or-prepend system-message logic of
+  `prepend_system_prompt` in 34 lines (verified line-by-line equivalent); it is now a
+  one-line wrapper, so the merge semantics have one source of truth. Std-only.
+- **ADR-114 Extract `print_doctor_models` from `run_doctor`'s twin branches (IMP-refactor-doctor-model-list).**
+  The models-found/no-models print block appeared verbatim in both the Ollama and
+  OpenAI-compat branches. One helper, two callers; doctor output verified unchanged.
+- **ADR-113 Extract `run_route`/`run_eval`/`run_stats`/`run_refer` from cli `run()` (IMP-refactor-cli-thin-dispatch).**
+  `run()` mixed thin delegation with four inline arms (~180 lines of business logic inside
+  the match). All four now follow the existing `run_*` convention, shrinking `run()` to a
+  readable dispatch (~248 → ~70 lines); the eval extraction also deduplicates the report
+  printing shared by the built-in and `--external` paths. A fn-pointer command table was
+  rejected: Rust would force uniform handler signatures for no real gain.
+- **ADR-112 Unify `doctor`'s twin JSON extractors into `extract_string_field` (IMP-refactor-doctor-extract-string-field).**
+  `parse_model_names` (Ollama: `models`/`name`) and `parse_openai_model_names` (OpenAI:
+  `data`/`id`) were structurally identical 13-line functions differing only in two key
+  names. Both keep their public signatures as one-line wrappers over the shared traversal.
+- **ADR-111 Extract `send_json_post()`: one wire format for backend HTTP (IMP-refactor-http-post-shared-setup).**
+  `http_post` and `http_post_streaming` shared ~22 identical lines (connect, timeouts,
+  POST request format, write). The request wire format now has one source of truth so the
+  buffered and streaming paths cannot drift apart.
+- **ADR-110 Zero clippy warnings restored (IMP-clippy-clean).** A deny-level
+  `if_same_then_else` (two identical `Some("GET, OPTIONS")` arms in `route_allowed_methods`,
+  merged), a `useless_conversion` regression from ADR-107, `should_implement_trait` allows
+  with rationale on the `Option`-returning `from_str` label parsers in improve.rs, and
+  mechanical test-code lints (`--fix`). `cargo clippy --all-targets` is clean.
+- **ADR-109 `calibrate_threshold` quantile: `floor` → `ceil` (IMP-calibrate-quantile-ceil).**
+  When `(1-target)*n` was non-integer, `floor()` picked an index one step too low, letting
+  the achieved cloud rate exceed the target budget (n=3, target=0.5 → achieved 0.667).
+  `ceil()` guarantees achieved ≤ target for all inputs. The existing tests all had integer
+  products and passed regardless; a new non-integer test pins the invariant. 1 test.
+- **ADR-108 Remove unreachable surrogate-pair error in the JSON parser (IMP-json-surrogate-pair-unwrap).**
+  A valid high surrogate combined with a valid low surrogate always yields a scalar value
+  in U+10000..U+10FFFF, so `char::from_u32` cannot fail; the `ok_or_else` error path was
+  dead code that obscured the invariant. Now `unwrap()` with the proof in a comment.
+- **ADR-107 `dechunk()` returns a protocol error on truncated chunked bodies (IMP-dechunk-truncation-error).**
+  A chunked cloud response declaring more bytes than were received was silently returned
+  as partial data, surfacing later as confusing JSON parse errors. The function now returns
+  `BackendError::Protocol` with declared-vs-actual counts; the retry path handles it. 1 test.
 - **ADR-106 Fix `doctor` `tcp_get` for IPv6 backend URLs (IMP-doctor-ipv6-host).**
   `TcpStream::connect(("[::1]", 8080))` received a bracketed IPv6 string; `ToSocketAddrs` for the
   `(&str, u16)` form expects a bare address (`::1`). The brackets are now stripped before connecting.
