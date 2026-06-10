@@ -668,89 +668,20 @@ impl Proxy {
             }
         }
 
-        // Cascade: try local first, escalate to cloud on low confidence.
-        // Never for sensitive content (privacy) or when no cloud is available.
+        // Pick the completion strategy. Cascade (try local, escalate on low
+        // confidence) is never used for sensitive content (privacy) or when
+        // either backend is missing.
         let (resp, route, logprob) = if self.cascade
             && !sensitive
             && decision.route == Route::Local
             && self.cloud.is_some()
             && self.local.is_some()
         {
-            let local = self.backend_for(Route::Local)?;
-            let (local_resp, confidence) = local
-                .complete_scored(req)
-                .map_err(|e| ProxyError::Backend(e.to_string()))?;
-            if crate::cascade::should_escalate(
-                &local_resp.content,
-                confidence,
-                self.cascade_logprob_threshold,
-            ) {
-                let cloud = self.backend_for(Route::Cloud)?;
-                match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
-                    Ok(cloud_resp) => (cloud_resp, Route::Cloud, confidence),
-                    // Cloud failed: fall back to the local answer rather than error.
-                    // Log the failure so the operator knows the cascade attempted.
-                    Err(e) => {
-                        eprintln!("pasture: cascade cloud failed ({e}); using local answer");
-                        (local_resp, Route::Local, confidence)
-                    }
-                }
-            } else {
-                (local_resp, Route::Local, confidence)
-            }
+            self.complete_cascade(req)?
         } else if decision.route == Route::Cloud {
-            // Cloud route: retry transient failures, then fall back to local if
-            // one is available rather than erroring the request (IMP-9).
-            let cloud = self.backend_for(Route::Cloud)?;
-            match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
-                Ok(resp) => (resp, Route::Cloud, None),
-                Err(e) => match self.local.as_deref() {
-                    Some(local) => {
-                        eprintln!("pasture: cloud failed ({e}); falling back to local");
-                        let resp = local
-                            .complete(req)
-                            .map_err(|e| ProxyError::Backend(e.to_string()))?;
-                        (resp, Route::Local, None)
-                    }
-                    None => return Err(ProxyError::Backend(e.to_string())),
-                },
-            }
+            self.complete_cloud_with_fallback(req)?
         } else {
-            let backend = self.backend_for(decision.route)?;
-            // Dual-local routing: if a fast model is configured, use it for
-            // simple short prompts (no hard signals, below fast_threshold tokens).
-            let fast_req;
-            let effective_req = if decision.route == Route::Local {
-                if let Some(fm) = self.fast_model.as_deref() {
-                    let text = req
-                        .messages
-                        .iter()
-                        .rev()
-                        .find(|m| m.role == "user")
-                        .map(|m| m.content.as_str())
-                        .unwrap_or("");
-                    if crate::routing::is_simple_prompt(text, self.fast_threshold) {
-                        fast_req = CompletionRequest {
-                            model: fm.to_string(),
-                            messages: req.messages.clone(),
-                            stream: req.stream,
-                            has_tools: req.has_tools,
-                            sampling: req.sampling.clone(),
-                        };
-                        &fast_req
-                    } else {
-                        req
-                    }
-                } else {
-                    req
-                }
-            } else {
-                req
-            };
-            let resp = backend
-                .complete(effective_req)
-                .map_err(|e| ProxyError::Backend(e.to_string()))?;
-            (resp, decision.route, None)
+            self.complete_direct(req, decision.route)?
         };
 
         // Store on miss.
@@ -761,6 +692,99 @@ impl Proxy {
         }
 
         Ok((resp, route.as_str(), logprob))
+    }
+
+    /// Cascade strategy: answer locally, escalate to the cloud when the local
+    /// answer's confidence is low. A cloud failure falls back to the local
+    /// answer rather than erroring; the failure is logged so the operator
+    /// knows the cascade attempted.
+    fn complete_cascade(
+        &self,
+        req: &CompletionRequest,
+    ) -> Result<(CompletionResponse, Route, Option<f64>), ProxyError> {
+        let local = self.backend_for(Route::Local)?;
+        let (local_resp, confidence) = local
+            .complete_scored(req)
+            .map_err(|e| ProxyError::Backend(e.to_string()))?;
+        if crate::cascade::should_escalate(
+            &local_resp.content,
+            confidence,
+            self.cascade_logprob_threshold,
+        ) {
+            let cloud = self.backend_for(Route::Cloud)?;
+            match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
+                Ok(cloud_resp) => return Ok((cloud_resp, Route::Cloud, confidence)),
+                Err(e) => {
+                    eprintln!("pasture: cascade cloud failed ({e}); using local answer");
+                }
+            }
+        }
+        Ok((local_resp, Route::Local, confidence))
+    }
+
+    /// Cloud strategy: retry transient failures, then fall back to local if
+    /// one is available rather than erroring the request (IMP-9).
+    fn complete_cloud_with_fallback(
+        &self,
+        req: &CompletionRequest,
+    ) -> Result<(CompletionResponse, Route, Option<f64>), ProxyError> {
+        let cloud = self.backend_for(Route::Cloud)?;
+        match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
+            Ok(resp) => Ok((resp, Route::Cloud, None)),
+            Err(e) => match self.local.as_deref() {
+                Some(local) => {
+                    eprintln!("pasture: cloud failed ({e}); falling back to local");
+                    let resp = local
+                        .complete(req)
+                        .map_err(|e| ProxyError::Backend(e.to_string()))?;
+                    Ok((resp, Route::Local, None))
+                }
+                None => Err(ProxyError::Backend(e.to_string())),
+            },
+        }
+    }
+
+    /// Direct strategy: send to the decided backend. On the local route a
+    /// configured fast model handles simple short prompts (dual-local routing).
+    fn complete_direct(
+        &self,
+        req: &CompletionRequest,
+        route: Route,
+    ) -> Result<(CompletionResponse, Route, Option<f64>), ProxyError> {
+        let backend = self.backend_for(route)?;
+        let fast_req = if route == Route::Local {
+            self.fast_request(req)
+        } else {
+            None
+        };
+        let resp = backend
+            .complete(fast_req.as_ref().unwrap_or(req))
+            .map_err(|e| ProxyError::Backend(e.to_string()))?;
+        Ok((resp, route, None))
+    }
+
+    /// A copy of `req` retargeted at the configured fast model when the last
+    /// user prompt is simple enough (no hard signals, below fast_threshold
+    /// tokens); `None` to use the main model.
+    fn fast_request(&self, req: &CompletionRequest) -> Option<CompletionRequest> {
+        let fm = self.fast_model.as_deref()?;
+        let text = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        if !crate::routing::is_simple_prompt(text, self.fast_threshold) {
+            return None;
+        }
+        Some(CompletionRequest {
+            model: fm.to_string(),
+            messages: req.messages.clone(),
+            stream: req.stream,
+            has_tools: req.has_tools,
+            sampling: req.sampling.clone(),
+        })
     }
 
     /// Handle a chat-completion request end to end (buffered), returning the
