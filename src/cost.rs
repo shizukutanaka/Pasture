@@ -236,36 +236,31 @@ pub fn summarize(records: &[LoggedRecord]) -> CostSummary {
     s
 }
 
-/// Format a USD cost with up to 6 decimal places, trimming trailing zeros.
-/// Non-finite values (inf/NaN) are serialised as `0` — they are invalid JSON
-/// numbers and would corrupt the log file.
-fn format_cost(cost: f64) -> String {
-    if !cost.is_finite() {
-        return "0".to_string();
-    }
-    let s = format!("{cost:.6}");
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() {
-        "0".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// Format a (typically negative) log-probability with up to 4 decimals,
-/// trimming trailing zeros, as a valid JSON number.
-/// Non-finite values are serialised as `0` — they are invalid JSON numbers.
-fn format_logprob(v: f64) -> String {
+/// Format an f64 as a valid JSON number with up to `decimals` places,
+/// trimming trailing zeros. Non-finite values (inf/NaN) serialise as `0` —
+/// they are invalid JSON numbers and would corrupt the log file. A negative
+/// zero that trims to a bare `-` also collapses to `0`.
+fn format_number(v: f64, decimals: usize) -> String {
     if !v.is_finite() {
         return "0".to_string();
     }
-    let s = format!("{v:.4}");
+    let s = format!("{v:.decimals$}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     if trimmed.is_empty() || trimmed == "-" {
         "0".to_string()
     } else {
         trimmed.to_string()
     }
+}
+
+/// Format a USD cost with up to 6 decimal places.
+fn format_cost(cost: f64) -> String {
+    format_number(cost, 6)
+}
+
+/// Format a (typically negative) mean log-probability with up to 4 decimals.
+fn format_logprob(v: f64) -> String {
+    format_number(v, 4)
 }
 
 #[cfg(test)]
