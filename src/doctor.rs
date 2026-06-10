@@ -16,20 +16,28 @@ pub struct OllamaStatus {
     pub models: Vec<String>,
 }
 
-/// Extract model names from an Ollama `/api/tags` response.
-/// Shape: `{"models":[{"name":"llama3:latest",...}, ...]}`.
-pub fn parse_model_names(tags_json: &str) -> Vec<String> {
-    let Ok(v) = parse(tags_json) else {
+/// Extract one string field from each object of a top-level JSON array,
+/// e.g. `{"models":[{"name":"x"},…]}` with keys ("models","name") → `["x"]`.
+/// Malformed JSON or a missing array yields `[]`. Shared by the Ollama
+/// `/api/tags` and OpenAI `/v1/models` response shapes.
+fn extract_string_field(json: &str, array_key: &str, field_key: &str) -> Vec<String> {
+    let Ok(v) = parse(json) else {
         return Vec::new();
     };
-    v.get("models")
+    v.get(array_key)
         .and_then(JsonValue::as_array)
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+                .filter_map(|m| m.get(field_key).and_then(|n| n.as_str()).map(String::from))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Extract model names from an Ollama `/api/tags` response.
+/// Shape: `{"models":[{"name":"llama3:latest",...}, ...]}`.
+pub fn parse_model_names(tags_json: &str) -> Vec<String> {
+    extract_string_field(tags_json, "models", "name")
 }
 
 /// True if `want` matches one of the installed models, allowing for the
@@ -77,17 +85,7 @@ pub fn parse_base_url(url: &str) -> (String, u16, String) {
 /// Extract model ids from an OpenAI `/v1/models` response.
 /// Shape: `{"data":[{"id":"..."}, ...]}`.
 pub fn parse_openai_model_names(models_json: &str) -> Vec<String> {
-    let Ok(v) = parse(models_json) else {
-        return Vec::new();
-    };
-    v.get("data")
-        .and_then(JsonValue::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id").and_then(|n| n.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+    extract_string_field(models_json, "data", "id")
 }
 
 /// Probe a local OpenAI-compatible server (LM Studio, etc.) via `/models`.

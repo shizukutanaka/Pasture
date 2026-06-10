@@ -691,13 +691,16 @@ impl Backend for OpenAiCompatBackend {
     }
 }
 
-fn http_post(
+/// Connect with read/write timeouts and send a JSON POST, returning the
+/// stream positioned to read the response. Shared by the buffered and
+/// streaming HTTP paths so the request wire format has one source of truth.
+fn send_json_post(
     host: &str,
     port: u16,
     path: &str,
     body: &str,
     timeout: Duration,
-) -> Result<String, BackendError> {
+) -> Result<TcpStream, BackendError> {
     let addr = format!("{host}:{port}");
     let mut stream = TcpStream::connect(&addr)
         .map_err(|e| BackendError::Transport(format!("connect {addr}: {e}")))?;
@@ -714,6 +717,17 @@ fn http_post(
     stream
         .write_all(request.as_bytes())
         .map_err(|e| BackendError::Transport(e.to_string()))?;
+    Ok(stream)
+}
+
+fn http_post(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &str,
+    timeout: Duration,
+) -> Result<String, BackendError> {
+    let mut stream = send_json_post(host, port, path, body, timeout)?;
     let mut raw = Vec::new();
     stream
         .read_to_end(&mut raw)
@@ -739,22 +753,7 @@ fn http_post_streaming(
     timeout: Duration,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<(), BackendError> {
-    let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| BackendError::Transport(format!("connect {addr}: {e}")))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| BackendError::Transport(e.to_string()))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|e| BackendError::Transport(e.to_string()))?;
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| BackendError::Transport(e.to_string()))?;
+    let mut stream = send_json_post(host, port, path, body, timeout)?;
 
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
