@@ -510,16 +510,7 @@ mod transport {
                 "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n{header_lines}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            let connector = native_tls::TlsConnector::new()
-                .map_err(|e| BackendError::Transport(format!("tls init: {e}")))?;
-            let tcp = TcpStream::connect((host, 443))
-                .map_err(|e| BackendError::Transport(format!("connect {host}: {e}")))?;
-            let mut stream = connector
-                .connect(host, tcp)
-                .map_err(|e| BackendError::Transport(format!("tls handshake: {e}")))?;
-            stream
-                .write_all(request.as_bytes())
-                .map_err(|e| BackendError::Transport(e.to_string()))?;
+            let mut stream = tls_send(host, request.as_bytes())?;
             let content = read_sse_body(&mut stream, self.provider, on_delta)?;
             let prompt_tokens = crate::routing::estimate_tokens(&req.routing_text()) as u64;
             let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
@@ -532,8 +523,13 @@ mod transport {
         }
     }
 
-    /// Perform an HTTPS request over TLS, returning the raw response text.
-    fn https_exchange(host: &str, request: &[u8]) -> Result<String, BackendError> {
+    /// Open a TLS connection to `host:443` and send `request`, returning the
+    /// stream positioned to read the response. Shared by the buffered and
+    /// streaming HTTPS paths so connect/handshake error handling exists once.
+    fn tls_send(
+        host: &str,
+        request: &[u8],
+    ) -> Result<native_tls::TlsStream<TcpStream>, BackendError> {
         let connector = native_tls::TlsConnector::new()
             .map_err(|e| BackendError::Transport(format!("tls init: {e}")))?;
         let tcp = TcpStream::connect((host, 443))
@@ -544,6 +540,12 @@ mod transport {
         stream
             .write_all(request)
             .map_err(|e| BackendError::Transport(e.to_string()))?;
+        Ok(stream)
+    }
+
+    /// Perform an HTTPS request over TLS, returning the raw response text.
+    fn https_exchange(host: &str, request: &[u8]) -> Result<String, BackendError> {
+        let mut stream = tls_send(host, request)?;
         let mut raw = Vec::new();
         stream
             .read_to_end(&mut raw)
