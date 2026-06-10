@@ -280,6 +280,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-124 Error-grounded cascade calibration via isotonic regression (IMP-13, UCCI).**
+  `calibrate --error --labels <f.jsonl> [--target E]` fits a monotone, non-increasing map from
+  local mean-logprob to estimated error probability with the Pool Adjacent Violators Algorithm
+  (std-only `ErrorCurve` in `calibrate.rs`; ties pooled into canonical minimal blocks) and
+  recommends the `PASTURE_CASCADE_LOGPROB` at which answers kept local stay within the error
+  budget — upgrading the cascade knob from a target-*rate* control (ADR-028 quantile) to a
+  target-*accuracy* control. Labels are user-supplied JSONL (`{"logprob": -0.42, "correct": true}`;
+  logprob from the cost log, correctness from the user's own judgement) — honest about label
+  scarcity: the advisory printout shows per-band sample counts, and an unachievable budget says
+  so instead of inventing a threshold. Runtime cascade mechanics unchanged (still one logprob
+  comparison). EN/JA i18n. Grounded: UCCI arXiv:2605.18796, survey 2603.04445, building on
+  2605.02241. 10 new tests (474 total); clippy clean (`--all-targets`).
 - **ADR-123 Optional semantic (embedding-similarity) cache via local `/v1/embeddings` (IMP-12).**
   Adds `cosine_similarity()` (std-only dot-product) and `SemanticCache` (bounded FIFO of
   `(Vec<f64>, CompletionResponse)` pairs; `find_similar()` linear-scans for best cosine ≥ threshold;

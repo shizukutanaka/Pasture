@@ -31,6 +31,9 @@ COMMANDS:
     config                   Print the effective configuration (no secrets)
     calibrate [--target R]   Recommend PASTURE_THRESHOLD from your logged usage (R=cloud rate, default 0.2)
     calibrate --logprob       Recommend PASTURE_CASCADE_LOGPROB from logged cascade confidence
+    calibrate --error --labels <f.jsonl> [--target E]
+                             Recommend PASTURE_CASCADE_LOGPROB for a target error rate E
+                             (default 0.1) from labelled answers: {\"logprob\": -0.4, \"correct\": true}
     donate                   Show how to support development ($1/month)
     refer [provider]         Show configurable cloud-provider referral links
     version                  Print the version
@@ -886,6 +889,9 @@ fn run_improvements(path: Option<&str>, review: bool) -> i32 {
 fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
     use crate::i18n::{detect, t, tf};
     let lang = detect();
+    if rest.iter().any(|a| a == "--error") {
+        return run_calibrate_error(lang, rest);
+    }
     let logprob_mode = rest.iter().any(|a| a == "--logprob");
     let target = option_value(rest, "--target")
         .and_then(|v| v.parse::<f64>().ok())
@@ -961,6 +967,94 @@ fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// `calibrate --error --labels <file> [--target <rate>]` (IMP-13, UCCI-style):
+/// fit a monotone logprob → error-probability curve on labelled answers and
+/// recommend the cascade threshold that keeps local error within the budget.
+/// Advisory like the other calibrate modes; the printout shows per-band sample
+/// counts so a thin label set is visibly thin.
+fn run_calibrate_error(lang: crate::i18n::Lang, rest: &[String]) -> i32 {
+    use crate::i18n::{t, tf};
+    let Some(labels_path) = option_value(rest, "--labels") else {
+        eprintln!("{}", t(lang, "calibrate.error.labels-required"));
+        return 1;
+    };
+    let target = option_value(rest, "--target")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.1)
+        .clamp(0.0, 1.0);
+    let labeled = match crate::calibrate::load_labeled_logprobs(labels_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let Some(curve) = crate::calibrate::ErrorCurve::fit(&labeled) else {
+        println!(
+            "{}",
+            tf(lang, "calibrate.error.empty", &[("path", labels_path)])
+        );
+        return 0;
+    };
+    let n = labeled.len();
+    let wrong = labeled.iter().filter(|l| !l.correct).count();
+    let overall = format!("{:.1}", wrong as f64 * 100.0 / n as f64);
+    let tgt = format!("{:.0}", target * 100.0);
+    println!(
+        "{}",
+        tf(
+            lang,
+            "calibrate.error.header",
+            &[("n", &n.to_string()), ("overall", &overall), ("target", &tgt)]
+        )
+    );
+    // The fitted step curve: each band runs from its start logprob up to the
+    // next band's start (the last band is capped at 0, the logprob maximum).
+    let bps = curve.breakpoints();
+    for (i, &(from, err, count)) in bps.iter().enumerate() {
+        let to = bps.get(i + 1).map_or(0.0, |b| b.0);
+        println!(
+            "{}",
+            tf(
+                lang,
+                "calibrate.error.band",
+                &[
+                    ("from", &format!("{from:.3}")),
+                    ("to", &format!("{to:.3}")),
+                    ("err", &format!("{:.1}", err * 100.0)),
+                    ("count", &count.to_string()),
+                ]
+            )
+        );
+    }
+    match curve.threshold_for_error(target) {
+        Some(threshold) => {
+            let thr = format!("{threshold:.3}");
+            let escalate = labeled.iter().filter(|l| l.logprob < threshold).count();
+            let rate = format!("{:.1}", escalate as f64 * 100.0 / n as f64);
+            println!(
+                "{}",
+                tf(
+                    lang,
+                    "calibrate.error.result",
+                    &[("threshold", &thr), ("rate", &rate), ("target", &tgt)]
+                )
+            );
+            println!(
+                "{}",
+                tf(lang, "calibrate.error.apply", &[("threshold", &thr)])
+            );
+        }
+        None => {
+            println!(
+                "{}",
+                tf(lang, "calibrate.error.unachievable", &[("target", &tgt)])
+            );
+        }
+    }
+    0
 }
 
 /// `config`: print the effective configuration (resolved env + defaults).

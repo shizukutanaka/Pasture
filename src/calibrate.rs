@@ -16,6 +16,14 @@
 //! length threshold — against real usage. The estimate is length-only: the
 //! engine also escalates on content signals (reasoning/code/privacy), so the
 //! realised cloud rate will be at least this much.
+//!
+//! When the user *does* have labels — (mean-logprob, was-the-answer-correct)
+//! pairs — `ErrorCurve` upgrades the cascade knob from a target-*rate* control
+//! to a target-*accuracy* control (IMP-13, UCCI arXiv:2605.18796): a monotone
+//! map from mean-logprob to estimated error probability, fit with the Pool
+//! Adjacent Violators Algorithm (isotonic regression, std-only). The fit is
+//! advisory and degrades gracefully with few labels: fewer labels → coarser
+//! blocks → more conservative recommendations.
 
 /// Recommend a token threshold so that about `target_cloud_rate` of the given
 /// prompts (by length alone) would route to the cloud.
@@ -94,6 +102,150 @@ pub fn calibrate_logprob_threshold(logprobs: &[f64], target_escalation_rate: f64
     let threshold = sorted[idx];
     let escalate = sorted.iter().filter(|&&v| v < threshold).count();
     (threshold, escalate as f64 / n as f64)
+}
+
+/// A labelled confidence observation (IMP-13): the local model's mean token
+/// log-probability for one answer, and whether that answer was judged correct.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LabeledLogprob {
+    pub logprob: f64,
+    pub correct: bool,
+}
+
+/// A monotone, non-increasing map from mean-logprob to estimated error
+/// probability (IMP-13, UCCI arXiv:2605.18796), fit with the Pool Adjacent
+/// Violators Algorithm. Higher confidence (logprob closer to 0) never yields a
+/// higher estimated error — the monotonicity constraint is what lets a small
+/// label set produce a usable curve instead of noise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ErrorCurve {
+    /// Step blocks ascending by logprob: (lowest logprob in block, estimated
+    /// error probability, number of labels pooled into the block). Error values
+    /// are non-increasing across blocks.
+    blocks: Vec<(f64, f64, usize)>,
+}
+
+impl ErrorCurve {
+    /// Fit the curve on labelled observations. Non-finite logprobs are dropped;
+    /// returns `None` when nothing usable remains.
+    pub fn fit(labeled: &[LabeledLogprob]) -> Option<ErrorCurve> {
+        let mut pts: Vec<(f64, f64)> = labeled
+            .iter()
+            .filter(|l| l.logprob.is_finite())
+            .map(|l| (l.logprob, if l.correct { 0.0 } else { 1.0 }))
+            .collect();
+        if pts.is_empty() {
+            return None;
+        }
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("filtered to finite"));
+        // PAVA for a non-increasing fit: walk left to right keeping blocks of
+        // (start_logprob, error_sum, count); a later block whose mean exceeds
+        // its predecessor's violates monotonicity and is merged into it.
+        // Equal means are merged too — same fitted function, canonical minimal
+        // blocks (so the advisory printout pools ties into one honest n=).
+        let mut blocks: Vec<(f64, f64, usize)> = Vec::new();
+        for (lp, y) in pts {
+            blocks.push((lp, y, 1));
+            while blocks.len() >= 2 {
+                let (_, last_sum, last_n) = blocks[blocks.len() - 1];
+                let (_, prev_sum, prev_n) = blocks[blocks.len() - 2];
+                if prev_sum / (prev_n as f64) <= last_sum / (last_n as f64) {
+                    blocks.pop();
+                    let prev = blocks.last_mut().expect("len checked >= 2");
+                    prev.1 += last_sum;
+                    prev.2 += last_n;
+                } else {
+                    break;
+                }
+            }
+        }
+        Some(ErrorCurve {
+            blocks: blocks
+                .into_iter()
+                .map(|(lp, sum, n)| (lp, sum / n as f64, n))
+                .collect(),
+        })
+    }
+
+    /// Estimated error probability at a given mean logprob (step lookup).
+    /// Below the first block the first (highest-error) estimate applies.
+    pub fn error_at(&self, logprob: f64) -> f64 {
+        let mut est = self.blocks[0].1;
+        for &(start, err, _) in &self.blocks {
+            if start <= logprob {
+                est = err;
+            } else {
+                break;
+            }
+        }
+        est
+    }
+
+    /// The lowest observed logprob whose estimated error is `<= target` —
+    /// usable directly as `PASTURE_CASCADE_LOGPROB`: answers below it escalate,
+    /// answers at or above it stay local with estimated error within budget.
+    /// `None` when even the most confident block exceeds the target.
+    pub fn threshold_for_error(&self, target: f64) -> Option<f64> {
+        self.blocks
+            .iter()
+            .find(|&&(_, err, _)| err <= target)
+            .map(|&(lp, _, _)| lp)
+    }
+
+    /// The fitted step curve: `(lowest logprob in block, estimated error, n)`,
+    /// ascending by logprob; each estimate applies until the next block starts.
+    pub fn breakpoints(&self) -> &[(f64, f64, usize)] {
+        &self.blocks
+    }
+}
+
+/// Load labelled (logprob, correct) pairs from a JSONL file (IMP-13). Each
+/// non-blank, non-`//` line must be a JSON object with a finite numeric
+/// `"logprob"` and a boolean `"correct"`:
+///
+/// ```json
+/// {"logprob": -0.42, "correct": true}
+/// {"logprob": -1.87, "correct": false}
+/// ```
+///
+/// The `logprob` values come from the cost log's `logprob` field (cascade
+/// runs record them); `correct` is the user's own judgement of that answer.
+pub fn load_labeled_logprobs(path: &str) -> Result<Vec<LabeledLogprob>, String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for (lineno, line_res) in reader.lines().enumerate() {
+        let line = line_res.map_err(|e| format!("{path}:{}: read error: {e}", lineno + 1))?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let val = crate::json::parse(line).map_err(|e| format!("{path}:{}: {e}", lineno + 1))?;
+        let logprob = val
+            .get("logprob")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| {
+                format!(
+                    "{path}:{}: missing or non-numeric 'logprob' field",
+                    lineno + 1
+                )
+            })?;
+        if !logprob.is_finite() {
+            return Err(format!("{path}:{}: 'logprob' must be finite", lineno + 1));
+        }
+        let correct = val
+            .get("correct")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| {
+                format!(
+                    "{path}:{}: missing or non-boolean 'correct' field",
+                    lineno + 1
+                )
+            })?;
+        out.push(LabeledLogprob { logprob, correct });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -183,5 +335,155 @@ mod tests {
         // All-NaN input must return the safe (0.0, 0.0) default.
         let all_nan = vec![f64::NAN, f64::NAN];
         assert_eq!(calibrate_logprob_threshold(&all_nan, 0.5), (0.0, 0.0));
+    }
+
+    // ── ErrorCurve (IMP-13) tests ────────────────────────────────────────────
+
+    fn lab(logprob: f64, correct: bool) -> LabeledLogprob {
+        LabeledLogprob { logprob, correct }
+    }
+
+    #[test]
+    fn test_error_curve_pava_merges_violators() {
+        // Errors by ascending logprob: 1,1,0,1,0,0. The 0-then-1 at positions
+        // 3..4 violates non-increasing → PAVA pools them into a 0.5 block.
+        let labeled = vec![
+            lab(-3.0, false),
+            lab(-2.5, false),
+            lab(-2.0, true),
+            lab(-1.5, false),
+            lab(-1.0, true),
+            lab(-0.5, true),
+        ];
+        let curve = ErrorCurve::fit(&labeled).unwrap();
+        let bps = curve.breakpoints();
+        assert_eq!(bps.len(), 3, "blocks: {bps:?}");
+        assert_eq!(bps[0], (-3.0, 1.0, 2));
+        assert_eq!(bps[1], (-2.0, 0.5, 2));
+        assert_eq!(bps[2], (-1.0, 0.0, 2));
+    }
+
+    #[test]
+    fn test_error_curve_fitted_values_non_increasing() {
+        // Alternating correctness: the fit must still be monotone.
+        let labeled: Vec<LabeledLogprob> = (0..20)
+            .map(|i| lab(-2.0 + 0.1 * i as f64, i % 3 != 0))
+            .collect();
+        let curve = ErrorCurve::fit(&labeled).unwrap();
+        let bps = curve.breakpoints();
+        for w in bps.windows(2) {
+            assert!(
+                w[0].1 >= w[1].1,
+                "error estimates must be non-increasing: {bps:?}"
+            );
+        }
+        // Pooled counts must account for every label.
+        assert_eq!(bps.iter().map(|b| b.2).sum::<usize>(), 20);
+    }
+
+    #[test]
+    fn test_error_curve_error_at_lookup() {
+        let labeled = vec![
+            lab(-3.0, false),
+            lab(-2.5, false),
+            lab(-2.0, true),
+            lab(-1.5, false),
+            lab(-1.0, true),
+            lab(-0.5, true),
+        ];
+        let curve = ErrorCurve::fit(&labeled).unwrap();
+        // Below the first block → first (worst) estimate.
+        assert_eq!(curve.error_at(-10.0), 1.0);
+        // Inside each block → that block's estimate.
+        assert_eq!(curve.error_at(-2.6), 1.0);
+        assert_eq!(curve.error_at(-1.7), 0.5);
+        assert_eq!(curve.error_at(-0.2), 0.0);
+    }
+
+    #[test]
+    fn test_error_curve_threshold_for_error() {
+        let labeled = vec![
+            lab(-3.0, false),
+            lab(-2.5, false),
+            lab(-2.0, true),
+            lab(-1.5, false),
+            lab(-1.0, true),
+            lab(-0.5, true),
+        ];
+        let curve = ErrorCurve::fit(&labeled).unwrap();
+        // Blocks: (-3.0, 1.0), (-2.0, 0.5), (-1.0, 0.0).
+        assert_eq!(curve.threshold_for_error(0.6), Some(-2.0));
+        assert_eq!(curve.threshold_for_error(0.05), Some(-1.0));
+        // Target met even by the worst block → lowest logprob (escalate ~nothing).
+        assert_eq!(curve.threshold_for_error(1.0), Some(-3.0));
+    }
+
+    #[test]
+    fn test_error_curve_unachievable_target() {
+        // Every answer wrong → single block at error 1.0; no threshold meets 50%.
+        let labeled = vec![lab(-2.0, false), lab(-1.0, false), lab(-0.5, false)];
+        let curve = ErrorCurve::fit(&labeled).unwrap();
+        assert_eq!(curve.breakpoints(), &[(-2.0, 1.0, 3)]);
+        assert_eq!(curve.threshold_for_error(0.5), None);
+    }
+
+    #[test]
+    fn test_error_curve_all_correct() {
+        let labeled = vec![lab(-2.0, true), lab(-1.0, true)];
+        let curve = ErrorCurve::fit(&labeled).unwrap();
+        assert_eq!(curve.breakpoints(), &[(-2.0, 0.0, 2)]);
+        // Any budget is met from the lowest observed logprob.
+        assert_eq!(curve.threshold_for_error(0.01), Some(-2.0));
+    }
+
+    #[test]
+    fn test_error_curve_filters_non_finite_and_empty() {
+        assert!(ErrorCurve::fit(&[]).is_none());
+        assert!(ErrorCurve::fit(&[lab(f64::NAN, true)]).is_none());
+        let curve = ErrorCurve::fit(&[lab(f64::NAN, false), lab(-1.0, true)]).unwrap();
+        assert_eq!(curve.breakpoints().len(), 1);
+        assert_eq!(curve.error_at(-1.0), 0.0);
+    }
+
+    fn tmp_labels(name: &str, body: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let p = std::env::temp_dir().join(format!("pasture_labels_{name}.jsonl"));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        p
+    }
+
+    #[test]
+    fn test_load_labeled_logprobs_basic() {
+        let p = tmp_labels(
+            "basic",
+            "{\"logprob\": -0.42, \"correct\": true}\n\n// comment\n{\"logprob\": -1.87, \"correct\": false}\n",
+        );
+        let labels = load_labeled_logprobs(p.to_str().unwrap()).unwrap();
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0], lab(-0.42, true));
+        assert_eq!(labels[1], lab(-1.87, false));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_load_labeled_logprobs_rejects_bad_lines() {
+        for (name, body, want) in [
+            ("missing_lp", "{\"correct\": true}\n", "logprob"),
+            ("missing_c", "{\"logprob\": -0.5}\n", "correct"),
+            ("string_c", "{\"logprob\": -0.5, \"correct\": \"yes\"}\n", "correct"),
+            ("not_json", "not json\n", ""),
+        ] {
+            let p = tmp_labels(name, body);
+            let err = load_labeled_logprobs(p.to_str().unwrap()).unwrap_err();
+            assert!(err.contains(":1:"), "{name}: error must cite the line: {err}");
+            assert!(err.contains(want), "{name}: {err}");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    #[test]
+    fn test_load_labeled_logprobs_missing_file() {
+        assert!(load_labeled_logprobs("/no/such/labels.jsonl").is_err());
     }
 }

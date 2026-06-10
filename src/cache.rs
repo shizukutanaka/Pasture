@@ -519,7 +519,8 @@ mod tests {
         let mut c = SemanticCache::new(4, 0.8);
         // Store two vectors at different angles from [1,0]
         let v_close = vec![0.99f64, 0.14142f64]; // cos ~ 0.99
-        let v_far = vec![0.70711f64, 0.70711f64]; // cos ~ 0.707
+        let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+        let v_far = vec![inv_sqrt2, inv_sqrt2]; // cos ~ 0.707
         c.put(v_far.clone(), resp("far"));
         c.put(v_close.clone(), resp("close"));
         let hit = c.find_similar(&[1.0, 0.0]);

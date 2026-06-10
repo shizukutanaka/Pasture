@@ -99,7 +99,7 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 
 ### Tier 1 — Low-risk API parity, fits the philosophy (std-only)
 
-#### IMP-8 — `/v1/models` and `/v1/embeddings` endpoints  — `/v1/models` ✅ SHIPPED
+#### IMP-8 — `/v1/models` and `/v1/embeddings` endpoints  — ✅ SHIPPED
 - **What:** `GET /v1/models` (return the configured local + cloud model ids in
   OpenAI list shape) is **implemented** (ADR-030; `build_models_response` +
   `Proxy::with_models`). `POST /v1/embeddings` (pass through to the local backend's
@@ -137,7 +137,7 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 - **Effort:** S · **Risk:** low–med (must pass fields through faithfully) ·
   **Zero-dep default?** ✅ (reuses the std-only JSON parser).
 
-#### IMP-11 — Cache-key normalization (near-exact hits)
+#### IMP-11 — Cache-key normalization (near-exact hits)  — ✅ SHIPPED
 - **What:** Before hashing the cache key in `cache.rs`, canonicalize messages
   (trim/collapse whitespace, normalize case for the match key, drop trailing
   punctuation). Still deterministic and exact-on-normalized-form.
@@ -151,7 +151,7 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 
 ### Tier 2 — Research-grounded routing/cache upgrades (opt-in)
 
-#### IMP-12 — Optional semantic cache via local embeddings
+#### IMP-12 — Optional semantic cache via local embeddings  — ✅ SHIPPED (ADR-123)
 - **What:** Opt-in (`PASTURE_SEMANTIC_CACHE=…`) cache that embeds the prompt via the
   **local backend's `/v1/embeddings`** and counts a hit when cosine similarity ≥ a
   tunable threshold (default ~0.92). Log near-miss distances so the user can monitor
@@ -167,7 +167,7 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
   a conservative default threshold + FP monitoring + opt-in) · **Zero-dep default?**
   ✅ (opt-in; uses local embeddings, no TLS/no vector-DB crate).
 
-#### IMP-13 — Calibrated-uncertainty escalation (complete the UCCI step)
+#### IMP-13 — Calibrated-uncertainty escalation (complete the UCCI step)  — ✅ SHIPPED (ADR-124)
 - **What:** Extend `calibrate --logprob` (ADR-028) from a target-*rate* quantile to a
   **monotone (isotonic-style, std-only) map from local mean-logprob → estimated error
   probability**, fit on the 18-case `eval.rs` set plus any user-supplied labels.
@@ -199,7 +199,7 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 
 ### Tier 3 — Deployment maturity (opt-in, off by default)
 
-#### IMP-15 — Optional bearer-token auth + token-bucket rate-limit
+#### IMP-15 — Optional bearer-token auth + token-bucket rate-limit  — ✅ SHIPPED
 - **What:** When the proxy is bound to a non-localhost address, optionally require a
   bearer token (`PASTURE_PROXY_TOKEN`) and apply a std-only token-bucket rate-limit.
   Localhost default behaviour is unchanged (trusted single user).
@@ -210,7 +210,7 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 - **Effort:** M · **Risk:** med (security-sensitive — constant-time token compare,
   fail-closed) · **Zero-dep default?** ✅ (std-only; off by default).
 
-#### IMP-16 — Live metrics endpoint
+#### IMP-16 — Live metrics endpoint  — ✅ SHIPPED
 - **What:** `GET /metrics` (Prometheus text) or `GET /v1/stats` (JSON) exposing the
   same counters the cost log already accumulates (route split, cloud rate, cache hit
   rate, tokens, spend, cascade-confidence distribution).
@@ -221,7 +221,7 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 - **Effort:** S–M · **Risk:** low · **Zero-dep default?** ✅ (std-only; reuses
   `cost.rs` aggregation).
 
-#### IMP-17 — RouterBench-format external eval loader
+#### IMP-17 — RouterBench-format external eval loader  — ✅ SHIPPED
 - **What:** Let `eval` optionally load a larger labelled set in RouterBench
   CSV/JSONL format, while keeping the built-in 18-case set as the offline regression.
 - **Why:** Validates routing quality against a public, comparable benchmark and turns

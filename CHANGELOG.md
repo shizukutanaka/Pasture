@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Error-grounded cascade calibration: `calibrate --error` (IMP-13, UCCI-style)
+
+- `pasture calibrate --error --labels <f.jsonl> [--target E]` turns the cascade knob from an
+  escalation-*rate* budget into a target-*accuracy* budget. It fits a monotone logprob → error-
+  probability curve (Pool Adjacent Violators isotonic regression, std-only) on user-labelled
+  answers (`{"logprob": -0.42, "correct": true}` per line; logprobs come from the cost log) and
+  recommends the `PASTURE_CASCADE_LOGPROB` at which answers kept local have estimated error ≤ E
+  (default 0.1). The printout shows each fitted error band with its sample count, so a thin label
+  set is visibly thin; an unachievable budget is reported rather than papered over. Runtime
+  behaviour is unchanged — the cascade still does one logprob comparison. EN/JA. Grounded in UCCI
+  (arXiv:2605.18796) and the routing survey (2603.04445). 10 new tests; 474 total. (ADR-124)
+
 ### Added — Optional semantic cache via local `/v1/embeddings` (IMP-12)
 
 - Set `PASTURE_SEMANTIC_CACHE=N` to hold up to N embedding–response pairs. On each non-sensitive
