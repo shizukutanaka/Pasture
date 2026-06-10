@@ -498,6 +498,20 @@ fn cloud_key_hint(config: &Config) -> String {
 }
 
 /// Run environment diagnostics with concrete, copy-pasteable fixes.
+/// Print the installed-model list (or the "no models" hint) for a reachable
+/// local engine. Shared by the Ollama and OpenAI-compat doctor branches.
+fn print_doctor_models(lang: crate::i18n::Lang, models: &[String]) {
+    use crate::i18n::{t, tf};
+    if models.is_empty() {
+        println!("{}", t(lang, "doctor.ollama.nomodels"));
+    } else {
+        println!(
+            "{}",
+            tf(lang, "doctor.ollama.models", &[("models", &models.join(", "))])
+        );
+    }
+}
+
 fn run_doctor(config: &Config) -> i32 {
     use crate::i18n::{detect, t, tf};
     let lang = detect();
@@ -522,18 +536,7 @@ fn run_doctor(config: &Config) -> i32 {
                     ]
                 )
             );
-            if s.models.is_empty() {
-                println!("{}", t(lang, "doctor.ollama.nomodels"));
-            } else {
-                println!(
-                    "{}",
-                    tf(
-                        lang,
-                        "doctor.ollama.models",
-                        &[("models", &s.models.join(", "))]
-                    )
-                );
-            }
+            print_doctor_models(lang, &s.models);
         } else {
             problems += 1;
             println!(
@@ -563,18 +566,7 @@ fn run_doctor(config: &Config) -> i32 {
                     &[("host", &config.ollama_host), ("port", &port)]
                 )
             );
-            if s.models.is_empty() {
-                println!("{}", t(lang, "doctor.ollama.nomodels"));
-            } else {
-                println!(
-                    "{}",
-                    tf(
-                        lang,
-                        "doctor.ollama.models",
-                        &[("models", &s.models.join(", "))]
-                    )
-                );
-            }
+            print_doctor_models(lang, &s.models);
         } else {
             problems += 1;
             println!(
