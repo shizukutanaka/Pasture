@@ -1116,6 +1116,17 @@ fn run_config(config: &Config) -> i32 {
         },
         config.hard_threshold
     );
+    if config.skills.is_empty() {
+        println!("  skills:            {unset}");
+    } else {
+        let s: Vec<String> = config
+            .skills
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect();
+        println!("  skills:            {}", s.join(", "));
+    }
+    println!("  injection_guard:   {}", config.injection_guard);
     println!("  cost_log:          {}", config.cost_log_path);
     println!("  donate_url:        {}", yn(config.donate_url.is_some()));
     println!("  lang:              {}", lang.code());
@@ -1130,6 +1141,22 @@ fn make_engine(profile: &HardwareProfile, config: &Config, cloud_available: bool
         .with_local_only(config.local_only);
     if let Some(t) = config.threshold {
         engine = engine.with_threshold(t);
+    }
+    // Skill-profile overrides (IMP-25): convert String route names → Route enum.
+    if !config.skills.is_empty() {
+        let skills: Vec<(String, crate::routing::Route)> = config
+            .skills
+            .iter()
+            .filter_map(|(skill, route)| {
+                let r = match route.as_str() {
+                    "local" => crate::routing::Route::Local,
+                    "cloud" => crate::routing::Route::Cloud,
+                    _ => return None,
+                };
+                Some((skill.clone(), r))
+            })
+            .collect();
+        engine = engine.with_skills(skills);
     }
     engine
 }
@@ -1311,7 +1338,8 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
             Some(std::time::Duration::from_secs(config.request_timeout_secs))
         } else {
             None
-        });
+        })
+        .with_injection_guard(&config.injection_guard);
     print!(
         "{}",
         crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])

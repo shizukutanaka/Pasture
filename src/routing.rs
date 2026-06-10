@@ -61,23 +61,37 @@ impl std::fmt::Display for RoutingError {
 
 impl std::error::Error for RoutingError {}
 
-/// Estimate the token count of a prompt. Heuristic: ~4 characters per token,
-/// which is good enough for threshold comparisons and needs no tokenizer.
-/// Estimate token count across scripts. Latin/whitespace text averages ~4
-/// chars per token, but CJK and Hangul are far denser (≈1 token per character).
-/// A purely chars/4 estimate would undercount Japanese/Chinese/Korean ~4x and
-/// keep long non-Latin prompts on the local model when they should escalate.
+/// Estimate the token count of a prompt (IMP-22 fertility-aware heuristic).
+///
+/// Three script classes, each with its empirical fertility (chars-per-token):
+/// - **Dense** (CJK, Hangul, kana, Thai, Devanagari, emoji): ≈1.0 tok/char.
+/// - **Digits** (ASCII 0-9): ≈0.5 tok/char — multi-digit numbers cluster
+///   as 2-3 chars per token in cl100k_base and LLaMA tokenisers.
+/// - **Latin / punctuation**: ≈0.25 tok/char (the traditional 4 chars/token).
+/// - **Whitespace** (spaces, tabs, newlines): ≈0 tok/char — whitespace is
+///   fused into adjacent tokens and does not generate tokens on its own;
+///   counting it as 0.25 systematically over-estimated space-heavy text.
+///
+/// This corrects the two largest systematic errors vs. the prior two-bucket
+/// implementation: whitespace inflation and digit under-counting
+/// (arXiv:2509.05486 "The Token Tax"; IMP-22).
 pub fn estimate_tokens(text: &str) -> usize {
-    let mut dense = 0usize; // CJK / Hangul: ~1 token per char
-    let mut other = 0usize; // Latin etc.: ~1 token per 4 chars
+    let mut dense = 0usize;  // CJK / Hangul / kana / Thai / Devangari / emoji
+    let mut digits = 0usize; // ASCII 0-9: ~0.5 tok/char
+    let mut latin = 0usize;  // letters, punctuation: ~0.25 tok/char
+    // whitespace (spaces, tabs, newlines) contributes 0 tokens
     for c in text.chars() {
         if is_dense_script(c) {
             dense += 1;
+        } else if c.is_ascii_whitespace() {
+            // fused into adjacent tokens — no separate token contribution
+        } else if c.is_ascii_digit() {
+            digits += 1;
         } else {
-            other += 1;
+            latin += 1;
         }
     }
-    dense + other.div_ceil(4)
+    dense + digits.div_ceil(2) + latin.div_ceil(4)
 }
 
 /// True for characters that tokenize at roughly one token each (CJK, kana,
@@ -182,6 +196,62 @@ pub fn looks_mathy(text: &str) -> bool {
     text.chars().filter(|c| MATH_CHARS.contains(c)).count() >= 4
 }
 
+/// Skill-detection markers for summarisation requests (EN + JA).
+const SUMMARIZE_MARKERS: &[&str] = &[
+    "summarize",
+    "summarise",
+    "summary",
+    "tldr",
+    "tl;dr",
+    "in brief",
+    "briefly",
+    "要約",
+    "まとめ",
+    "概要",
+    "サマリー",
+    "要旨",
+];
+
+/// Skill-detection markers for translation requests (EN + JA).
+const TRANSLATE_MARKERS: &[&str] = &[
+    "translate",
+    "translation",
+    "翻訳",
+    "訳して",
+    "に翻訳",
+    "translate to",
+    "translate into",
+];
+
+/// Classify the primary skill of a prompt into one of several canonical labels.
+/// Returns `None` for general / unclassified queries.
+///
+/// Labels (stable, used as keys in skill-profile routing, IMP-25):
+/// - `"code"`: fenced code block present.
+/// - `"math"`: ≥4 mathematical symbols.
+/// - `"reason"`: reasoning-depth marker (step-by-step, prove, etc.).
+/// - `"summarize"`: summarisation request.
+/// - `"translate"`: translation request.
+pub fn detect_skill(text: &str) -> Option<&'static str> {
+    if looks_like_code(text) {
+        return Some("code");
+    }
+    if looks_mathy(text) {
+        return Some("math");
+    }
+    let lower = text.to_ascii_lowercase();
+    if has_marker(&lower, REASONING_MARKERS) {
+        return Some("reason");
+    }
+    if has_marker(&lower, SUMMARIZE_MARKERS) {
+        return Some("summarize");
+    }
+    if has_marker(&lower, TRANSLATE_MARKERS) {
+        return Some("translate");
+    }
+    None
+}
+
 /// Aggregate "hard" signals that suggest escalating to the stronger model.
 /// Returns stable labels (no user content).
 pub fn hard_signals(text: &str) -> Vec<&'static str> {
@@ -222,6 +292,10 @@ pub struct RoutingEngine {
     allow_sensitive_cloud: bool,
     /// When true all traffic routes local regardless of content signals or length.
     local_only: bool,
+    /// Skill-profile overrides (IMP-25): `(skill_name, route)` pairs, checked
+    /// before the generic hard-signal rules. E.g. `("summarize", Local)` keeps
+    /// summarisation on the fast local model even when hard signals are present.
+    skills: Vec<(String, Route)>,
 }
 
 impl RoutingEngine {
@@ -234,6 +308,7 @@ impl RoutingEngine {
             cloud_available,
             allow_sensitive_cloud: false,
             local_only: false,
+            skills: Vec::new(),
         }
     }
 
@@ -273,6 +348,16 @@ impl RoutingEngine {
     /// local; this adds nothing there). Cloud availability is ignored.
     pub fn with_local_only(mut self, enabled: bool) -> Self {
         self.local_only = enabled;
+        self
+    }
+
+    /// Set skill-profile route overrides (IMP-25).
+    ///
+    /// Each entry is `(skill_label, route)`. Recognised labels: `"code"`,
+    /// `"math"`, `"reason"`, `"summarize"`, `"translate"`. Unknown labels are
+    /// silently ignored at decision time.
+    pub fn with_skills(mut self, skills: Vec<(String, Route)>) -> Self {
+        self.skills = skills;
         self
     }
 
@@ -362,6 +447,18 @@ impl RoutingEngine {
             (true, true) => {}
         }
 
+        // Skill-profile overrides (IMP-25): checked before generic hard signals.
+        // A configured skill match short-circuits the rest of the decision.
+        if !self.skills.is_empty() {
+            if let Some(skill) = detect_skill(text) {
+                for (name, route) in &self.skills {
+                    if name == skill {
+                        return self.decide_forced_with_reason(*route, format!("skill:{skill}"));
+                    }
+                }
+            }
+        }
+
         if self.code_to_cloud {
             let mut signals = hard_signals(text);
             if has_tools {
@@ -396,15 +493,20 @@ impl RoutingEngine {
     }
 
     fn decide_forced(&self, route: Route) -> Result<Decision, RoutingError> {
+        self.decide_forced_with_reason(route, format!("forced to {}", route.as_str()))
+    }
+
+    fn decide_forced_with_reason(
+        &self,
+        route: Route,
+        reason: String,
+    ) -> Result<Decision, RoutingError> {
         let available = match route {
             Route::Local => self.local_available,
             Route::Cloud => self.cloud_available,
         };
         if available {
-            Ok(Decision {
-                route,
-                reason: format!("forced to {}", route.as_str()),
-            })
+            Ok(Decision { route, reason })
         } else {
             Err(RoutingError::ForcedRouteUnavailable(route))
         }
@@ -437,11 +539,31 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens_mixed_script() {
-        // 4 Latin chars (=1) + 2 kana (=2) -> 3 tokens.
-        assert_eq!(estimate_tokens("code あい"), {
-            // "code あい" = 'c','o','d','e',' ' (5 latin -> 2) + 'あ','い' (2 dense)
-            2 + 2
-        });
+        // IMP-22: whitespace no longer counts as latin.
+        // "code あい" = c,o,d,e (4 latin → ceil(4/4)=1) + ' ' (whitespace → 0)
+        //              + あ,い (2 dense → 2) = 3 tokens.
+        assert_eq!(estimate_tokens("code あい"), 1 + 2);
+    }
+
+    #[test]
+    fn test_estimate_tokens_whitespace_zero_contrib() {
+        // IMP-22: spaces/newlines fuse into adjacent tokens, not separate tokens.
+        assert_eq!(estimate_tokens("   "), 0);
+        assert_eq!(estimate_tokens("\n\t"), 0);
+        // A padded word: "hello " (5 latin + 1 space) = ceil(5/4) = 2 latin tokens.
+        assert_eq!(estimate_tokens("hello "), 2);
+    }
+
+    #[test]
+    fn test_estimate_tokens_digits_half_rate() {
+        // IMP-22: digits tokenise at ~0.5 tok/char (multi-digit numbers use
+        // 2-3 chars per token in cl100k_base and LLaMA tokenisers).
+        // "1234" = 4 digits → ceil(4/2) = 2 tokens.
+        assert_eq!(estimate_tokens("1234"), 2);
+        // "12" = 2 digits → ceil(2/2) = 1 token.
+        assert_eq!(estimate_tokens("12"), 1);
+        // "12345 abc" = 5 digits (ceil(5/2)=3) + 1 space(0) + 3 latin(ceil(3/4)=1) = 4.
+        assert_eq!(estimate_tokens("12345 abc"), 3 + 1);
     }
 
     #[test]
@@ -759,5 +881,92 @@ mod tests {
     #[test]
     fn test_is_simple_prompt_has_hard_signal() {
         assert!(!is_simple_prompt("write a function to sort", 50));
+    }
+
+    // ── IMP-25 skill-profile routing tests ───────────────────────────────────
+
+    #[test]
+    fn test_detect_skill_code() {
+        assert_eq!(detect_skill("```python\nprint(1)\n```"), Some("code"));
+    }
+
+    #[test]
+    fn test_detect_skill_math() {
+        assert_eq!(detect_skill("x = a + b * c / d ^ 2"), Some("math"));
+    }
+
+    #[test]
+    fn test_detect_skill_reason() {
+        assert_eq!(detect_skill("solve this step by step"), Some("reason"));
+        assert_eq!(detect_skill("ステップで説明"), Some("reason"));
+    }
+
+    #[test]
+    fn test_detect_skill_summarize() {
+        assert_eq!(detect_skill("please summarize this document"), Some("summarize"));
+        assert_eq!(detect_skill("tl;dr please"), Some("summarize"));
+        assert_eq!(detect_skill("要約してください"), Some("summarize"));
+    }
+
+    #[test]
+    fn test_detect_skill_translate() {
+        assert_eq!(detect_skill("translate this to Japanese"), Some("translate"));
+        assert_eq!(detect_skill("翻訳してください"), Some("translate"));
+    }
+
+    #[test]
+    fn test_detect_skill_none() {
+        assert_eq!(detect_skill("what time is it"), None);
+        assert_eq!(detect_skill("hello"), None);
+    }
+
+    #[test]
+    fn test_skill_profile_code_to_local() {
+        // By default code goes to cloud; with skill profile it stays local.
+        let e = both().with_skills(vec![("code".to_string(), Route::Local)]);
+        let d = e.decide("```rust\nfn main(){}\n```", None).unwrap();
+        assert_eq!(d.route, Route::Local);
+        assert!(d.reason.contains("skill:code"), "reason: {}", d.reason);
+    }
+
+    #[test]
+    fn test_skill_profile_summarize_to_cloud() {
+        // Without skill profile, a short summarize request stays local.
+        let d = both().decide("please summarize this", None).unwrap();
+        assert_eq!(d.route, Route::Local);
+        // With skill profile, it escalates.
+        let e = both().with_skills(vec![("summarize".to_string(), Route::Cloud)]);
+        let d = e.decide("please summarize this", None).unwrap();
+        assert_eq!(d.route, Route::Cloud);
+        assert!(d.reason.contains("skill:summarize"), "reason: {}", d.reason);
+    }
+
+    #[test]
+    fn test_skill_profile_privacy_wins_over_skill() {
+        // Privacy check is before skill profiles — sensitive content must stay local.
+        let e = both().with_skills(vec![("code".to_string(), Route::Cloud)]);
+        let d = e
+            .decide_with_sensitivity("```secret key```", None, true)
+            .unwrap();
+        assert_eq!(d.route, Route::Local);
+        assert!(d.reason.contains("sensitive"), "reason: {}", d.reason);
+    }
+
+    #[test]
+    fn test_skill_profile_unknown_skill_falls_through() {
+        // An unknown skill name in the profile is a no-op; generic routing applies.
+        let e = both().with_skills(vec![("unknown_skill".to_string(), Route::Local)]);
+        let d = e.decide("```code```", None).unwrap();
+        // Generic code→cloud still fires because the skill profile didn't match.
+        assert_eq!(d.route, Route::Cloud);
+    }
+
+    #[test]
+    fn test_skill_profile_no_match_falls_through_to_threshold() {
+        // Skills defined but none match → token threshold still applies.
+        let e = both().with_skills(vec![("summarize".to_string(), Route::Local)]);
+        let long = "x".repeat(1000);
+        let d = e.decide(&long, None).unwrap();
+        assert_eq!(d.route, Route::Cloud); // long → cloud (threshold)
     }
 }

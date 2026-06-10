@@ -222,6 +222,26 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
   `cost.rs` aggregation).
 
 #### IMP-17 — RouterBench-format external eval loader  — ✅ SHIPPED
+
+---
+
+## 4b. Extended improvement backlog (IMP-18 → IMP-27, from RESEARCH.md)
+
+> Source: `RESEARCH.md` Round 1–3 deep-dives (10 product areas × ~10 arXiv/GitHub sources).
+> All items preserve the zero-dependency default build.
+
+| IMP | Title | Status |
+|-----|-------|--------|
+| **IMP-18** | Prefix-preserving request shaping + provider prompt-cache activation | Planned |
+| **IMP-19** | Reversible pseudonymization send mode (machine→cloud with PII masked) | Planned |
+| **IMP-20** | Lightweight prompt-injection guard (lexical, deterministic) | ✅ **SHIPPED (ADR-128)** |
+| **IMP-21** | Latency DoS hardening (body size/connection time/output length limits) | Partial (ADR-033 body size done) |
+| **IMP-22** | Fertility-based token estimation (whitespace=0, digits=0.5 tok/char) | ✅ **SHIPPED (ADR-126)** |
+| **IMP-23** | OpenTelemetry GenAI–compliant optional metrics/trace export | Planned |
+| **IMP-24** | Output-length prediction for cost estimation (deferred) | Deferred |
+| **IMP-25** | Skill-profile routing: task-type → route override table | ✅ **SHIPPED (ADR-127)** |
+| **IMP-26** | Budget-aware dynamic threshold (cost velocity + daily cap) | Planned |
+| **IMP-27** | Supply-chain hardening: cargo-deny/SBOM/cosign in CI | Planned |
 - **What:** Let `eval` optionally load a larger labelled set in RouterBench
   CSV/JSONL format, while keeping the built-in 18-case set as the offline regression.
 - **Why:** Validates routing quality against a public, comparable benchmark and turns

@@ -5,6 +5,39 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Prompt-injection guard: lexical detection with flag/block modes (IMP-20)
+
+- Set `PASTURE_INJECTION_GUARD=flag` to detect and annotate potential prompt-injection
+  attempts (role-switch and exfiltration patterns), or `=block` to reject them with a
+  400 error. Default `off` (zero overhead). Detection uses ~30 lexical patterns (case-
+  insensitive, std-only, no new dependencies); the label `role_switch` or `exfil_attempt`
+  is logged to stderr in both modes and written to `x_pasture_injection_flag` in the
+  response JSON for `flag` mode. Guard applies to buffered, streaming, and legacy
+  completions. Privacy invariant: only the category label is recorded, never the prompt
+  content. Grounded in PCFI (arXiv:2603.18433). 12 new tests; 509 total. (ADR-128)
+
+### Added — Skill-profile routing: per-task-type route overrides (IMP-25)
+
+- Set `PASTURE_SKILLS=code:local,summarize:cloud` (or `skills = …` in the config file)
+  to pin detected task types to a specific backend. Recognised skills: `code` (fenced
+  code block), `math` (≥4 math symbols), `reason` (step-by-step / chain-of-thought),
+  `summarize`, `translate`. Skill routing is deterministic and config-driven; the
+  override fires before generic hard signals but after privacy and local_only checks.
+  Falls through to the token threshold when no skill matches or no rule is configured.
+  `pasture config` prints the active skill table. Grounded in arXiv:2602.02386. 9 new
+  tests added to routing.rs. (ADR-127)
+
+### Changed — Fertility-based token estimation refinement (IMP-22)
+
+- `estimate_tokens` now uses three buckets: ASCII whitespace contributes 0 tokens
+  (previously counted as 0.25 tok/char alongside Latin text, over-estimating space-
+  padded prompts), ASCII digits count at 0.5 tok/char (multi-digit numbers use 2-3
+  chars per token in cl100k_base and LLaMA tokenisers), and Latin/punctuation remains
+  0.25 tok/char. Dense scripts (CJK, Thai, Hangul, emoji) unchanged at 1.0 tok/char.
+  The routing threshold comparison, cost-log token counts, and `pasture stats` are all
+  more accurate for number-heavy and space-padded prompts. Grounded in arXiv:2509.05486
+  "The Token Tax". 3 new tests. (ADR-126)
+
 ### Added — Embedding difficulty signal: known-hard prompts escalate pre-emptively (IMP-14)
 
 - Set `PASTURE_HARD_PROMPTS=<file>` (one prompt per line) to name prompts your local model

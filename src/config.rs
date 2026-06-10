@@ -70,6 +70,16 @@ pub struct Config {
     /// (IMP-14). Default 0.85 — looser than the semantic cache's 0.92 because
     /// the goal is topical closeness, not near-duplication.
     pub hard_threshold: f64,
+    /// Skill-profile route overrides (IMP-25). Each entry is `(skill, route)`
+    /// where skill is one of: `code`, `math`, `reason`, `summarize`, `translate`,
+    /// and route is `"local"` or `"cloud"`. Set via `PASTURE_SKILLS=code:local,math:cloud`
+    /// or `skills = code:local,math:cloud` in the config file.
+    pub skills: Vec<(String, String)>,
+    /// Prompt-injection guard mode (IMP-20). One of `"off"` (default), `"flag"`
+    /// (detect and annotate via `X-Pasture-Injection-Flag` header, request
+    /// proceeds), or `"block"` (reject with 400 Bad Request).
+    /// Set via `PASTURE_INJECTION_GUARD` or `injection_guard` in the config file.
+    pub injection_guard: String,
 }
 
 impl Default for Config {
@@ -109,6 +119,8 @@ impl Default for Config {
             semantic_cache_threshold: 0.92,
             hard_prompts: String::new(),
             hard_threshold: 0.85,
+            skills: Vec::new(),
+            injection_guard: "off".to_string(),
         }
     }
 }
@@ -283,6 +295,15 @@ impl Config {
                 self.hard_threshold = f;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_SKILLS") {
+            self.skills = parse_skills(&v);
+        }
+        if let Ok(v) = std::env::var("PASTURE_INJECTION_GUARD") {
+            let v = v.trim().to_ascii_lowercase();
+            if matches!(v.as_str(), "off" | "flag" | "block") {
+                self.injection_guard = v;
+            }
+        }
         self
     }
 
@@ -380,9 +401,32 @@ impl Config {
                     self.hard_threshold = f;
                 }
             }
+            "skills" => self.skills = parse_skills(val),
+            "injection_guard" => {
+                let v = val.trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "off" | "flag" | "block") {
+                    self.injection_guard = v;
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// Parse `"code:local,math:cloud"` into `[("code","local"),("math","cloud")]`.
+pub(crate) fn parse_skills(val: &str) -> Vec<(String, String)> {
+    val.split(',')
+        .filter_map(|pair| {
+            let pair = pair.trim();
+            let (skill, route) = pair.split_once(':')?;
+            let route = route.trim().to_ascii_lowercase();
+            if route == "local" || route == "cloud" {
+                Some((skill.trim().to_ascii_lowercase(), route))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

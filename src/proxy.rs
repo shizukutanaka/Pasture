@@ -177,6 +177,9 @@ pub struct Proxy {
     /// a failed embedding attempt — the signal stays disabled for the process
     /// lifetime rather than re-querying a broken backend on every request.
     hard_centroids: std::sync::Mutex<Option<Vec<Vec<f64>>>>,
+    /// Prompt-injection guard mode (IMP-20). `"off"` = disabled; `"flag"` =
+    /// detect and log + annotate the JSON response; `"block"` = reject with 400.
+    injection_guard: String,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -214,7 +217,14 @@ impl Proxy {
             hard_prompts: Vec::new(),
             hard_threshold: 0.85,
             hard_centroids: std::sync::Mutex::new(None),
+            injection_guard: "off".to_string(),
         }
+    }
+
+    /// Set the prompt-injection guard mode (IMP-20).
+    pub fn with_injection_guard(mut self, mode: &str) -> Self {
+        self.injection_guard = mode.trim().to_ascii_lowercase();
+        self
     }
 
     pub fn with_access_log(mut self, path: Option<String>) -> Self {
@@ -910,9 +920,7 @@ impl Proxy {
     /// response body. Used for non-streaming requests and by tests.
     pub fn handle_chat(&self, body: &str) -> Result<String, ProxyError> {
         let req = Self::parse_request(body)?;
-        let (resp, label, logprob) = self.run_completion(&req)?;
-        self.log_cost(label, &resp, logprob);
-        Ok(build_openai_response(&resp, label))
+        self.complete_buffered(&req)
     }
 
     /// Handle `POST /v1/embeddings` (IMP-8). Inputs are embedded by the **local**
@@ -1042,6 +1050,20 @@ impl Proxy {
     /// `choices[].text` (not `message.content`) for API compatibility.
     fn handle_legacy_completion(&self, body: &str) -> Result<String, ProxyError> {
         let req = Self::parse_legacy_completion(body)?;
+        // Apply injection guard on legacy completions too (IMP-20).
+        if self.injection_guard != "off" {
+            let text = req.routing_text();
+            if let crate::guard::InjectionRisk::Flag(label) =
+                crate::guard::classify_injection(&text)
+            {
+                if self.injection_guard == "block" {
+                    return Err(ProxyError::BadRequest(format!(
+                        "request blocked by injection guard: {label}"
+                    )));
+                }
+                eprintln!("pasture: injection_flag:{label} (flag mode, legacy request proceeds)");
+            }
+        }
         let (resp, label, logprob) = self.run_completion(&req)?;
         self.log_cost(label, &resp, logprob);
         Ok(build_legacy_completion_response(&resp, label))
@@ -1423,9 +1445,29 @@ impl Proxy {
 
     /// Non-streaming completion from an already-parsed request.
     fn complete_buffered(&self, req: &CompletionRequest) -> Result<String, ProxyError> {
+        // Prompt-injection guard (IMP-20). Off by default (zero overhead).
+        let injection_label = if self.injection_guard != "off" {
+            let text = req.routing_text();
+            match crate::guard::classify_injection(&text) {
+                crate::guard::InjectionRisk::Flag(label) => {
+                    if self.injection_guard == "block" {
+                        return Err(ProxyError::BadRequest(format!(
+                            "request blocked by injection guard: {label}"
+                        )));
+                    }
+                    // flag mode: log and annotate, but let the request proceed.
+                    eprintln!("pasture: injection_flag:{label} (flag mode, request proceeds)");
+                    Some(label)
+                }
+                crate::guard::InjectionRisk::Allow => None,
+            }
+        } else {
+            None
+        };
+
         let (resp, label, logprob) = self.run_completion(req)?;
         self.log_cost(label, &resp, logprob);
-        Ok(build_openai_response(&resp, label))
+        Ok(build_openai_response_with_injection(&resp, label, injection_label.as_deref()))
     }
 
     /// Stream a completion to the socket as Server-Sent Events (IMP-7).
@@ -1438,6 +1480,26 @@ impl Proxy {
         cors: &str,
         include_usage: bool,
     ) -> std::io::Result<()> {
+        // Injection guard for streaming (IMP-20): block mode can still reject before
+        // the stream starts; flag mode logs but cannot annotate mid-stream chunks.
+        if self.injection_guard != "off" {
+            let text = req.routing_text();
+            if let crate::guard::InjectionRisk::Flag(label) =
+                crate::guard::classify_injection(&text)
+            {
+                if self.injection_guard == "block" {
+                    let msg = format!("request blocked by injection guard: {label}");
+                    return write_response(
+                        sock,
+                        400,
+                        &build_error_response(&msg, "invalid_request_error"),
+                        cors,
+                        false,
+                    );
+                }
+                eprintln!("pasture: injection_flag:{label} (flag mode, stream proceeds)");
+            }
+        }
         let decision = match self.classify_and_decide(req) {
             Ok((d, _)) => d,
             Err(e) => {
@@ -1823,10 +1885,24 @@ pub fn fingerprint_for_model(model: &str) -> String {
 }
 
 pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> String {
+    build_openai_response_with_injection(resp, route_label, None)
+}
+
+/// Like `build_openai_response`, but adds `x_pasture_injection_flag` when
+/// the injection guard fires in flag mode (IMP-20).
+pub fn build_openai_response_with_injection(
+    resp: &CompletionResponse,
+    route_label: &str,
+    injection_flag: Option<&str>,
+) -> String {
     let total = resp.prompt_tokens + resp.completion_tokens;
     let fp = fingerprint_for_model(&resp.model);
+    let flag_field = match injection_flag {
+        Some(label) => format!(",\"x_pasture_injection_flag\":\"{}\"", escape_string(label)),
+        None => String::new(),
+    };
     format!(
-        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fp}\",\"x_pasture_route\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"logprobs\":null,\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fp}\",\"x_pasture_route\":\"{}\"{flag_field},\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"logprobs\":null,\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
         next_completion_id(),
         unix_now(),
         escape_string(&resp.model),

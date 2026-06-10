@@ -52,7 +52,7 @@ pasture stats              # summarize the cost log (routes, tokens, spend)
 pasture improvements       # show the self-improvement ledger (verified change history)
 ```
 
-Force a route with `--local` or `--cloud`. Enable cascade (answer locally, escalate to cloud only when the local answer is weak) with `PASTURE_CASCADE=1` (requires the `cloud` feature and a key). Enable an exact-match response cache with `PASTURE_CACHE=<size>` to avoid paying for repeated identical prompts, and a semantic cache with `PASTURE_SEMANTIC_CACHE=<size>` to also serve paraphrased repeats (cosine similarity via the local backend's embeddings; threshold `PASTURE_SEMANTIC_THRESHOLD`, default 0.92). List prompts your local model handles badly in a file and set `PASTURE_HARD_PROMPTS=<file>` to escalate anything embedding-similar to them (threshold `PASTURE_HARD_THRESHOLD`, default 0.85). Set the listen address for the proxy with `--addr host:port`.
+Force a route with `--local` or `--cloud`. Enable cascade (answer locally, escalate to cloud only when the local answer is weak) with `PASTURE_CASCADE=1` (requires the `cloud` feature and a key). Enable an exact-match response cache with `PASTURE_CACHE=<size>` to avoid paying for repeated identical prompts, and a semantic cache with `PASTURE_SEMANTIC_CACHE=<size>` to also serve paraphrased repeats (cosine similarity via the local backend's embeddings; threshold `PASTURE_SEMANTIC_THRESHOLD`, default 0.92). List prompts your local model handles badly in a file and set `PASTURE_HARD_PROMPTS=<file>` to escalate anything embedding-similar to them (threshold `PASTURE_HARD_THRESHOLD`, default 0.85). Pin task types to backends with `PASTURE_SKILLS=code:local,summarize:cloud` (comma-separated `skill:route`; recognised: `code`, `math`, `reason`, `summarize`, `translate`). Enable prompt-injection detection with `PASTURE_INJECTION_GUARD=flag` (annotate) or `=block` (reject 400). Set the listen address for the proxy with `--addr host:port`.
 
 Point any OpenAI-compatible client at the proxy:
 
@@ -98,6 +98,8 @@ Defaults are sensible; override via environment variables:
 | `PASTURE_RATE_LIMIT` | `0` | cap `/v1/*` to this many requests per minute (global; 0 = unlimited) |
 | `PASTURE_REQUEST_TIMEOUT` | `30` | per-connection read/write timeout in seconds (slow-loris guard; 0 = none) |
 | `PASTURE_CORS_ORIGINS` | _(off)_ | CORS allow-list for browser clients: comma-separated origins, or `*` (off by default — a localhost server with `*` is reachable by any website) |
+| `PASTURE_SKILLS` | _(off)_ | skill-profile routing: `code:local,summarize:cloud` pins detected task types (`code`, `math`, `reason`, `summarize`, `translate`) to a specific backend; checked before generic hard signals |
+| `PASTURE_INJECTION_GUARD` | `off` | prompt-injection guard: `flag` detects role-switch/exfiltration patterns and annotates the response; `block` rejects with 400; `off` (default) has zero overhead |
 
 The local backend talks to [Ollama](https://ollama.com) over plain HTTP. GPU acceleration (CUDA/Metal/ROCm) is handled by Ollama; Pasture writes no GPU code itself.
 

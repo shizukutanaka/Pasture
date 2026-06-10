@@ -280,6 +280,37 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-128 Prompt-injection guard: lexical detection with flag/block modes (IMP-20).**
+  New `guard` module (`src/guard.rs`): `classify_injection(text)` matches ~30 lexical patterns for
+  role-switch and exfiltration attempts (case-insensitive std pattern matching, no new deps).
+  Three modes via `PASTURE_INJECTION_GUARD` / `injection_guard` config key: `off` (default, zero
+  overhead), `flag` (detect → log to stderr + add `x_pasture_injection_flag` field to response JSON,
+  request proceeds), `block` (detect → 400 Bad Request). Guard applies to buffered, streaming, and
+  legacy completions. Privacy invariant preserved: guard runs on `routing_text()` which excludes
+  system prompts; PII is never extracted or logged. Grounded: PCFI arXiv:2603.18433,
+  arXiv:2602.10481. 8 new tests (17 in guard.rs + 4 in proxy_tests.rs); clippy clean; zero new deps.
+- **ADR-127 Skill-profile routing: per-task-type route overrides (IMP-25).**
+  `RoutingEngine::with_skills(vec![("summarize".to_string(), Route::Local)])` pins a detected skill
+  to a specific backend, checked after privacy/local_only but before generic hard signals. New
+  `detect_skill(text)` recognises five canonical labels — `code`, `math`, `reason`, `summarize`,
+  `translate` — from existing markers plus two new const arrays (`SUMMARIZE_MARKERS`,
+  `TRANSLATE_MARKERS`, EN+JA). Config: `PASTURE_SKILLS=code:local,math:cloud` (comma-separated
+  `skill:route` pairs) or `skills = …` config-file key; parsed by `parse_skills()`. `make_engine()`
+  in `cli.rs` wires it; `run_config` prints the table. Skill routing is deterministic and
+  config-driven (no ML); falls through to token-threshold routing when no skill matches. Privacy
+  invariant: sensitive content is checked before skills — the `decide_full` order is unchanged.
+  Grounded: arXiv:2602.02386 (Skill Profiles for Cost-Aware Routing). 9 new tests; clippy clean.
+- **ADR-126 Fertility-based token estimation refinement (IMP-22).**
+  `estimate_tokens` now uses three script buckets: dense (CJK/Thai/etc = 1.0 tok/char, unchanged),
+  digits (ASCII 0-9 = 0.5 tok/char — multi-digit numbers use 2-3 chars/token in cl100k_base and
+  LLaMA tokenisers), and latin (letters/punctuation = 0.25 tok/char); ASCII whitespace contributes
+  0 (whitespace fuses into adjacent tokens and does not generate separate tokens). The prior
+  implementation counted whitespace as latin (0.25 tok/char), systematically over-estimating
+  space-padded text and routing short padded prompts to cloud; the digit bucket corrects the reverse
+  error (under-counting digit-heavy expressions). All existing callers (`backend.rs`, `cloud.rs`,
+  `routing.rs`) unchanged in signature. `test_estimate_tokens_mixed_script` updated to the more
+  accurate value (3 not 4 for `"code あい"`). Grounded: arXiv:2509.05486 "The Token Tax". 3 new
+  tests; clippy clean.
 - **ADR-125 Embedding difficulty signal: known-hard prompts escalate pre-emptively (IMP-14).**
   New `difficulty` module + proxy wiring: the user lists prompts their local model handles badly
   (`PASTURE_HARD_PROMPTS=<file>`, one per line, `#` comments); a non-sensitive request routed

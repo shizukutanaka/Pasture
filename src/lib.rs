@@ -14,6 +14,7 @@ pub mod config;
 pub mod cost;
 pub mod difficulty;
 pub mod doctor;
+pub mod guard;
 pub mod eval;
 pub mod hardware;
 pub mod i18n;
