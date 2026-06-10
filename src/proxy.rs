@@ -13,6 +13,7 @@ use crate::json::{escape_string, parse, JsonValue};
 use crate::routing::{Decision, Route, RoutingEngine};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -24,6 +25,8 @@ pub enum ProxyError {
     BadRequest(String),
     Routing(String),
     Backend(String),
+    /// Daily token budget exceeded and `budget_action = "block"` (IMP-26).
+    BudgetExceeded(String),
 }
 
 impl ProxyError {
@@ -32,12 +35,16 @@ impl ProxyError {
             ProxyError::BadRequest(_) => 400,
             ProxyError::Routing(_) => 503,
             ProxyError::Backend(_) => 502,
+            ProxyError::BudgetExceeded(_) => 429,
         }
     }
 
     fn message(&self) -> &str {
         match self {
-            ProxyError::BadRequest(m) | ProxyError::Routing(m) | ProxyError::Backend(m) => m,
+            ProxyError::BadRequest(m)
+            | ProxyError::Routing(m)
+            | ProxyError::Backend(m)
+            | ProxyError::BudgetExceeded(m) => m,
         }
     }
 
@@ -47,6 +54,7 @@ impl ProxyError {
             ProxyError::BadRequest(_) => "invalid_request_error",
             ProxyError::Routing(_) => "routing_error",
             ProxyError::Backend(_) => "upstream_error",
+            ProxyError::BudgetExceeded(_) => "rate_limit_error",
         }
     }
 }
@@ -180,6 +188,25 @@ pub struct Proxy {
     /// Prompt-injection guard mode (IMP-20). `"off"` = disabled; `"flag"` =
     /// detect and log + annotate the JSON response; `"block"` = reject with 400.
     injection_guard: String,
+    /// Daily cloud token budget (IMP-26). 0 = disabled. Running sum of
+    /// cloud prompt+completion tokens today (UTC day), initialized from the cost
+    /// log at startup and incremented atomically on each cloud completion.
+    today_cloud_tokens: AtomicU64,
+    /// Cloud request count and token sum for spike detection (IMP-26).
+    cloud_request_count: AtomicU64,
+    cloud_token_sum: AtomicU64,
+    /// Daily token budget cap (IMP-26). 0 = disabled.
+    budget_daily_tokens: u64,
+    /// Action when the budget is exceeded: `"local-only"` (default), `"warn"`,
+    /// or `"block"` (return 429).
+    budget_action: String,
+    /// Spike detection factor (IMP-26). A request estimating more than
+    /// `spike_factor × running-average` tokens overrides the cloud route to local.
+    /// 0 = spike detection disabled.
+    spike_factor: u64,
+    /// Maximum request body bytes (IMP-21). Default 16 MiB. Set via
+    /// `PASTURE_MAX_BODY_BYTES`. Bodies larger than this yield 413.
+    max_body_bytes: usize,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -218,12 +245,47 @@ impl Proxy {
             hard_threshold: 0.85,
             hard_centroids: std::sync::Mutex::new(None),
             injection_guard: "off".to_string(),
+            today_cloud_tokens: AtomicU64::new(0),
+            cloud_request_count: AtomicU64::new(0),
+            cloud_token_sum: AtomicU64::new(0),
+            budget_daily_tokens: 0,
+            budget_action: "local-only".to_string(),
+            spike_factor: 50,
+            max_body_bytes: 16 * 1024 * 1024,
         }
     }
 
     /// Set the prompt-injection guard mode (IMP-20).
     pub fn with_injection_guard(mut self, mode: &str) -> Self {
         self.injection_guard = mode.trim().to_ascii_lowercase();
+        self
+    }
+
+    /// Configure the daily token budget and spike detection (IMP-26).
+    /// `daily_tokens` = 0 disables the budget; `spike_factor` = 0 disables spike
+    /// detection. `cost_log_path` seeds the running counter from today's log so
+    /// the budget survives a proxy restart.
+    pub fn with_budget(
+        mut self,
+        daily_tokens: u64,
+        action: &str,
+        spike_factor: u64,
+        cost_log_path: &str,
+    ) -> Self {
+        self.budget_daily_tokens = daily_tokens;
+        self.budget_action = action.trim().to_ascii_lowercase();
+        self.spike_factor = spike_factor;
+        if daily_tokens > 0 {
+            let used = crate::cost::today_cloud_tokens(cost_log_path);
+            self.today_cloud_tokens = AtomicU64::new(used);
+        }
+        self
+    }
+
+    /// Set the maximum request body size in bytes (IMP-21). Bodies larger than
+    /// this are rejected with 413 before being read. Default: 16 MiB.
+    pub fn with_max_body_bytes(mut self, limit: usize) -> Self {
+        self.max_body_bytes = limit;
         self
     }
 
@@ -664,6 +726,31 @@ impl Proxy {
         .ok_or_else(|| ProxyError::Routing(format!("no backend for route {}", route.as_str())))
     }
 
+    /// Budget + spike check (IMP-26). Returns `Some(reason)` when the cloud route
+    /// should be overridden or blocked; `None` when the request may proceed normally.
+    /// Called only when the routing engine has decided Cloud.
+    fn check_budget_and_spike(&self, estimated_tokens: u64) -> Option<&'static str> {
+        // Spike: single request far above the running average → route local instead.
+        if self.spike_factor > 0 && estimated_tokens > 0 {
+            let count = self.cloud_request_count.load(Ordering::Relaxed);
+            if count > 0 {
+                let sum = self.cloud_token_sum.load(Ordering::Relaxed);
+                let avg = sum / count;
+                if avg > 0 && estimated_tokens > self.spike_factor.saturating_mul(avg) {
+                    return Some("spike detected — request exceeds average by spike_factor");
+                }
+            }
+        }
+        // Daily budget: cumulative cloud tokens since UTC midnight.
+        if self.budget_daily_tokens > 0 {
+            let used = self.today_cloud_tokens.load(Ordering::Relaxed);
+            if used >= self.budget_daily_tokens {
+                return Some("daily cloud token budget exceeded");
+            }
+        }
+        None
+    }
+
     fn log_cost(&self, route_label: &'static str, resp: &CompletionResponse, logprob: Option<f64>) {
         // Record cost (local and cache are free). PII is never written (I5);
         // logprob is the local-answer confidence number, not content.
@@ -677,6 +764,13 @@ impl Proxy {
         .with_logprob(logprob);
         if let Err(e) = record.append_to(&self.cost_log_path) {
             eprintln!("pasture: cost log write failed: {e}");
+        }
+        // Update IMP-26 budget / spike counters for cloud completions.
+        if route_label == "cloud" {
+            let tokens = resp.prompt_tokens + resp.completion_tokens;
+            self.today_cloud_tokens.fetch_add(tokens, Ordering::Relaxed);
+            self.cloud_token_sum.fetch_add(tokens, Ordering::Relaxed);
+            self.cloud_request_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -786,6 +880,31 @@ impl Proxy {
                         "pasture: prompt similar to known-hard set (cos {sim:.2}) -> cloud"
                     );
                     planned_route = Route::Cloud;
+                }
+            }
+        }
+
+        // Budget / spike guard (IMP-26): only applies when routing to cloud and
+        // budget or spike detection is configured. Sensitive content was excluded
+        // from cloud routing above (privacy), so this check runs on non-sensitive
+        // cloud-bound requests only.
+        if planned_route == Route::Cloud
+            && (self.budget_daily_tokens > 0 || self.spike_factor > 0)
+        {
+            let estimated = crate::routing::estimate_tokens(&req.routing_text()) as u64;
+            if let Some(reason) = self.check_budget_and_spike(estimated) {
+                match self.budget_action.as_str() {
+                    "block" => {
+                        return Err(ProxyError::BudgetExceeded(reason.to_string()));
+                    }
+                    "warn" => {
+                        eprintln!("pasture: budget warning: {reason} (cloud request proceeds)");
+                    }
+                    _ => {
+                        // "local-only" (default): silently redirect to local.
+                        eprintln!("pasture: {reason} -> routing local");
+                        planned_route = Route::Local;
+                    }
                 }
             }
         }
@@ -1175,7 +1294,7 @@ impl Proxy {
         const MAX_KEEPALIVE_REQUESTS: usize = 100;
         for _ in 0..MAX_KEEPALIVE_REQUESTS {
             let (method, path, body, auth, origin, keep_alive, request_id, content_type) =
-                match read_request(stream, &mut conn_buf)? {
+                match read_request(stream, &mut conn_buf, self.max_body_bytes)? {
                     ReadOutcome::Request {
                         method,
                         path,
@@ -2080,10 +2199,9 @@ fn write_sse_headers(stream: &mut std::net::TcpStream, cors: &str) -> std::io::R
     );
     stream.write_all(headers.as_bytes())
 }
-/// Maximum request body the proxy will read (SPEC §7). Far above any real chat
-/// payload; a larger `Content-Length`, or a body that grows past it, yields 413
-/// instead of an unbounded read (DoS guard, IMP-21).
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Default maximum request body the proxy will read (SPEC §7, IMP-21).
+/// Overridden at runtime via `PASTURE_MAX_BODY_BYTES` / `Proxy::with_max_body_bytes`.
+const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Outcome of reading one HTTP request off the socket.
 enum ReadOutcome {
@@ -2128,6 +2246,7 @@ fn is_timeout(e: &std::io::Error) -> bool {
 fn read_request(
     stream: &mut std::net::TcpStream,
     conn_buf: &mut Vec<u8>,
+    max_body_bytes: usize,
 ) -> std::io::Result<ReadOutcome> {
     let mut chunk = [0u8; 1024];
     // Accumulate bytes until the header terminator is found.
@@ -2206,7 +2325,7 @@ fn read_request(
     }
 
     // Reject oversized bodies before reading them (DoS guard, SPEC §7).
-    if content_length > MAX_BODY_BYTES {
+    if content_length > max_body_bytes {
         return Ok(ReadOutcome::TooLarge);
     }
 
@@ -2226,7 +2345,7 @@ fn read_request(
             break;
         }
         conn_buf.extend_from_slice(&chunk[..n]);
-        if conn_buf.len() > body_end + MAX_BODY_BYTES {
+        if conn_buf.len() > body_end + max_body_bytes {
             return Ok(ReadOutcome::TooLarge);
         }
     }

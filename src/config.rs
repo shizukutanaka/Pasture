@@ -80,6 +80,24 @@ pub struct Config {
     /// proceeds), or `"block"` (reject with 400 Bad Request).
     /// Set via `PASTURE_INJECTION_GUARD` or `injection_guard` in the config file.
     pub injection_guard: String,
+    /// Daily cloud token budget (IMP-26). 0 = disabled. Compared against the
+    /// running sum of prompt+completion tokens routed to cloud today (UTC day).
+    /// Set via `PASTURE_BUDGET_DAILY_TOKENS`.
+    pub budget_daily_tokens: u64,
+    /// Action when the daily token budget is exceeded (IMP-26).
+    /// `"local-only"` (default) — silently route to local instead.
+    /// `"warn"` — route to cloud but log a warning.
+    /// `"block"` — reject with 429 Too Many Requests.
+    /// Set via `PASTURE_BUDGET_ACTION`.
+    pub budget_action: String,
+    /// Spike detection factor (IMP-26). If a single request estimates more than
+    /// `spike_factor × running-request-average` tokens, escalation is overridden
+    /// to local (regardless of budget). 0 = spike detection disabled.
+    /// Set via `PASTURE_SPIKE_FACTOR`. Default 50.
+    pub spike_factor: u64,
+    /// Maximum body bytes accepted per request (IMP-21). Requests larger than
+    /// this are rejected with 413. Default 16 MiB. Set via `PASTURE_MAX_BODY_BYTES`.
+    pub max_body_bytes: usize,
 }
 
 impl Default for Config {
@@ -121,6 +139,10 @@ impl Default for Config {
             hard_threshold: 0.85,
             skills: Vec::new(),
             injection_guard: "off".to_string(),
+            budget_daily_tokens: 0,
+            budget_action: "local-only".to_string(),
+            spike_factor: 50,
+            max_body_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -304,6 +326,27 @@ impl Config {
                 self.injection_guard = v;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_BUDGET_DAILY_TOKENS") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.budget_daily_tokens = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_BUDGET_ACTION") {
+            let v = v.trim().to_ascii_lowercase();
+            if matches!(v.as_str(), "local-only" | "warn" | "block") {
+                self.budget_action = v;
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_SPIKE_FACTOR") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.spike_factor = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_MAX_BODY_BYTES") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.max_body_bytes = n;
+            }
+        }
         self
     }
 
@@ -406,6 +449,27 @@ impl Config {
                 let v = val.trim().to_ascii_lowercase();
                 if matches!(v.as_str(), "off" | "flag" | "block") {
                     self.injection_guard = v;
+                }
+            }
+            "budget_daily_tokens" => {
+                if let Ok(n) = val.parse::<u64>() {
+                    self.budget_daily_tokens = n;
+                }
+            }
+            "budget_action" => {
+                let v = val.trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "local-only" | "warn" | "block") {
+                    self.budget_action = v;
+                }
+            }
+            "spike_factor" => {
+                if let Ok(n) = val.parse::<u64>() {
+                    self.spike_factor = n;
+                }
+            }
+            "max_body_bytes" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    self.max_body_bytes = n;
                 }
             }
             _ => {}

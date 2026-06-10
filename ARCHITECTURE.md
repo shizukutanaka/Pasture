@@ -280,6 +280,24 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-130 Configurable body size limit (IMP-21).**
+  `PASTURE_MAX_BODY_BYTES` (config key `max_body_bytes`) overrides the per-request body cap at
+  runtime. Previously hardcoded at 16 MiB (`MAX_BODY_BYTES` constant), the constant is renamed
+  `DEFAULT_MAX_BODY_BYTES` and the proxy stores the runtime limit in `Proxy.max_body_bytes`, set via
+  `with_max_body_bytes(n)`. `read_request` now accepts a `max_body_bytes` argument instead of
+  referencing the constant directly. Zero-dep; 2 new tests; backward-compatible (default unchanged).
+- **ADR-129 Budget-aware routing: daily token cap + spike detection (IMP-26).**
+  New `Proxy` fields: `budget_daily_tokens`, `budget_action`, `spike_factor`, plus three
+  `AtomicU64` counters (`today_cloud_tokens`, `cloud_request_count`, `cloud_token_sum`).
+  `with_budget(daily_tokens, action, spike_factor, cost_log_path)` initialises the running counter
+  from the cost log (survives restart). `check_budget_and_spike(estimated_tokens)` returns a reason
+  string when: (a) spike detected — request > `spike_factor × running-average` tokens, or
+  (b) daily cloud token budget already exhausted. Three actions: `"local-only"` (default) silently
+  redirects to local; `"warn"` logs + proceeds to cloud; `"block"` returns 429 `BudgetExceeded`.
+  `log_cost` increments all three counters after cloud completions. Budget check is skipped for
+  local, cache, and sensitive-content requests (privacy invariant preserved). New `BudgetExceeded`
+  variant in `ProxyError` → HTTP 429. Config: `PASTURE_BUDGET_DAILY_TOKENS`,
+  `PASTURE_BUDGET_ACTION`, `PASTURE_SPIKE_FACTOR`. 7 new tests; zero new deps.
 - **ADR-128 Prompt-injection guard: lexical detection with flag/block modes (IMP-20).**
   New `guard` module (`src/guard.rs`): `classify_injection(text)` matches ~30 lexical patterns for
   role-switch and exfiltration attempts (case-insensitive std pattern matching, no new deps).

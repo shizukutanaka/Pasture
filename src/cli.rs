@@ -1127,6 +1127,16 @@ fn run_config(config: &Config) -> i32 {
         println!("  skills:            {}", s.join(", "));
     }
     println!("  injection_guard:   {}", config.injection_guard);
+    if config.budget_daily_tokens > 0 {
+        println!(
+            "  budget_daily_tokens: {} (action: {})",
+            config.budget_daily_tokens, config.budget_action
+        );
+        if config.spike_factor > 0 {
+            println!("  spike_factor:      {}", config.spike_factor);
+        }
+    }
+    println!("  max_body_bytes:    {}", config.max_body_bytes);
     println!("  cost_log:          {}", config.cost_log_path);
     println!("  donate_url:        {}", yn(config.donate_url.is_some()));
     println!("  lang:              {}", lang.code());
@@ -1339,7 +1349,14 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         } else {
             None
         })
-        .with_injection_guard(&config.injection_guard);
+        .with_injection_guard(&config.injection_guard)
+        .with_budget(
+            config.budget_daily_tokens,
+            &config.budget_action,
+            config.spike_factor,
+            &config.cost_log_path,
+        )
+        .with_max_body_bytes(config.max_body_bytes);
     print!(
         "{}",
         crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])

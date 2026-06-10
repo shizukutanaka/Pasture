@@ -80,6 +80,8 @@ fn now_secs() -> u64 {
 /// A record read back from the JSONL log (route is owned, unlike `CostRecord`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoggedRecord {
+    /// Unix timestamp (seconds) parsed from the `ts` field (IMP-26: today filter).
+    pub ts_secs: u64,
     pub route: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -92,12 +94,35 @@ pub fn parse_log_line(line: &str) -> Option<LoggedRecord> {
     let v = crate::json::parse(line.trim()).ok()?;
     let route = v.get("route")?.as_str()?.to_string();
     Some(LoggedRecord {
+        ts_secs: num(&v, "ts").map(|f| f as u64).unwrap_or(0),
         route,
         prompt_tokens: num(&v, "prompt_tokens").unwrap_or(0.0) as u64,
         completion_tokens: num(&v, "completion_tokens").unwrap_or(0.0) as u64,
         cost_usd: num(&v, "cost_usd").unwrap_or(0.0),
         logprob: num(&v, "logprob"),
     })
+}
+
+/// Unix timestamp (seconds) for the start of today (00:00:00 UTC).
+pub fn today_start_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86400 * 86400)
+        .unwrap_or(0)
+}
+
+/// Sum of cloud prompt+completion tokens logged today (UTC day).
+/// Used by IMP-26 to initialise the budget counter from an existing cost log.
+pub fn today_cloud_tokens(path: &str) -> u64 {
+    let today = today_start_secs();
+    let Ok(records) = read_log(path) else {
+        return 0;
+    };
+    records
+        .iter()
+        .filter(|r| r.ts_secs >= today && r.route == "cloud")
+        .map(|r| r.prompt_tokens + r.completion_tokens)
+        .sum()
 }
 
 fn num(v: &crate::json::JsonValue, key: &str) -> Option<f64> {
@@ -344,6 +369,7 @@ mod tests {
     fn test_summarize_counts_and_rates() {
         let recs = vec![
             LoggedRecord {
+                ts_secs: 0,
                 route: "local".into(),
                 prompt_tokens: 10,
                 completion_tokens: 5,
@@ -351,6 +377,7 @@ mod tests {
                 logprob: None,
             },
             LoggedRecord {
+                ts_secs: 0,
                 route: "cloud".into(),
                 prompt_tokens: 20,
                 completion_tokens: 8,
@@ -358,6 +385,7 @@ mod tests {
                 logprob: None,
             },
             LoggedRecord {
+                ts_secs: 0,
                 route: "cache".into(),
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -365,6 +393,7 @@ mod tests {
                 logprob: None,
             },
             LoggedRecord {
+                ts_secs: 0,
                 route: "cloud".into(),
                 prompt_tokens: 30,
                 completion_tokens: 2,
@@ -391,6 +420,7 @@ mod tests {
     #[test]
     fn test_logprob_summary() {
         let mk = |lp: Option<f64>| LoggedRecord {
+            ts_secs: 0,
             route: "local".into(),
             prompt_tokens: 1,
             completion_tokens: 1,
@@ -410,6 +440,7 @@ mod tests {
     fn test_summary_to_json_roundtrips() {
         let recs = vec![
             LoggedRecord {
+                ts_secs: 0,
                 route: "cloud".into(),
                 prompt_tokens: 100,
                 completion_tokens: 50,
@@ -417,6 +448,7 @@ mod tests {
                 logprob: None,
             },
             LoggedRecord {
+                ts_secs: 0,
                 route: "local".into(),
                 prompt_tokens: 10,
                 completion_tokens: 5,
@@ -480,6 +512,7 @@ mod tests {
         // stats non-finite. inf cost is ignored; inf logprob is filtered out.
         let recs = vec![
             LoggedRecord {
+                ts_secs: 0,
                 route: "cloud".into(),
                 prompt_tokens: 10,
                 completion_tokens: 5,
@@ -487,6 +520,7 @@ mod tests {
                 logprob: Some(-0.5),
             },
             LoggedRecord {
+                ts_secs: 0,
                 route: "cloud".into(),
                 prompt_tokens: 1,
                 completion_tokens: 1,

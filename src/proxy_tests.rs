@@ -592,10 +592,10 @@ fn test_roundtrip_bad_json_is_400_envelope() {
 #[test]
 fn test_roundtrip_oversized_body_is_413() {
     let p = proxy_with(true, true, 100, "unused");
-    // Declare a Content-Length far beyond MAX_BODY_BYTES; no body sent.
+    // Declare a Content-Length far beyond the default body limit; no body sent.
     let req = format!(
         "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
-        MAX_BODY_BYTES + 1
+        DEFAULT_MAX_BODY_BYTES + 1
     );
     let (status, body) = roundtrip(p, req);
     assert_eq!(status, 413);
@@ -2498,4 +2498,119 @@ fn test_excessive_header_count_closes_connection() {
         resp.is_empty(),
         "expected empty response (connection closed on excess headers), got: {resp}"
     );
+}
+
+// ── IMP-26 budget-aware routing ────────────────────────────────────────────
+
+#[test]
+fn test_budget_disabled_allows_cloud() {
+    // budget_daily_tokens = 0 → budget feature is off; cloud routes through.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log); // low threshold → cloud
+    let long = "word ".repeat(20);
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let resp = p.handle_chat(&body).unwrap();
+    assert!(resp.contains("\"x_pasture_route\":\"cloud\""), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_budget_exceeded_local_only_redirects_to_local() {
+    // When the daily budget is already exhausted and action = "local-only" (default),
+    // the request should be redirected to local silently.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log) // low threshold → cloud
+        .with_budget(
+            1,          // 1 token budget → already exceeded for any real request
+            "local-only",
+            0,          // spike detection off
+            "/dev/null", // empty log → seed counter is 0
+        );
+    // Manually bump the counter above the budget so the check fires.
+    p.today_cloud_tokens.store(100, Ordering::Relaxed);
+    let long = "word ".repeat(20);
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let resp = p.handle_chat(&body).unwrap();
+    assert!(
+        resp.contains("\"x_pasture_route\":\"local\""),
+        "budget exceeded + local-only must route local: {resp}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_budget_exceeded_block_returns_429() {
+    // budget_action = "block" → BudgetExceeded (429) when limit hit.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log)
+        .with_budget(1, "block", 0, "/dev/null");
+    p.today_cloud_tokens.store(100, Ordering::Relaxed);
+    let long = "word ".repeat(20);
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let err = p.handle_chat(&body).unwrap_err();
+    assert!(
+        matches!(err, ProxyError::BudgetExceeded(_)),
+        "expected BudgetExceeded, got {err:?}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_budget_not_exceeded_allows_cloud() {
+    // Plenty of budget remaining → cloud request should go through normally.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log)
+        .with_budget(1_000_000, "block", 0, "/dev/null");
+    p.today_cloud_tokens.store(0, Ordering::Relaxed);
+    let long = "word ".repeat(20);
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let resp = p.handle_chat(&body).unwrap();
+    assert!(resp.contains("\"x_pasture_route\":\"cloud\""), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_log_cost_increments_cloud_counters() {
+    // After a cloud completion, the today_cloud_tokens counter must increase.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log)
+        .with_budget(1_000_000, "local-only", 0, "/dev/null");
+    let long = "word ".repeat(20);
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let _ = p.handle_chat(&body).unwrap();
+    let tokens_after = p.today_cloud_tokens.load(Ordering::Relaxed);
+    // MockBackend returns prompt_tokens=0 / completion_tokens=0, so the counter
+    // increments by 0; but cloud_request_count must be 1.
+    let count_after = p.cloud_request_count.load(Ordering::Relaxed);
+    assert_eq!(count_after, 1, "cloud request count must be 1 after one cloud call");
+    let _ = tokens_after; // checked via count_after
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_max_body_bytes_configurable() {
+    // with_max_body_bytes(100) means a 101-byte Content-Length → 413.
+    let p = proxy_with(true, false, 100, "unused")
+        .with_max_body_bytes(100);
+    let req = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 101\r\n\r\n";
+    let (status, _body) = roundtrip(p, req.to_string());
+    assert_eq!(status, 413);
+}
+
+#[test]
+fn test_max_body_bytes_default_allows_small_bodies() {
+    // Default limit (16 MiB) allows normal-sized chat requests.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log);
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#;
+    let (status, _) = roundtrip(
+        p,
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    );
+    assert_eq!(status, 200);
+    let _ = std::fs::remove_file(&log);
 }

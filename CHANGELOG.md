@@ -5,6 +5,21 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Budget-aware routing: daily token cap + spike detection (IMP-26, IMP-21)
+
+- Set `PASTURE_BUDGET_DAILY_TOKENS=<n>` to cap the cloud token spend per UTC day (prompt +
+  completion tokens combined). When the running total reaches the cap, behaviour is controlled
+  by `PASTURE_BUDGET_ACTION`: `local-only` (default) silently redirects the request to local;
+  `warn` logs a warning but lets the request proceed; `block` rejects with HTTP 429. The running
+  counter is seeded from the cost log at startup so a proxy restart does not reset today's spend.
+- Spike detection: if `PASTURE_SPIKE_FACTOR=<n>` (default 50) is set and a single request
+  estimates more than n × the running-request average, it is redirected to local regardless of the
+  daily budget. Prevents accidental runaway token usage from outlier large prompts.
+- `PASTURE_MAX_BODY_BYTES=<n>` (config key `max_body_bytes`): configures the per-request body size
+  cap (default 16 MiB). Bodies larger than this yield HTTP 413. Previously hardcoded only.
+- Privacy invariant preserved: sensitive content was already kept local before the budget check,
+  so the guard never touches PII paths. 7 new tests (516 total). (ADR-129, ADR-130)
+
 ### Added — Prompt-injection guard: lexical detection with flag/block modes (IMP-20)
 
 - Set `PASTURE_INJECTION_GUARD=flag` to detect and annotate potential prompt-injection
