@@ -778,12 +778,11 @@ impl Proxy {
         if !crate::routing::is_simple_prompt(text, self.fast_threshold) {
             return None;
         }
+        // Same request retargeted at the fast model; struct-update carries the
+        // messages/stream/tools/sampling unchanged (and any future field).
         Some(CompletionRequest {
             model: fm.to_string(),
-            messages: req.messages.clone(),
-            stream: req.stream,
-            has_tools: req.has_tools,
-            sampling: req.sampling.clone(),
+            ..req.clone()
         })
     }
 

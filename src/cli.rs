@@ -418,16 +418,7 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
             eprintln!("to compare cloud providers: pasture refer");
             return 1;
         };
-        let req = CompletionRequest {
-            model: config.cloud_model.clone(),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: text.to_string(),
-            }],
-            stream: false,
-            has_tools: false,
-            sampling: Default::default(),
-        };
+        let req = chat_request(&config.cloud_model, text);
         return match backend.complete(&req) {
             Ok(resp) => {
                 println!("{}", resp.content);
@@ -442,15 +433,10 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
     }
 
     let backend = make_local_backend(config);
+    // Local path streams to the terminal; otherwise identical to chat_request.
     let req = CompletionRequest {
-        model: config.local_model.clone(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: text.to_string(),
-        }],
         stream: true,
-        has_tools: false,
-        sampling: Default::default(),
+        ..chat_request(&config.local_model, text)
     };
     use std::io::Write as _;
     let mut out = std::io::stdout();
