@@ -207,6 +207,10 @@ pub struct Proxy {
     /// Maximum request body bytes (IMP-21). Default 16 MiB. Set via
     /// `PASTURE_MAX_BODY_BYTES`. Bodies larger than this yield 413.
     max_body_bytes: usize,
+    /// Pseudonymize PII in cloud requests and restore in responses (IMP-19).
+    pseudonymize: bool,
+    /// Optional OTel-compatible GenAI trace log path (IMP-23). Empty = disabled.
+    otel_log: Option<String>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -245,13 +249,15 @@ impl Proxy {
             hard_threshold: 0.85,
             hard_centroids: std::sync::Mutex::new(None),
             injection_guard: "off".to_string(),
+            pseudonymize: false,
+            otel_log: None,
             today_cloud_tokens: AtomicU64::new(0),
             cloud_request_count: AtomicU64::new(0),
             cloud_token_sum: AtomicU64::new(0),
             budget_daily_tokens: 0,
             budget_action: "local-only".to_string(),
             spike_factor: 50,
-            max_body_bytes: 16 * 1024 * 1024,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 
@@ -286,6 +292,22 @@ impl Proxy {
     /// this are rejected with 413 before being read. Default: 16 MiB.
     pub fn with_max_body_bytes(mut self, limit: usize) -> Self {
         self.max_body_bytes = limit;
+        self
+    }
+
+    /// Enable PII pseudonymization for cloud requests (IMP-19). When true,
+    /// detected PII in messages is replaced with opaque tokens before the
+    /// request is sent to the cloud backend, and restored from the response.
+    pub fn with_pseudonymize(mut self, enabled: bool) -> Self {
+        self.pseudonymize = enabled;
+        self
+    }
+
+    /// Enable the OTel GenAI trace log (IMP-23). Each request appends one
+    /// JSONL span with GenAI semantic convention attributes to `path`.
+    /// Empty path disables the feature.
+    pub fn with_otel_log(mut self, path: Option<String>) -> Self {
+        self.otel_log = path.filter(|p| !p.is_empty());
         self
     }
 
@@ -909,10 +931,41 @@ impl Proxy {
             }
         }
 
+        // Pseudonymization (IMP-19): replace PII with opaque tokens before
+        // sending to the cloud. Only applied to cloud-bound, non-sensitive
+        // requests (sensitive content is already handled above). The mapping
+        // is kept in memory and never logged (I5).
+        let pseudo_mapping;
+        let pseudo_req;
+        let req = if self.pseudonymize && planned_route == Route::Cloud {
+            let (msgs, mapping) =
+                crate::pseudonymize::pseudonymize_messages(&req.messages);
+            pseudo_mapping = Some(mapping);
+            pseudo_req = CompletionRequest {
+                messages: msgs,
+                ..req.clone()
+            };
+            &pseudo_req
+        } else {
+            pseudo_mapping = None;
+            req
+        };
+
+        // OTel span (IMP-23): start before the completion call.
+        let mut otel_span = self.otel_log.as_deref().map(|_| {
+            let system = match self.cloud.as_deref().map(|b| b.name()) {
+                Some("cloud") => "cloud",
+                _ => "local",
+            };
+            let mut s = crate::telemetry::Span::start(system, &req.model);
+            s.route = "local"; // default; overwritten after completion
+            s
+        });
+
         // Pick the completion strategy. Cascade (try local, escalate on low
         // confidence) is never used for sensitive content (privacy) or when
         // either backend is missing.
-        let (resp, route, logprob) = if self.cascade
+        let (mut resp, route, logprob) = if self.cascade
             && !sensitive
             && planned_route == Route::Local
             && self.cloud.is_some()
@@ -924,6 +977,27 @@ impl Proxy {
         } else {
             self.complete_direct(req, planned_route)?
         };
+
+        // Restore pseudonymized tokens in the response (IMP-19).
+        if let Some(ref mapping) = pseudo_mapping {
+            if !mapping.is_empty() {
+                resp.content = crate::pseudonymize::restore(&resp.content, mapping);
+            }
+        }
+
+        // Finish and emit the OTel span (IMP-23).
+        if let (Some(ref mut span), Some(ref log_path)) =
+            (otel_span.as_mut(), self.otel_log.as_deref())
+        {
+            span.response_model = resp.model.clone();
+            span.input_tokens = resp.prompt_tokens;
+            span.output_tokens = resp.completion_tokens;
+            span.route = route.as_str();
+            span.finish();
+            if let Err(e) = span.append_to(log_path) {
+                eprintln!("pasture: otel log write failed: {e}");
+            }
+        }
 
         // Store on miss (exact-match).
         if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
@@ -1972,7 +2046,6 @@ pub fn build_embeddings_response(resp: &EmbeddingsResponse) -> String {
 /// logging/observability/dedup tooling keys on. Uniqueness within the process is
 /// guaranteed by an atomic counter; the wall-clock prefix adds cross-run variety.
 fn next_completion_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("chatcmpl-{}{:08}", unix_now(), n)
@@ -1984,7 +2057,6 @@ fn next_completion_id() -> String {
 /// correlatable. Uniqueness within the process is guaranteed by an atomic
 /// counter; the wall-clock prefix adds cross-run variety.
 fn next_request_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("req_{}{:08}", unix_now(), n)
@@ -2103,7 +2175,6 @@ pasture_semantic_cache_capacity {sem_cap}\n",
 /// (false / score 0). Pasture does not run content moderation; the stub prevents
 /// client SDKs that unconditionally call the moderation endpoint from erroring.
 pub fn build_moderations_response() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static CTR: AtomicU64 = AtomicU64::new(0);
     let id = CTR.fetch_add(1, Ordering::Relaxed);
     format!(

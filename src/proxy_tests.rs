@@ -1496,7 +1496,6 @@ impl Backend for FlakyBackend {
         "flaky"
     }
     fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
-        use std::sync::atomic::Ordering;
         self.attempts.fetch_add(1, Ordering::SeqCst);
         if self.remaining.load(Ordering::SeqCst) > 0 {
             self.remaining.fetch_sub(1, Ordering::SeqCst);

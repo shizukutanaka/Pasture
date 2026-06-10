@@ -469,7 +469,8 @@ fn make_cloud_backend(config: &Config) -> Option<Box<dyn Backend>> {
     #[cfg(feature = "cloud")]
     {
         let provider = crate::cloud::Provider::from_name(&config.cloud_provider)?;
-        let backend = crate::cloud::HttpsCloudBackend::from_env(provider, &config.cloud_model)?;
+        let backend = crate::cloud::HttpsCloudBackend::from_env(provider, &config.cloud_model)?
+            .with_cache_control(config.cache_control);
         Some(Box::new(backend))
     }
     #[cfg(not(feature = "cloud"))]
@@ -1137,6 +1138,11 @@ fn run_config(config: &Config) -> i32 {
         }
     }
     println!("  max_body_bytes:    {}", config.max_body_bytes);
+    println!("  cache_control:     {}", config.cache_control);
+    println!("  pseudonymize:      {}", config.pseudonymize);
+    if !config.otel_log.is_empty() {
+        println!("  otel_log:          {}", config.otel_log);
+    }
     println!("  cost_log:          {}", config.cost_log_path);
     println!("  donate_url:        {}", yn(config.donate_url.is_some()));
     println!("  lang:              {}", lang.code());
@@ -1356,7 +1362,13 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
             config.spike_factor,
             &config.cost_log_path,
         )
-        .with_max_body_bytes(config.max_body_bytes);
+        .with_max_body_bytes(config.max_body_bytes)
+        .with_pseudonymize(config.pseudonymize)
+        .with_otel_log(if config.otel_log.is_empty() {
+            None
+        } else {
+            Some(config.otel_log.clone())
+        });
     print!(
         "{}",
         crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])

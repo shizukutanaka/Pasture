@@ -1019,3 +1019,38 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   `OpenAiCompatBackend` implement it. `handle_embeddings`, `parse_embeddings_request`,
   `build_embeddings_response`, and `fmt_float_array` (finite-safe) live in `proxy.rs`.
   Std-only, zero new dependencies. SPEC.md §3.2b now normative for this endpoint.
+- **ADR-131 Anthropic prefix caching + system field separation (IMP-18).**
+  The Anthropic API requires `role="system"` messages in a top-level `"system"` field
+  (not in the `messages` array). Previously Pasture passed them as `{"role":"system",…}`
+  which the API silently accepted but ignored for prefix caching. `Provider::build_body_opts`
+  now separates system messages into the `"system"` field; when `PASTURE_CACHE_CONTROL=1`
+  the system block gains a `"cache_control":{"type":"ephemeral"}` hint so Anthropic's
+  prompt-cache caches the system prefix across requests. Cache hints are no-op for OpenAI
+  targets. `HttpsCloudBackend` gains a `cache_control: bool` field set via `with_cache_control`.
+  Std-only; behaviour-preserving for OpenAI; zero new dependencies.
+- **ADR-132 Reversible PII pseudonymization (IMP-19).**
+  New module `src/pseudonymize.rs`: when `PASTURE_PSEUDONYMIZE=1`, cloud-bound messages
+  have detected PII (email, IPv4, phone, API-key prefix) replaced with stable opaque tokens
+  (`<EMAIL_1>`, `<IP_1>`, etc.) before the request leaves the machine; the cloud response has
+  tokens replaced back with the original values. Identical values get the same token (stable
+  across messages in one request). The replacement mapping lives only in memory for the request
+  lifetime and is never logged (privacy invariant I5). Uses the existing `privacy` module
+  detectors — zero new pattern matching, zero new dependencies. 9 unit tests in the module.
+- **ADR-133 OTel GenAI trace log (IMP-23).**
+  New module `src/telemetry.rs`: when `PASTURE_OTEL_LOG=<path>` is set, each completion
+  appends one JSONL line in OpenTelemetry GenAI semantic convention format (OTel SemConv 1.28+:
+  `gen_ai.system`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`,
+  `gen_ai.usage.output_tokens`, `pasture.route`). Trace and span IDs (128-bit / 64-bit) are
+  generated without an external RNG: nanosecond time mixed with an atomic counter via
+  MurmurHash3 finalizer — unique within a process lifetime and compliant with OTel hex format.
+  No PII is written: only token counts, model names, route, and timing (I5). The JSONL format
+  is importable by OTel Collector, Jaeger, and Tempo. Zero new dependencies; 7 unit tests.
+- **ADR-134 Supply-chain hardening (IMP-27).**
+  `deny.toml` (cargo-deny configuration) enumerates the permitted SPDX licence set
+  (MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, ISC, OpenSSL, BSD-2-Clause, BSD-3-Clause)
+  and denies unlicensed, copyleft, unknown-registry, unknown-git, and yanked crates. Any new
+  dependency outside the allowed set fails CI. `.github/workflows/ci.yml` runs `build-and-test`
+  (cargo build --release, cargo test, clippy -D warnings, fmt --check) and `supply-chain`
+  (cargo-deny check) on every push and pull request. The supply-chain gate mirrors the
+  IMP-10/IMP-27 "zero new dependency by default" invariant: if a PR adds a crate, CI forces
+  a licence + advisory review before merge.

@@ -232,16 +232,16 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 
 | IMP | Title | Status |
 |-----|-------|--------|
-| **IMP-18** | Prefix-preserving request shaping + provider prompt-cache activation | Planned |
-| **IMP-19** | Reversible pseudonymization send mode (machine→cloud with PII masked) | Planned |
+| **IMP-18** | Prefix-preserving request shaping + provider prompt-cache activation | ✅ **SHIPPED (ADR-131 — `PASTURE_CACHE_CONTROL`)** |
+| **IMP-19** | Reversible pseudonymization send mode (machine→cloud with PII masked) | ✅ **SHIPPED (ADR-132 — `PASTURE_PSEUDONYMIZE`)** |
 | **IMP-20** | Lightweight prompt-injection guard (lexical, deterministic) | ✅ **SHIPPED (ADR-128)** |
 | **IMP-21** | Latency DoS hardening (body size/connection time/output length limits) | ✅ **SHIPPED (ADR-130 — `PASTURE_MAX_BODY_BYTES` configurable)** |
 | **IMP-22** | Fertility-based token estimation (whitespace=0, digits=0.5 tok/char) | ✅ **SHIPPED (ADR-126)** |
-| **IMP-23** | OpenTelemetry GenAI–compliant optional metrics/trace export | Planned |
+| **IMP-23** | OpenTelemetry GenAI–compliant optional metrics/trace export | ✅ **SHIPPED (ADR-133 — `PASTURE_OTEL_LOG`)** |
 | **IMP-24** | Output-length prediction for cost estimation (deferred) | Deferred |
 | **IMP-25** | Skill-profile routing: task-type → route override table | ✅ **SHIPPED (ADR-127)** |
 | **IMP-26** | Budget-aware dynamic threshold (cost velocity + daily cap) | ✅ **SHIPPED (ADR-129 — `PASTURE_BUDGET_DAILY_TOKENS`)** |
-| **IMP-27** | Supply-chain hardening: cargo-deny/SBOM/cosign in CI | Planned |
+| **IMP-27** | Supply-chain hardening: cargo-deny/SBOM/cosign in CI | ✅ **SHIPPED (ADR-134 — `deny.toml` + `.github/workflows/ci.yml`)** |
 - **What:** Let `eval` optionally load a larger labelled set in RouterBench
   CSV/JSONL format, while keeping the built-in 18-case set as the offline regression.
 - **Why:** Validates routing quality against a public, comparable benchmark and turns

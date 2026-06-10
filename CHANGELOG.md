@@ -5,6 +5,29 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — PII pseudonymization, OTel trace log, Anthropic cache hints, supply-chain CI (IMP-18, IMP-19, IMP-23, IMP-27)
+
+- **IMP-19 Reversible PII pseudonymization** (`PASTURE_PSEUDONYMIZE=1`): cloud-bound messages
+  have detected PII (email, IPv4, phone, API-key prefix) replaced with stable opaque tokens
+  (`<EMAIL_1>`, `<IP_1>`, …) before leaving the machine; the cloud response has tokens swapped
+  back. Identical values map to the same token across all messages in one request. The mapping
+  lives in memory for the request lifetime only — never logged (I5). 9 new tests. (ADR-132)
+- **IMP-23 OTel GenAI trace log** (`PASTURE_OTEL_LOG=<path>`): each completion appends one JSONL
+  line in OpenTelemetry GenAI semantic convention format (OTel SemConv 1.28+). Fields: trace_id,
+  span_id, start/end_time_unix_nano, gen_ai.system, gen_ai.request/response.model,
+  gen_ai.usage.input/output_tokens, pasture.route. IDs generated from nanosecond time + atomic
+  counter (no external RNG). No PII written (I5). Compatible with OTel Collector, Jaeger, Tempo.
+  7 new tests. (ADR-133)
+- **IMP-18 Anthropic prefix caching + system field separation** (`PASTURE_CACHE_CONTROL=1`):
+  system messages are now sent in the Anthropic-required top-level `"system"` field (previously
+  sent as conversation messages, which the API silently accepted but did not prefix-cache).
+  With `PASTURE_CACHE_CONTROL=1`, the system block gains `"cache_control":{"type":"ephemeral"}`
+  to enable Anthropic prompt-cache across requests. No-op for OpenAI targets. (ADR-131)
+- **IMP-27 Supply-chain hardening**: `deny.toml` (cargo-deny) locks permitted licences and denies
+  unlicensed/copyleft/yanked crates. `.github/workflows/ci.yml` gates every push/PR on:
+  `cargo build --release`, `cargo test`, `clippy -D warnings`, `fmt --check`, and
+  `cargo deny check`. (ADR-134)
+
 ### Added — Budget-aware routing: daily token cap + spike detection (IMP-26, IMP-21)
 
 - Set `PASTURE_BUDGET_DAILY_TOKENS=<n>` to cap the cloud token spend per UTC day (prompt +

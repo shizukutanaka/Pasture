@@ -49,28 +49,77 @@ impl Provider {
 
     /// Build the JSON request body for this provider.
     pub fn build_body(self, req: &CompletionRequest) -> String {
-        let msgs: Vec<String> = req
-            .messages
-            .iter()
-            .map(|m| {
-                format!(
-                    "{{\"role\":\"{}\",\"content\":\"{}\"}}",
-                    escape_string(&m.role),
-                    escape_string(&m.content)
-                )
-            })
-            .collect();
+        self.build_body_opts(req, false)
+    }
+
+    /// Like `build_body` but, when `cache_control` is true, injects an Anthropic
+    /// prompt-caching hint (`cache_control: {"type": "ephemeral"}`) into the system
+    /// content block (IMP-18). For OpenAI the flag is a no-op (OAI supports prefix
+    /// caching automatically; no explicit annotation is required).
+    ///
+    /// For Anthropic the system message(s) are also separated from the messages
+    /// array into the top-level `"system"` field, which is the canonical Anthropic
+    /// Messages API form and enables provider-side prefix caching.
+    pub fn build_body_opts(self, req: &CompletionRequest, cache_control: bool) -> String {
         match self {
-            Provider::OpenAI => format!(
-                "{{\"model\":\"{}\",\"messages\":[{}]{}}}",
-                escape_string(&req.model),
-                msgs.join(","),
-                req.sampling.openai_fields()
-            ),
+            Provider::OpenAI => {
+                let msgs: Vec<String> = req
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "{{\"role\":\"{}\",\"content\":\"{}\"}}",
+                            escape_string(&m.role),
+                            escape_string(&m.content)
+                        )
+                    })
+                    .collect();
+                format!(
+                    "{{\"model\":\"{}\",\"messages\":[{}]{}}}",
+                    escape_string(&req.model),
+                    msgs.join(","),
+                    req.sampling.openai_fields()
+                )
+            }
             Provider::Anthropic => {
-                // Anthropic requires max_tokens; honour the client's value (else
-                // keep the prior 1024 default). temperature/top_p/stop_sequences
-                // map across; OpenAI-only penalties are not supported here.
+                // Separate system messages from the conversation turns (IMP-18).
+                // The Anthropic Messages API takes system as a top-level field;
+                // putting it there (rather than as role="system" in the array)
+                // is the recommended form and is required for prompt caching.
+                let mut system_parts: Vec<&str> = Vec::new();
+                let mut conv_msgs: Vec<String> = Vec::new();
+                for m in &req.messages {
+                    if m.role == "system" {
+                        system_parts.push(m.content.as_str());
+                    } else {
+                        conv_msgs.push(format!(
+                            "{{\"role\":\"{}\",\"content\":\"{}\"}}",
+                            escape_string(&m.role),
+                            escape_string(&m.content)
+                        ));
+                    }
+                }
+
+                // Build the "system" JSON fragment (omitted when there are no
+                // system messages so the schema stays minimal).
+                let system_json = if !system_parts.is_empty() {
+                    let combined = system_parts.join("\n\n");
+                    if cache_control {
+                        // Structured content block with cache hint (IMP-18).
+                        format!(
+                            ",\"system\":[{{\"type\":\"text\",\"text\":\"{}\",\"cache_control\":{{\"type\":\"ephemeral\"}}}}]",
+                            escape_string(&combined)
+                        )
+                    } else {
+                        // Plain string form (Anthropic accepts both).
+                        format!(",\"system\":\"{}\"", escape_string(&combined))
+                    }
+                } else {
+                    String::new()
+                };
+
+                // Anthropic requires max_tokens; honour the client's value or
+                // fall back to 1024. temperature/top_p/stop_sequences map across.
                 let max_tokens = req.sampling.max_tokens.unwrap_or(1024);
                 let mut extra = String::new();
                 if let Some(t) = req.sampling.temperature {
@@ -89,9 +138,10 @@ impl Provider {
                     extra.push_str(&format!(",\"stop_sequences\":[{}]", items.join(",")));
                 }
                 format!(
-                    "{{\"model\":\"{}\",\"max_tokens\":{max_tokens},\"messages\":[{}]{}}}",
+                    "{{\"model\":\"{}\",\"max_tokens\":{max_tokens}{},\"messages\":[{}]{}}}",
                     escape_string(&req.model),
-                    msgs.join(","),
+                    system_json,
+                    conv_msgs.join(","),
                     extra
                 )
             }
@@ -441,6 +491,8 @@ mod transport {
         provider: Provider,
         api_key: String,
         model: String,
+        /// When true, inject Anthropic prompt-cache hints (IMP-18).
+        cache_control: bool,
     }
 
     impl HttpsCloudBackend {
@@ -449,12 +501,19 @@ mod transport {
                 provider,
                 api_key: api_key.to_string(),
                 model: model.to_string(),
+                cache_control: false,
             }
         }
 
         /// Build from environment; returns None if the API key is unset.
         pub fn from_env(provider: Provider, model: &str) -> Option<Self> {
             api_key_from_env(provider).map(|k| Self::new(provider, &k, model))
+        }
+
+        /// Enable Anthropic prompt-cache hints (IMP-18).
+        pub fn with_cache_control(mut self, enabled: bool) -> Self {
+            self.cache_control = enabled;
+            self
         }
     }
 
@@ -466,7 +525,7 @@ mod transport {
         fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
             let host = self.provider.host();
             let path = self.provider.path();
-            let body = self.provider.build_body(req);
+            let body = self.provider.build_body_opts(req, self.cache_control);
             let mut header_lines = String::new();
             for (k, v) in self.provider.headers(&self.api_key) {
                 header_lines.push_str(&format!("{k}: {v}\r\n"));
@@ -501,7 +560,13 @@ mod transport {
         ) -> Result<CompletionResponse, BackendError> {
             let host = self.provider.host();
             let path = self.provider.path();
-            let body = self.provider.build_body_stream(req);
+            // build_body_stream adds "stream":true on top of the base body;
+            // call opts variant so cache_control hints apply here too (IMP-18).
+            let mut body = self.provider.build_body_opts(req, self.cache_control);
+            debug_assert!(body.ends_with('}'));
+            body.pop();
+            body.push_str(",\"stream\":true}");
+            let body = body;
             let mut header_lines = String::new();
             for (k, v) in self.provider.headers(&self.api_key) {
                 header_lines.push_str(&format!("{k}: {v}\r\n"));

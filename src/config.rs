@@ -98,6 +98,20 @@ pub struct Config {
     /// Maximum body bytes accepted per request (IMP-21). Requests larger than
     /// this are rejected with 413. Default 16 MiB. Set via `PASTURE_MAX_BODY_BYTES`.
     pub max_body_bytes: usize,
+    /// Inject Anthropic prompt-cache hints into the system message (IMP-18).
+    /// Separates system messages into Anthropic's `"system"` field and adds
+    /// `cache_control: {"type": "ephemeral"}` to enable provider-side KV caching.
+    /// For OpenAI this is a no-op. Set via `PASTURE_CACHE_CONTROL=1`.
+    pub cache_control: bool,
+    /// Pseudonymize PII before sending cloud requests and restore in responses
+    /// (IMP-19). Replaces emails, IPs, phone numbers, and API keys with opaque
+    /// tokens (`<EMAIL_1>`, etc.) that are reversed after the cloud response.
+    /// Set via `PASTURE_PSEUDONYMIZE=1`.
+    pub pseudonymize: bool,
+    /// Optional OTel-compatible GenAI trace log path (IMP-23). Each request
+    /// appends one JSONL span with GenAI semantic convention attributes.
+    /// Empty = disabled (default). Set via `PASTURE_OTEL_LOG=<path>`.
+    pub otel_log: String,
 }
 
 impl Default for Config {
@@ -143,6 +157,9 @@ impl Default for Config {
             budget_action: "local-only".to_string(),
             spike_factor: 50,
             max_body_bytes: 16 * 1024 * 1024,
+            cache_control: false,
+            pseudonymize: false,
+            otel_log: String::new(),
         }
     }
 }
@@ -347,6 +364,21 @@ impl Config {
                 self.max_body_bytes = n;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_CACHE_CONTROL") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.cache_control = true,
+                _ => {}
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_PSEUDONYMIZE") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.pseudonymize = true,
+                _ => {}
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_OTEL_LOG") {
+            self.otel_log = v;
+        }
         self
     }
 
@@ -472,6 +504,13 @@ impl Config {
                     self.max_body_bytes = n;
                 }
             }
+            "cache_control" => {
+                self.cache_control = matches!(val, "1" | "true" | "yes");
+            }
+            "pseudonymize" => {
+                self.pseudonymize = matches!(val, "1" | "true" | "yes");
+            }
+            "otel_log" => self.otel_log = val.to_string(),
             _ => {}
         }
     }

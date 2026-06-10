@@ -1,0 +1,47 @@
+# cargo-deny configuration (IMP-27: supply-chain hardening).
+#
+# The default Pasture build is zero-dependency (no external crates).
+# The `--features cloud` build pulls in native-tls + openssl.
+# This config governs both; unknown licenses and security advisories are denied.
+#
+# Run: cargo deny check
+# Install: cargo install cargo-deny  OR  use taiki-e/install-action in CI.
+
+[licenses]
+# Licenses we explicitly allow. All current deps (openssl, native-tls) are
+# Apache-2.0 or MIT. The OpenSSL license applies to the underlying OpenSSL C
+# library when linked via openssl-sys.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "OpenSSL",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+]
+unlicensed = "deny"
+copyleft = "deny"
+default = "deny"
+
+[bans]
+# Warn rather than deny multiple versions of the same crate (build-dep
+# duplication is sometimes unavoidable with the openssl ecosystem).
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+# Crates we never want in the dependency graph for any reason.
+deny = []
+
+[advisories]
+# Deny crates with known security vulnerabilities (RUSTSEC advisories).
+ignore = []
+unmaintained = "warn"
+unsound = "deny"
+yanked = "deny"
+
+[sources]
+# Only allow crates from crates.io (no unpinned git deps).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
