@@ -133,36 +133,7 @@ pub fn run(args: &[String]) -> i32 {
             println!("{}", hardware_text(&profile));
             0
         }
-        "route" => {
-            let pos = positional(rest);
-            let Some(text) = pos.first() else {
-                eprintln!("usage: pasture route <text> [--local|--cloud]");
-                return 2;
-            };
-            // Dry-run shows the full rule logic, assuming both backends present.
-            let profile = HardwareProfile::detect();
-            let engine = make_engine(&profile, &config, true);
-            let report = crate::privacy::classify(text);
-            if report.is_sensitive() {
-                println!("sensitive: yes [{}]", report.categories.join(", "));
-            } else {
-                println!("sensitive: no");
-            }
-            match engine.decide_with_sensitivity(
-                text,
-                parse_route_flag(rest),
-                report.is_sensitive(),
-            ) {
-                Ok(d) => println!(
-                    "route: {}\nreason: {}\nthreshold: {} tokens",
-                    d.route.as_str(),
-                    d.reason,
-                    engine.threshold()
-                ),
-                Err(e) => println!("error: {e}"),
-            }
-            0
-        }
+        "route" => run_route(&config, rest),
         "chat" => {
             let pos = positional(rest);
             let Some(text) = pos.first() else {
@@ -175,127 +146,8 @@ pub fn run(args: &[String]) -> i32 {
             let addr = option_value(rest, "--addr").unwrap_or(&config.listen_addr);
             run_serve(&config, addr)
         }
-        "eval" => {
-            let profile = HardwareProfile::detect();
-            let engine = RoutingEngine::for_hardware(&profile, true, true);
-            // --external <file>: load a user-supplied JSONL eval file and run it
-            // through the same routing harness as the built-in cases (IMP-17).
-            if let Some(path) = option_value(rest, "--external") {
-                match crate::eval::load_eval_cases(path) {
-                    Ok(cases) => {
-                        if cases.is_empty() {
-                            println!("external eval file contains no cases: {path}");
-                            return 0;
-                        }
-                        let report = crate::eval::run_eval_owned(&engine, &cases);
-                        println!(
-                            "External routing eval ({} cases from {path}, threshold {}):",
-                            report.total,
-                            engine.threshold()
-                        );
-                        println!(
-                            "  accuracy: {:.1}% ({}/{})",
-                            report.accuracy() * 100.0,
-                            report.correct,
-                            report.total
-                        );
-                        println!("  cloud rate: {:.1}%", report.cloud_rate() * 100.0);
-                        println!(
-                            "  false escalations (local->cloud): {}",
-                            report.false_escalations
-                        );
-                        println!(
-                            "  missed escalations (cloud->local): {}",
-                            report.missed_escalations
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("eval --external: {e}");
-                        return 1;
-                    }
-                }
-                return 0;
-            }
-            let report = crate::eval::run_eval(&engine, &crate::eval::default_cases());
-            if rest.iter().any(|a| a == "--json") {
-                println!("{}", report.to_json(engine.threshold()));
-                return 0;
-            }
-            println!(
-                "Routing eval ({} cases, threshold {}):",
-                report.total,
-                engine.threshold()
-            );
-            println!(
-                "  accuracy: {:.1}% ({}/{})",
-                report.accuracy() * 100.0,
-                report.correct,
-                report.total
-            );
-            println!("  cloud rate: {:.1}%", report.cloud_rate() * 100.0);
-            println!(
-                "  false escalations (local->cloud): {}",
-                report.false_escalations
-            );
-            println!(
-                "  missed escalations (cloud->local): {}",
-                report.missed_escalations
-            );
-            println!("\nThreshold sweep (plain prompts, cloud rate):");
-            for (t, rate) in
-                crate::eval::sweep(&crate::eval::length_samples(), &[50, 100, 300, 800, 2000])
-            {
-                println!("  thr {t:>5}: {:.0}%", rate * 100.0);
-            }
-            0
-        }
-        "stats" => match crate::cost::read_log(&config.cost_log_path) {
-            Ok(recs) => {
-                let s = crate::cost::summarize(&recs);
-                if rest.iter().any(|a| a == "--json") {
-                    // Always valid JSON (zeros when the log is empty) for scripting.
-                    println!("{}", s.to_json());
-                    return 0;
-                }
-                if s.total == 0 {
-                    println!(
-                        "no cost log yet at {} (run some requests first)",
-                        config.cost_log_path
-                    );
-                    return 0;
-                }
-                println!("Cost log: {} ({} records)", config.cost_log_path, s.total);
-                println!(
-                    "  local: {}  cloud: {}  cache: {}",
-                    s.local, s.cloud, s.cache
-                );
-                println!(
-                    "  cloud rate: {:.1}%   cache hit rate: {:.1}%",
-                    s.cloud_rate() * 100.0,
-                    s.cache_rate() * 100.0
-                );
-                println!(
-                    "  tokens: prompt {}, completion {}",
-                    s.prompt_tokens, s.completion_tokens
-                );
-                println!("  cloud spend: ${:.4}", s.cloud_cost_usd);
-                if s.cache > 0 {
-                    println!("  cache saved {} backend call(s)", s.cache);
-                }
-                if let Some(lp) = crate::cost::logprob_summary(&recs) {
-                    println!(
-                        "  cascade confidence (mean logprob): n={}, mean {:.3}, min {:.3}, p10 {:.3}, median {:.3}",
-                        lp.count, lp.mean, lp.min, lp.p10, lp.median
-                    );
-                    println!("  -> tune escalation: pasture calibrate --logprob");
-                }
-                0
-            }
-            Err(e) => {
-                eprintln!("cannot read cost log: {e}");
-                1
-            }
-        },
+        "eval" => run_eval(rest),
+        "stats" => run_stats(&config, rest),
         "calibrate" => run_calibrate(&config, rest),
         "improvements" => {
             let review = rest.iter().any(|a| a == "--review");
@@ -309,40 +161,191 @@ pub fn run(args: &[String]) -> i32 {
             );
             0
         }
-        "refer" => {
-            let pos = positional(rest);
-            if let Some(key) = pos.first() {
-                match crate::monetize::provider(key) {
-                    Some(p) => {
-                        match crate::monetize::referral_url(p.key, env_referral_resolver) {
-                            Some(u) => println!("{}: {u}", p.display),
-                            None => println!(
-                                "{}: not configured. Set PASTURE_REF_{}=<your affiliate url>\n({})",
-                                p.display,
-                                p.key.to_uppercase(),
-                                p.homepage
-                            ),
-                        }
-                        0
-                    }
-                    None => {
-                        eprintln!("unknown provider: {key}");
-                        2
-                    }
-                }
-            } else {
-                println!(
-                    "{}",
-                    crate::monetize::referral_list_text(env_referral_resolver)
-                );
-                0
-            }
-        }
+        "refer" => run_refer(rest),
         other => {
             eprintln!("unknown command: {other}\n");
             print!("{USAGE}");
             2
         }
+    }
+}
+
+/// `pasture route <text>`: dry-run the routing decision for a prompt,
+/// showing sensitivity, chosen route, reason, and the active threshold.
+fn run_route(config: &Config, rest: &[String]) -> i32 {
+    let pos = positional(rest);
+    let Some(text) = pos.first() else {
+        eprintln!("usage: pasture route <text> [--local|--cloud]");
+        return 2;
+    };
+    // Dry-run shows the full rule logic, assuming both backends present.
+    let profile = HardwareProfile::detect();
+    let engine = make_engine(&profile, config, true);
+    let report = crate::privacy::classify(text);
+    if report.is_sensitive() {
+        println!("sensitive: yes [{}]", report.categories.join(", "));
+    } else {
+        println!("sensitive: no");
+    }
+    match engine.decide_with_sensitivity(text, parse_route_flag(rest), report.is_sensitive()) {
+        Ok(d) => println!(
+            "route: {}\nreason: {}\nthreshold: {} tokens",
+            d.route.as_str(),
+            d.reason,
+            engine.threshold()
+        ),
+        Err(e) => println!("error: {e}"),
+    }
+    0
+}
+
+/// Print the standard eval report block shared by the built-in and
+/// `--external` eval paths.
+fn print_eval_report(report: &crate::eval::EvalReport) {
+    println!(
+        "  accuracy: {:.1}% ({}/{})",
+        report.accuracy() * 100.0,
+        report.correct,
+        report.total
+    );
+    println!("  cloud rate: {:.1}%", report.cloud_rate() * 100.0);
+    println!(
+        "  false escalations (local->cloud): {}",
+        report.false_escalations
+    );
+    println!(
+        "  missed escalations (cloud->local): {}",
+        report.missed_escalations
+    );
+}
+
+/// `pasture eval`: run the routing eval (built-in cases, or `--external
+/// <file>` JSONL cases) and print accuracy / escalation stats.
+fn run_eval(rest: &[String]) -> i32 {
+    let profile = HardwareProfile::detect();
+    let engine = RoutingEngine::for_hardware(&profile, true, true);
+    // --external <file>: load a user-supplied JSONL eval file and run it
+    // through the same routing harness as the built-in cases (IMP-17).
+    if let Some(path) = option_value(rest, "--external") {
+        match crate::eval::load_eval_cases(path) {
+            Ok(cases) => {
+                if cases.is_empty() {
+                    println!("external eval file contains no cases: {path}");
+                    return 0;
+                }
+                let report = crate::eval::run_eval_owned(&engine, &cases);
+                println!(
+                    "External routing eval ({} cases from {path}, threshold {}):",
+                    report.total,
+                    engine.threshold()
+                );
+                print_eval_report(&report);
+            }
+            Err(e) => {
+                eprintln!("eval --external: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+    let report = crate::eval::run_eval(&engine, &crate::eval::default_cases());
+    if rest.iter().any(|a| a == "--json") {
+        println!("{}", report.to_json(engine.threshold()));
+        return 0;
+    }
+    println!(
+        "Routing eval ({} cases, threshold {}):",
+        report.total,
+        engine.threshold()
+    );
+    print_eval_report(&report);
+    println!("\nThreshold sweep (plain prompts, cloud rate):");
+    for (t, rate) in crate::eval::sweep(&crate::eval::length_samples(), &[50, 100, 300, 800, 2000])
+    {
+        println!("  thr {t:>5}: {:.0}%", rate * 100.0);
+    }
+    0
+}
+
+/// `pasture stats`: summarize the PII-free cost log (`--json` for scripting).
+fn run_stats(config: &Config, rest: &[String]) -> i32 {
+    match crate::cost::read_log(&config.cost_log_path) {
+        Ok(recs) => {
+            let s = crate::cost::summarize(&recs);
+            if rest.iter().any(|a| a == "--json") {
+                // Always valid JSON (zeros when the log is empty) for scripting.
+                println!("{}", s.to_json());
+                return 0;
+            }
+            if s.total == 0 {
+                println!(
+                    "no cost log yet at {} (run some requests first)",
+                    config.cost_log_path
+                );
+                return 0;
+            }
+            println!("Cost log: {} ({} records)", config.cost_log_path, s.total);
+            println!(
+                "  local: {}  cloud: {}  cache: {}",
+                s.local, s.cloud, s.cache
+            );
+            println!(
+                "  cloud rate: {:.1}%   cache hit rate: {:.1}%",
+                s.cloud_rate() * 100.0,
+                s.cache_rate() * 100.0
+            );
+            println!(
+                "  tokens: prompt {}, completion {}",
+                s.prompt_tokens, s.completion_tokens
+            );
+            println!("  cloud spend: ${:.4}", s.cloud_cost_usd);
+            if s.cache > 0 {
+                println!("  cache saved {} backend call(s)", s.cache);
+            }
+            if let Some(lp) = crate::cost::logprob_summary(&recs) {
+                println!(
+                    "  cascade confidence (mean logprob): n={}, mean {:.3}, min {:.3}, p10 {:.3}, median {:.3}",
+                    lp.count, lp.mean, lp.min, lp.p10, lp.median
+                );
+                println!("  -> tune escalation: pasture calibrate --logprob");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("cannot read cost log: {e}");
+            1
+        }
+    }
+}
+
+/// `pasture refer [provider]`: print referral links (or the configured list).
+fn run_refer(rest: &[String]) -> i32 {
+    let pos = positional(rest);
+    if let Some(key) = pos.first() {
+        match crate::monetize::provider(key) {
+            Some(p) => {
+                match crate::monetize::referral_url(p.key, env_referral_resolver) {
+                    Some(u) => println!("{}: {u}", p.display),
+                    None => println!(
+                        "{}: not configured. Set PASTURE_REF_{}=<your affiliate url>\n({})",
+                        p.display,
+                        p.key.to_uppercase(),
+                        p.homepage
+                    ),
+                }
+                0
+            }
+            None => {
+                eprintln!("unknown provider: {key}");
+                2
+            }
+        }
+    } else {
+        println!(
+            "{}",
+            crate::monetize::referral_list_text(env_referral_resolver)
+        );
+        0
     }
 }
 
