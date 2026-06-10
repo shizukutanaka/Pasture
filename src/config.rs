@@ -62,6 +62,14 @@ pub struct Config {
     /// default 0.92. A hit is returned when similarity ≥ threshold. Ignored when
     /// `semantic_cache_size` is 0.
     pub semantic_cache_threshold: f64,
+    /// Path to a known-hard prompts file for the embedding difficulty signal
+    /// (IMP-14). One prompt per line; `#` comments. Empty = disabled (the default).
+    /// Requests embedding-similar to a listed prompt escalate Local → Cloud.
+    pub hard_prompts: String,
+    /// Cosine similarity at which a prompt counts as "near a known-hard prompt"
+    /// (IMP-14). Default 0.85 — looser than the semantic cache's 0.92 because
+    /// the goal is topical closeness, not near-duplication.
+    pub hard_threshold: f64,
 }
 
 impl Default for Config {
@@ -99,6 +107,8 @@ impl Default for Config {
             local_timeout_secs: 120,
             semantic_cache_size: 0,
             semantic_cache_threshold: 0.92,
+            hard_prompts: String::new(),
+            hard_threshold: 0.85,
         }
     }
 }
@@ -265,6 +275,14 @@ impl Config {
                 self.semantic_cache_threshold = f;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_HARD_PROMPTS") {
+            self.hard_prompts = v;
+        }
+        if let Ok(v) = std::env::var("PASTURE_HARD_THRESHOLD") {
+            if let Ok(f) = v.parse::<f64>() {
+                self.hard_threshold = f;
+            }
+        }
         self
     }
 
@@ -354,6 +372,12 @@ impl Config {
             "semantic_cache_threshold" => {
                 if let Ok(f) = val.parse::<f64>() {
                     self.semantic_cache_threshold = f;
+                }
+            }
+            "hard_prompts" => self.hard_prompts = val.to_string(),
+            "hard_threshold" => {
+                if let Ok(f) = val.parse::<f64>() {
+                    self.hard_threshold = f;
                 }
             }
             _ => {}

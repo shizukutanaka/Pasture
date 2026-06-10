@@ -166,6 +166,17 @@ pub struct Proxy {
     /// backend for an embedding, then scans stored (embedding, response) pairs for
     /// cosine similarity ≥ threshold. Off by default; never used for sensitive content.
     semantic_cache: Option<std::sync::Mutex<crate::cache::SemanticCache>>,
+    /// Known-hard prompts for the embedding difficulty signal (IMP-14). A request
+    /// embedding-similar to any of these escalates Local → Cloud before wasting a
+    /// local attempt. Empty = disabled (the default). Never overrides privacy.
+    hard_prompts: Vec<String>,
+    /// Cosine similarity at which a prompt counts as "near a known-hard prompt".
+    hard_threshold: f64,
+    /// Lazily-embedded centroids for `hard_prompts` (the local backend may not be
+    /// running at construction). `None` = not yet attempted; `Some(vec![])` after
+    /// a failed embedding attempt — the signal stays disabled for the process
+    /// lifetime rather than re-querying a broken backend on every request.
+    hard_centroids: std::sync::Mutex<Option<Vec<Vec<f64>>>>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -200,6 +211,9 @@ impl Proxy {
             cloud_model_name: String::new(),
             access_log: None,
             semantic_cache: None,
+            hard_prompts: Vec::new(),
+            hard_threshold: 0.85,
+            hard_centroids: std::sync::Mutex::new(None),
         }
     }
 
@@ -467,6 +481,15 @@ impl Proxy {
         self
     }
 
+    /// Enable the embedding difficulty signal (IMP-14): requests whose embedding
+    /// is within `threshold` cosine similarity of any of `prompts` escalate
+    /// Local → Cloud. An empty list leaves the signal disabled.
+    pub fn with_hard_prompts(mut self, prompts: Vec<String>, threshold: f64) -> Self {
+        self.hard_prompts = prompts;
+        self.hard_threshold = threshold;
+        self
+    }
+
     /// Parse an OpenAI-style chat-completion request body.
     pub fn parse_request(body: &str) -> Result<CompletionRequest, ProxyError> {
         let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
@@ -647,6 +670,32 @@ impl Proxy {
         }
     }
 
+    /// Difficulty signal (IMP-14): the best cosine similarity between the query
+    /// embedding and the known-hard centroids, when it meets `hard_threshold`.
+    /// Centroids are embedded lazily on first use (the local backend may not be
+    /// up at construction); a failed attempt disables the signal for the process
+    /// lifetime (logged once) instead of re-querying a broken backend per request.
+    fn similar_to_hard(&self, query: &[f64]) -> Option<f64> {
+        let mut guard = self.hard_centroids.lock().ok()?;
+        if guard.is_none() {
+            let centroids = match self.local.as_deref() {
+                Some(local) => match local.embeddings(&self.hard_prompts) {
+                    Ok(r) => r.vectors,
+                    Err(e) => {
+                        eprintln!(
+                            "pasture: hard-prompt embedding failed ({e}); difficulty signal disabled"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
+            *guard = Some(centroids);
+        }
+        let centroids = guard.as_ref().expect("initialised above");
+        crate::difficulty::similar_to_hard(query, centroids, self.hard_threshold)
+    }
+
     /// Run a completion for an already-parsed request (buffered), applying the
     /// cache and cascade strategies when enabled. Returns (response, label).
     fn run_completion(
@@ -686,12 +735,16 @@ impl Proxy {
             }
         }
 
-        // Semantic cache (IMP-12): compute embedding once for both lookup and store.
-        // Uses the local backend's /v1/embeddings — privacy-first (embeddings stay on
-        // machine). Silently skipped when local is absent or the call fails (degraded
-        // to exact-match / no cache). Never used for sensitive content (I5).
+        // Query embedding, computed at most once and shared by the semantic
+        // cache (IMP-12) and the difficulty signal (IMP-14). Uses the local
+        // backend's /v1/embeddings — privacy-first (embeddings stay on machine).
+        // Silently skipped when local is absent or the call fails (degrades to
+        // the deterministic path). Never computed for sensitive content (I5).
+        let want_difficulty = !self.hard_prompts.is_empty()
+            && decision.route == Route::Local
+            && self.cloud.is_some();
         let query_embedding: Option<Vec<f64>> =
-            if !sensitive && self.semantic_cache.is_some() {
+            if !sensitive && (self.semantic_cache.is_some() || want_difficulty) {
                 self.local.as_deref().and_then(|local| {
                     let text = semantic_embed_text(req);
                     local
@@ -712,20 +765,35 @@ impl Proxy {
             }
         }
 
+        // Difficulty signal (IMP-14): a Local-routed prompt near a known-hard
+        // centroid escalates to the cloud before wasting a local attempt. Only
+        // ever flips Local → Cloud; sensitive content was excluded above.
+        let mut planned_route = decision.route;
+        if want_difficulty {
+            if let Some(emb) = query_embedding.as_ref() {
+                if let Some(sim) = self.similar_to_hard(emb) {
+                    eprintln!(
+                        "pasture: prompt similar to known-hard set (cos {sim:.2}) -> cloud"
+                    );
+                    planned_route = Route::Cloud;
+                }
+            }
+        }
+
         // Pick the completion strategy. Cascade (try local, escalate on low
         // confidence) is never used for sensitive content (privacy) or when
         // either backend is missing.
         let (resp, route, logprob) = if self.cascade
             && !sensitive
-            && decision.route == Route::Local
+            && planned_route == Route::Local
             && self.cloud.is_some()
             && self.local.is_some()
         {
             self.complete_cascade(req)?
-        } else if decision.route == Route::Cloud {
+        } else if planned_route == Route::Cloud {
             self.complete_cloud_with_fallback(req)?
         } else {
-            self.complete_direct(req, decision.route)?
+            self.complete_direct(req, planned_route)?
         };
 
         // Store on miss (exact-match).

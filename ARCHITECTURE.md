@@ -280,6 +280,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-125 Embedding difficulty signal: known-hard prompts escalate pre-emptively (IMP-14).**
+  New `difficulty` module + proxy wiring: the user lists prompts their local model handles badly
+  (`PASTURE_HARD_PROMPTS=<file>`, one per line, `#` comments); a non-sensitive request routed
+  Local whose embedding — computed once and shared with the IMP-12 semantic cache — is within
+  `PASTURE_HARD_THRESHOLD` (default 0.85) cosine similarity of any listed prompt escalates to
+  Cloud before wasting a local attempt. Centroids are embedded lazily on first use via the local
+  backend (it may not be up at construction); a failed attempt logs once and disables the signal
+  for the process lifetime. The flip is Local → Cloud only, never overrides privacy (sensitive
+  prompts are excluded before any embedding), requires a cloud backend, and is buffered-only
+  (streaming keeps its direct path, same as cache/cascade). Deterministic routing stays the
+  always-on baseline; this completes the COMPETITIVE.md backlog (IMP-8…17 all shipped).
+  Grounded: survey arXiv:2603.04445 (clustering paradigm), vLLM Semantic Router. 10 new tests
+  (484 total); clippy clean; zero new dependencies; off by default.
 - **ADR-124 Error-grounded cascade calibration via isotonic regression (IMP-13, UCCI).**
   `calibrate --error --labels <f.jsonl> [--target E]` fits a monotone, non-increasing map from
   local mean-logprob to estimated error probability with the Pool Adjacent Violators Algorithm

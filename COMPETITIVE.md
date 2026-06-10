@@ -184,7 +184,7 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
   advisory like the existing calibrate output) · **Zero-dep default?** ✅ (offline,
   std-only math).
 
-#### IMP-14 — Optional embedding/clustering difficulty signal
+#### IMP-14 — Optional embedding/clustering difficulty signal  — ✅ SHIPPED (ADR-125)
 - **What:** Using the same local-embeddings infra as IMP-12, add an optional routing
   input: distance from the prompt embedding to a small set of "known-hard" centroids
   (derived from the eval set / user history) contributes to the escalation decision

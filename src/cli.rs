@@ -1103,6 +1103,19 @@ fn run_config(config: &Config) -> i32 {
         config.cascade_logprob_threshold
     );
     println!("  cache_size:        {}", config.cache_size);
+    println!(
+        "  semantic_cache:    {} (threshold {})",
+        config.semantic_cache_size, config.semantic_cache_threshold
+    );
+    println!(
+        "  hard_prompts:      {} (threshold {})",
+        if config.hard_prompts.is_empty() {
+            unset
+        } else {
+            config.hard_prompts.as_str()
+        },
+        config.hard_threshold
+    );
     println!("  cost_log:          {}", config.cost_log_path);
     println!("  donate_url:        {}", yn(config.donate_url.is_some()));
     println!("  lang:              {}", lang.code());
@@ -1237,6 +1250,27 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
     if cors.is_some() {
         eprintln!("pasture: CORS enabled for origins: {}", config.cors_origins);
     }
+    // Embedding difficulty signal (IMP-14): load known-hard prompts if configured.
+    // A bad path warns loudly but does not stop the server (the signal is advisory;
+    // the deterministic routing baseline is unaffected).
+    let hard_prompts = if config.hard_prompts.is_empty() {
+        Vec::new()
+    } else {
+        match crate::difficulty::load_hard_prompts(&config.hard_prompts) {
+            Ok(p) => {
+                eprintln!(
+                    "pasture: difficulty signal enabled: {} hard prompt(s) (threshold {})",
+                    p.len(),
+                    config.hard_threshold
+                );
+                p
+            }
+            Err(e) => {
+                eprintln!("pasture: WARNING — difficulty signal disabled: {e}");
+                Vec::new()
+            }
+        }
+    };
     // Security nudge: a non-localhost bind without auth is exposed to the network.
     let localhost = addr.starts_with("127.")
         || addr.starts_with("localhost")
@@ -1254,6 +1288,7 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         .with_cache(config.cache_size)
         .with_cache_ttl(config.cache_ttl_secs)
         .with_semantic_cache(config.semantic_cache_size, config.semantic_cache_threshold)
+        .with_hard_prompts(hard_prompts, config.hard_threshold)
         .with_models(models)
         .with_cloud_retry(config.cloud_retry)
         .with_fast_model(fast, config.fast_threshold)

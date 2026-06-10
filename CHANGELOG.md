@@ -5,6 +5,19 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Embedding difficulty signal: known-hard prompts escalate pre-emptively (IMP-14)
+
+- Set `PASTURE_HARD_PROMPTS=<file>` (one prompt per line) to name prompts your local model
+  handles badly. A request embedding-similar to any of them (cosine ≥ `PASTURE_HARD_THRESHOLD`,
+  default 0.85) escalates Local → Cloud before wasting a local attempt — catching hard prompts
+  that read like plain prose and slip past the deterministic keyword heuristics. The embedding is
+  computed once per request and shared with the semantic cache; centroids are embedded lazily via
+  the local backend and a failure disables the signal (logged) rather than degrading requests.
+  Never overrides privacy; requires a cloud backend; off by default. The `pasture config`
+  printout now shows the semantic-cache and hard-prompts settings. This completes the
+  COMPETITIVE.md backlog — IMP-8 through IMP-17 are all shipped. 10 new tests; 484 total.
+  (ADR-125)
+
 ### Added — Error-grounded cascade calibration: `calibrate --error` (IMP-13, UCCI-style)
 
 - `pasture calibrate --error --labels <f.jsonl> [--target E]` turns the cascade knob from an

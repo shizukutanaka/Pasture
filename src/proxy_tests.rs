@@ -1583,6 +1583,59 @@ fn test_handle_chat_short_goes_local() {
 }
 
 #[test]
+fn test_difficulty_signal_escalates_similar_prompt() {
+    // IMP-14: MockBackend embeddings are [char_count, 0] — all parallel, so any
+    // prompt is cosine-1.0 to any centroid. With the signal on, a short prompt
+    // that would otherwise stay local escalates to the cloud.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 100, &log)
+        .with_hard_prompts(vec!["a prompt my local model fumbles".to_string()], 0.9);
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = p.handle_chat(body).unwrap();
+    assert!(resp.contains("\"x_pasture_route\":\"cloud\""), "{resp}");
+    assert!(resp.contains("cloud-reply"));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_difficulty_signal_below_threshold_stays_local() {
+    // An unreachable threshold (cosine can never exceed 1.0) must never flip.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 100, &log)
+        .with_hard_prompts(vec!["hard".to_string()], 1.5);
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = p.handle_chat(body).unwrap();
+    assert!(resp.contains("\"x_pasture_route\":\"local\""), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_difficulty_signal_never_overrides_privacy() {
+    // Sensitive content must stay local even when "similar to hard" (privacy
+    // invariant): the embedding is never computed for sensitive prompts.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 100, &log)
+        .with_hard_prompts(vec!["hard".to_string()], 0.0);
+    let body =
+        r#"{"model":"m","messages":[{"role":"user","content":"email alice@example.com please"}]}"#;
+    let resp = p.handle_chat(body).unwrap();
+    assert!(resp.contains("\"x_pasture_route\":\"local\""), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_difficulty_signal_disabled_without_cloud() {
+    // No cloud backend → nothing to escalate to; the gate must short-circuit.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log)
+        .with_hard_prompts(vec!["hard".to_string()], 0.0);
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = p.handle_chat(body).unwrap();
+    assert!(resp.contains("\"x_pasture_route\":\"local\""), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_handle_chat_long_goes_cloud() {
     let log = tmp_log();
     let p = proxy_with(true, true, 5, &log);
