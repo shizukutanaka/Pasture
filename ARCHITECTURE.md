@@ -280,6 +280,22 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-121 Deterministic `Connection: close` pipelining test (IMP-fix-connection-close-test-flake).**
+  The session-long flake in `test_connection_close_terminates_after_first_request` had a real
+  root cause: the server honours `Connection: close` and drops the socket with the pipelined
+  second request still unread, so the kernel sends RST rather than FIN — and an RST discards
+  unread data in the client's receive buffer, intermittently destroying the first 200 response
+  before the client read it (ECONNRESET). The test now reads the complete first response and
+  signals over an mpsc channel before the server socket is dropped; a buggy server serving the
+  second request is still detected (it closes cleanly, so extra bytes survive to be parsed).
+  Shared helpers extracted: `parse_response_statuses`, `header_content_length`,
+  `read_one_response`. Verified with 8 consecutive parallel full-suite runs.
+- **ADR-120 Proxy test module moved to `src/proxy_tests.rs` via `#[path]` (IMP-refactor-proxy-tests-split).**
+  `proxy.rs` was 4453 lines, 52% of which was the inline test module — the largest file in the
+  codebase, hard to navigate and diff. The module body now lives in its own file, attached with
+  `#[cfg(test)] #[path = "proxy_tests.rs"] mod tests;` — it remains a normal child module
+  (`use super::*` and private-item access unchanged), so the move is purely physical.
+  `proxy.rs` is now 2133 lines of production code. Other modules keep their inline tests.
 - **ADR-119 Extract completion strategies from `run_completion` (IMP-refactor-completion-strategies).**
   The three completion strategies (cascade, cloud-with-local-fallback, direct-with-fast-model)
   were inlined in one 90-line if/else expression. Each is now a named, documented method

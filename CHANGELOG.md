@@ -18,6 +18,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
   products the achieved rate exceeded the target (n=3, target=0.5 → 0.667). `ceil()` guarantees
   achieved ≤ target. 1 test. (ADR-109)
 
+### Fixed — Intermittent `test_connection_close` failure eliminated (IMP-fix-connection-close-test-flake)
+
+- The test closed the server socket with a pipelined second request unread, triggering a TCP RST
+  that could discard the first response from the client's receive buffer (ECONNRESET, ~1-in-3
+  flake). The client now consumes the first response and signals before the socket is dropped.
+  Verified with 8 consecutive parallel full-suite runs. (ADR-121)
+
+### Changed — `proxy.rs` test module moved to `src/proxy_tests.rs` (IMP-refactor-proxy-tests-split)
+
+- `proxy.rs` was 4453 lines, 52% inline tests. The test module now lives in its own file via
+  `#[path]` — same module tree and visibility, purely a physical move. (ADR-120)
+
 ### Changed — Code health: zero clippy warnings, duplication sweep, structural decomposition (ADR-108, 110–119)
 
 - Removed the unreachable surrogate-pair error path in the JSON parser (`char::from_u32` cannot
