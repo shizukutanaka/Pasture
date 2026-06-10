@@ -1084,6 +1084,23 @@ impl Proxy {
                     write_head_response(stream, $s, $l, $e, $ka)?;
                 }};
             }
+            // Handler error: write the OpenAI error envelope and close.
+            macro_rules! wr_err {
+                ($e:expr) => {{
+                    let e = $e;
+                    wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
+                    return Ok(());
+                }};
+            }
+            // Handler Result: 200 with the body on Ok, error envelope on Err.
+            macro_rules! wr_result {
+                ($r:expr) => {
+                    match $r {
+                        Ok(resp) => wr!(200, &resp, &te(), keep_alive),
+                        Err(e) => wr_err!(e),
+                    }
+                };
+            }
             // CORS preflight: answer OPTIONS before the gate (preflight is credential-free).
             if method == "OPTIONS" {
                 match self.cors_preflight(origin.as_deref()) {
@@ -1146,63 +1163,27 @@ impl Proxy {
                         self.stream_chat_to_socket(stream, &req, &te(), include_usage)?;
                         return Ok(());
                     }
-                    Ok(req) => match self.complete_buffered(&req) {
-                        Ok(resp) => wr!(200, &resp, &te(), keep_alive),
-                        Err(e) => {
-                            wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
-                            return Ok(());
-                        }
-                    },
-                    Err(e) => {
-                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
-                        return Ok(());
-                    }
+                    Ok(req) => wr_result!(self.complete_buffered(&req)),
+                    Err(e) => wr_err!(e),
                 }
             } else if method == "POST" && path.starts_with("/v1/completions") {
                 // Legacy text-completion API shim — maps prompt→chat message,
                 // routes through the same pipeline, returns object:"text_completion".
-                match self.handle_legacy_completion(&body) {
-                    Ok(resp) => wr!(200, &resp, &te(), keep_alive),
-                    Err(e) => {
-                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
-                        return Ok(());
-                    }
-                }
+                wr_result!(self.handle_legacy_completion(&body));
             } else if method == "POST" && path.starts_with("/v1/embeddings") {
-                match self.handle_embeddings(&body) {
-                    Ok(resp) => wr!(200, &resp, &te(), keep_alive),
-                    Err(e) => {
-                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
-                        return Ok(());
-                    }
-                }
+                wr_result!(self.handle_embeddings(&body));
             } else if method == "POST" && path.starts_with("/v1/moderations") {
                 // Stub: always marks content as safe. Pasture does not run real
                 // moderation; the stub prevents SDK clients that call this endpoint
                 // unconditionally from receiving a 404.
-                match Self::handle_moderations(&body) {
-                    Ok(resp) => wr!(200, &resp, &te(), keep_alive),
-                    Err(e) => {
-                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
-                        return Ok(());
-                    }
-                }
+                wr_result!(Self::handle_moderations(&body));
             } else if method == "GET" && path.starts_with("/v1/stats") {
-                match self.handle_stats() {
-                    Ok(resp) => wr!(200, &resp, &te(), keep_alive),
-                    Err(e) => {
-                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
-                        return Ok(());
-                    }
-                }
+                wr_result!(self.handle_stats());
             } else if method == "GET" && path.starts_with("/metrics") {
                 // Prometheus text-format scrape endpoint (IMP-metrics-prom).
                 match self.handle_metrics() {
                     Ok(resp) => wrp!(&resp, &te(), keep_alive),
-                    Err(e) => {
-                        wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
-                        return Ok(());
-                    }
+                    Err(e) => wr_err!(e),
                 }
             } else if method == "GET"
                 && (path.starts_with("/v1/models") || path.starts_with("/v1/engines"))
