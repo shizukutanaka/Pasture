@@ -162,6 +162,10 @@ pub struct Proxy {
     /// Appends one JSONL record per request: ts, method, path, status, ms, request_id.
     /// No prompt content, no auth tokens, no PII. None = disabled.
     access_log: Option<String>,
+    /// Optional semantic (embedding-similarity) cache (IMP-12). Queries the local
+    /// backend for an embedding, then scans stored (embedding, response) pairs for
+    /// cosine similarity ≥ threshold. Off by default; never used for sensitive content.
+    semantic_cache: Option<std::sync::Mutex<crate::cache::SemanticCache>>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -195,6 +199,7 @@ impl Proxy {
             local_model_name: String::new(),
             cloud_model_name: String::new(),
             access_log: None,
+            semantic_cache: None,
         }
     }
 
@@ -449,6 +454,19 @@ impl Proxy {
         self
     }
 
+    /// Enable the optional semantic cache (IMP-12). `cap` entries are stored;
+    /// `threshold` is the minimum cosine similarity for a hit (e.g. 0.92).
+    /// The local backend's `/v1/embeddings` endpoint is used — no new deps.
+    /// Disabled (cap = 0) by default so the zero-dependency build is unchanged.
+    pub fn with_semantic_cache(mut self, cap: usize, threshold: f64) -> Self {
+        if cap > 0 {
+            self.semantic_cache = Some(std::sync::Mutex::new(
+                crate::cache::SemanticCache::new(cap, threshold),
+            ));
+        }
+        self
+    }
+
     /// Parse an OpenAI-style chat-completion request body.
     pub fn parse_request(body: &str) -> Result<CompletionRequest, ProxyError> {
         let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
@@ -668,6 +686,32 @@ impl Proxy {
             }
         }
 
+        // Semantic cache (IMP-12): compute embedding once for both lookup and store.
+        // Uses the local backend's /v1/embeddings — privacy-first (embeddings stay on
+        // machine). Silently skipped when local is absent or the call fails (degraded
+        // to exact-match / no cache). Never used for sensitive content (I5).
+        let query_embedding: Option<Vec<f64>> =
+            if !sensitive && self.semantic_cache.is_some() {
+                self.local.as_deref().and_then(|local| {
+                    let text = semantic_embed_text(req);
+                    local
+                        .embeddings(&[text])
+                        .ok()
+                        .and_then(|r| r.vectors.into_iter().next())
+                })
+            } else {
+                None
+            };
+        if let (Some(emb), Some(sem_mutex)) =
+            (query_embedding.as_ref(), self.semantic_cache.as_ref())
+        {
+            if let Ok(mut guard) = sem_mutex.lock() {
+                if let Some(hit) = guard.find_similar(emb) {
+                    return Ok((hit, "semantic_cache", None));
+                }
+            }
+        }
+
         // Pick the completion strategy. Cascade (try local, escalate on low
         // confidence) is never used for sensitive content (privacy) or when
         // either backend is missing.
@@ -684,10 +728,18 @@ impl Proxy {
             self.complete_direct(req, decision.route)?
         };
 
-        // Store on miss.
+        // Store on miss (exact-match).
         if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
             if let Ok(mut guard) = cache.lock() {
                 guard.put(key, resp.clone());
+            }
+        }
+        // Store on miss (semantic).
+        if let (Some(emb), Some(sem_mutex)) =
+            (query_embedding, self.semantic_cache.as_ref())
+        {
+            if let Ok(mut guard) = sem_mutex.lock() {
+                guard.put(emb, resp.clone());
             }
         }
 
@@ -818,9 +870,15 @@ impl Proxy {
         let records = crate::cost::read_log(&self.cost_log_path)
             .map_err(|e| ProxyError::Backend(e.to_string()))?;
         let summary = crate::cost::summarize(&records);
-        // Live hit/miss counters + size/capacity from the in-memory cache.
+        // Live hit/miss counters + size/capacity from the in-memory caches.
         let (live_hits, live_misses, cache_size, cache_cap) = self
             .cache
+            .as_ref()
+            .and_then(|m| m.lock().ok())
+            .map(|g| (g.hits(), g.misses(), g.len(), g.cap()))
+            .unwrap_or((0, 0, 0, 0));
+        let (sem_hits, sem_misses, sem_size, sem_cap) = self
+            .semantic_cache
             .as_ref()
             .and_then(|m| m.lock().ok())
             .map(|g| (g.hits(), g.misses(), g.len(), g.cap()))
@@ -831,6 +889,10 @@ impl Proxy {
             live_misses,
             cache_size,
             cache_cap,
+            sem_hits,
+            sem_misses,
+            sem_size,
+            sem_cap,
         ))
     }
 
@@ -847,12 +909,22 @@ impl Proxy {
             .and_then(|m| m.lock().ok())
             .map(|g| (g.hits(), g.misses(), g.len(), g.cap()))
             .unwrap_or((0, 0, 0, 0));
+        let (sem_hits, sem_misses, sem_size, sem_cap) = self
+            .semantic_cache
+            .as_ref()
+            .and_then(|m| m.lock().ok())
+            .map(|g| (g.hits(), g.misses(), g.len(), g.cap()))
+            .unwrap_or((0, 0, 0, 0));
         Ok(build_metrics_response(
             &s,
             live_hits,
             live_misses,
             cache_size,
             cache_cap,
+            sem_hits,
+            sem_misses,
+            sem_size,
+            sem_cap,
         ))
     }
 
@@ -1510,6 +1582,19 @@ fn inject_context_into(req: &CompletionRequest) -> CompletionRequest {
     prepend_system_prompt(req, &system_context_text())
 }
 
+/// Build the text submitted to the local embeddings backend for the semantic cache
+/// (IMP-12). System messages are skipped — they are usually proxy infrastructure
+/// (date/OS context, safety framing) rather than user intent. The embedding
+/// captures what the user is asking, not how the system was configured.
+fn semantic_embed_text(req: &CompletionRequest) -> String {
+    req.messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Build an OpenAI-compatible error body: `{"error":{"message":..,"type":..}}`
 /// (SPEC §3.5). Both fields are JSON-escaped.
 pub fn build_error_response(message: &str, kind: &str) -> String {
@@ -1565,19 +1650,26 @@ pub fn build_model_response(models: &[String], id: &str) -> Option<String> {
 
 /// Build the `GET /v1/stats` JSON body (IMP-metrics): live counters from the
 /// cost log. All values are PII-free aggregates (I3). Rates are rounded to 4 dp.
+#[allow(clippy::too_many_arguments)]
 pub fn build_stats_response(
     s: &crate::cost::CostSummary,
     cache_hits: u64,
     cache_misses: u64,
     cache_size: usize,
     cache_cap: usize,
+    sem_hits: u64,
+    sem_misses: u64,
+    sem_size: usize,
+    sem_cap: usize,
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
     format!(
         "{{\"object\":\"pasture.stats\",\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
 \"cloud_rate\":{},\"cache_rate\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\
 \"cloud_cost_usd\":{},\"cache_hits\":{cache_hits},\"cache_misses\":{cache_misses},\
-\"cache_size\":{cache_size},\"cache_capacity\":{cache_cap}}}",
+\"cache_size\":{cache_size},\"cache_capacity\":{cache_cap},\
+\"semantic_cache_hits\":{sem_hits},\"semantic_cache_misses\":{sem_misses},\
+\"semantic_cache_size\":{sem_size},\"semantic_cache_capacity\":{sem_cap}}}",
         s.total,
         s.local,
         s.cloud,
@@ -1682,12 +1774,17 @@ pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> St
 /// Uses the standard exposition format (version 0.0.4): `# HELP`, `# TYPE`, then
 /// metric lines. Counter names follow Prometheus naming conventions (total suffix
 /// on counters, no suffix on gauges).
+#[allow(clippy::too_many_arguments)]
 pub fn build_metrics_response(
     s: &crate::cost::CostSummary,
     cache_hits: u64,
     cache_misses: u64,
     cache_size: usize,
     cache_cap: usize,
+    sem_hits: u64,
+    sem_misses: u64,
+    sem_size: usize,
+    sem_cap: usize,
 ) -> String {
     // Prometheus text exposition format v0.0.4.
     // Braces in label selectors are literal Prometheus syntax — not format args.
@@ -1717,7 +1814,19 @@ pasture_cache_misses_total {cache_misses}\n\
 pasture_cache_entries {cache_size}\n\
 # HELP pasture_cache_capacity Maximum entries the cache holds (0=disabled)\n\
 # TYPE pasture_cache_capacity gauge\n\
-pasture_cache_capacity {cache_cap}\n",
+pasture_cache_capacity {cache_cap}\n\
+# HELP pasture_semantic_cache_hits_total Semantic cache hit count since process start\n\
+# TYPE pasture_semantic_cache_hits_total counter\n\
+pasture_semantic_cache_hits_total {sem_hits}\n\
+# HELP pasture_semantic_cache_misses_total Semantic cache miss count since process start\n\
+# TYPE pasture_semantic_cache_misses_total counter\n\
+pasture_semantic_cache_misses_total {sem_misses}\n\
+# HELP pasture_semantic_cache_entries Current number of entries in the semantic cache\n\
+# TYPE pasture_semantic_cache_entries gauge\n\
+pasture_semantic_cache_entries {sem_size}\n\
+# HELP pasture_semantic_cache_capacity Maximum entries the semantic cache holds (0=disabled)\n\
+# TYPE pasture_semantic_cache_capacity gauge\n\
+pasture_semantic_cache_capacity {sem_cap}\n",
         local = s.local,
         cloud = s.cloud,
         cache = s.cache,

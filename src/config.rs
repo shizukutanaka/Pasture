@@ -53,6 +53,15 @@ pub struct Config {
     /// Default 120 s suits most single-GPU setups; raise for large models (70B+)
     /// or lower to fail fast and trigger the cascade sooner.
     pub local_timeout_secs: u64,
+    /// Maximum entries in the optional semantic (embedding-similarity) cache (IMP-12).
+    /// 0 = disabled (the default). When non-zero, the local backend's `/v1/embeddings`
+    /// endpoint is called to compute query embeddings and cosine similarity is used
+    /// to find near-duplicate requests without an exact-match hit.
+    pub semantic_cache_size: usize,
+    /// Cosine similarity threshold for semantic cache hits (IMP-12). Values in [0, 1];
+    /// default 0.92. A hit is returned when similarity ≥ threshold. Ignored when
+    /// `semantic_cache_size` is 0.
+    pub semantic_cache_threshold: f64,
 }
 
 impl Default for Config {
@@ -88,6 +97,8 @@ impl Default for Config {
             access_log: String::new(),
             cache_ttl_secs: 0,
             local_timeout_secs: 120,
+            semantic_cache_size: 0,
+            semantic_cache_threshold: 0.92,
         }
     }
 }
@@ -244,6 +255,16 @@ impl Config {
                 self.local_timeout_secs = n;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_SEMANTIC_CACHE") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.semantic_cache_size = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_SEMANTIC_THRESHOLD") {
+            if let Ok(f) = v.parse::<f64>() {
+                self.semantic_cache_threshold = f;
+            }
+        }
         self
     }
 
@@ -323,6 +344,16 @@ impl Config {
             "local_timeout" => {
                 if let Ok(n) = val.parse::<u64>() {
                     self.local_timeout_secs = n;
+                }
+            }
+            "semantic_cache_size" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    self.semantic_cache_size = n;
+                }
+            }
+            "semantic_cache_threshold" => {
+                if let Ok(f) = val.parse::<f64>() {
+                    self.semantic_cache_threshold = f;
                 }
             }
             _ => {}

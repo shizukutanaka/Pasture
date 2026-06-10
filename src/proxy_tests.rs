@@ -674,7 +674,7 @@ fn test_build_stats_response_shape() {
         completion_tokens: 50,
         cloud_cost_usd: 0.0123,
     };
-    let json = build_stats_response(&s, 7, 3, 5, 128);
+    let json = build_stats_response(&s, 7, 3, 5, 128, 0, 0, 0, 0);
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
     assert_eq!(v.get("cloud").and_then(|x| x.as_f64()), Some(1.0));
@@ -1144,7 +1144,7 @@ fn test_metrics_response_shape() {
         completion_tokens: 100,
         cloud_cost_usd: 0.005,
     };
-    let body = build_metrics_response(&s, 3, 8, 5, 50);
+    let body = build_metrics_response(&s, 3, 8, 5, 50, 0, 0, 0, 0);
     assert!(
         body.contains("pasture_requests_total{route=\"local\"} 7"),
         "{body}"

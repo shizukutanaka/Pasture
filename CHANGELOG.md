@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Optional semantic cache via local `/v1/embeddings` (IMP-12)
+
+- Set `PASTURE_SEMANTIC_CACHE=N` to hold up to N embedding–response pairs. On each non-sensitive
+  request, the local backend's `/v1/embeddings` endpoint is queried once; cosine similarity is
+  computed against stored entries; a response is returned on the first hit with similarity ≥
+  `PASTURE_SEMANTIC_THRESHOLD` (default 0.92). On a real completion, the entry is stored for
+  future near-duplicate queries. Silently skipped if the local backend is unavailable or the
+  embeddings call fails. Off by default (0); sensitive content never cached (I5); embeddings stay
+  on-machine (I3). `/v1/stats` and `/metrics` expose `semantic_cache_hits/misses/size/capacity`
+  counters. No new dependencies. Grounded in GPTCache, arXiv:2603.03301/2402.01173/2411.05276,
+  and the IMP-8 `/v1/embeddings` infra already in place. 10 new tests; 464 total. (ADR-123)
+
 ### Fixed — Truncated chunked cloud responses now error instead of silently losing data (IMP-dechunk-truncation-error)
 
 - `dechunk()` accepted a chunked body whose declared chunk size exceeded the available bytes and

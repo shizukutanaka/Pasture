@@ -280,6 +280,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   doctor printed "Ollama is running (no models downloaded)" when Ollama was not
   running. The function now parses the first response line and returns `None` on any
   non-200 status. A mock-TCP-server test verifies the new behavior. Std-only; 1 test.
+- **ADR-123 Optional semantic (embedding-similarity) cache via local `/v1/embeddings` (IMP-12).**
+  Adds `cosine_similarity()` (std-only dot-product) and `SemanticCache` (bounded FIFO of
+  `(Vec<f64>, CompletionResponse)` pairs; `find_similar()` linear-scans for best cosine ≥ threshold;
+  FIFO eviction; hit/miss counters) to `cache.rs`. Config: `PASTURE_SEMANTIC_CACHE` / `semantic_cache_size`
+  (default 0 = disabled) and `PASTURE_SEMANTIC_THRESHOLD` / `semantic_cache_threshold` (default 0.92).
+  `run_completion()` computes embedding once via the local backend's `/v1/embeddings`, checks the
+  semantic cache before dispatching, stores on real-completion miss. `semantic_embed_text()` skips
+  system messages — captures user intent, not proxy infrastructure. `/v1/stats` and `/metrics` expose
+  `semantic_cache_*` counters. Off by default; sensitive content excluded (I5); embeddings stay on
+  machine (I3/privacy-first); no new dependencies. Grounded: GPTCache, arXiv:2603.03301/2402.01173/
+  2411.05276; reuses IMP-8 embeddings infra. 10 new tests (464 total); clippy clean.
 - **ADR-122 Reuse `chat_request` helper; struct-update for clone-modify sites (IMP-refactor-chat-request-reuse).**
   The cli non-cascade cloud/local paths reimplemented the body of the existing `chat_request`
   helper inline (already used by the cascade path). The cloud path now calls it directly; the

@@ -13,6 +13,112 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+// ── Semantic cache (IMP-12) ──────────────────────────────────────────────────
+
+/// Cosine similarity between two equal-length vectors.
+/// Returns 0.0 when either vector has zero magnitude or lengths differ.
+pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let mag_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let mag_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if mag_a == 0.0 || mag_b == 0.0 {
+        0.0
+    } else {
+        dot / (mag_a * mag_b)
+    }
+}
+
+/// Bounded FIFO semantic cache keyed on embedding vectors (IMP-12).
+///
+/// `find_similar` performs a linear scan over all stored vectors and returns
+/// the response paired with the vector whose cosine similarity to the query
+/// meets or exceeds `threshold`. On a tie the most-similar entry wins.
+/// Sensitive prompts are never stored — the caller enforces that invariant.
+pub struct SemanticCache {
+    entries: VecDeque<(Vec<f64>, CompletionResponse)>,
+    cap: usize,
+    /// Minimum cosine similarity for a hit (e.g. 0.92).
+    threshold: f64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl SemanticCache {
+    pub fn new(cap: usize, threshold: f64) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            cap,
+            threshold,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    /// Find the best-matching cached response (cosine ≥ threshold).
+    /// Returns a clone of the response. Updates hit/miss counters.
+    pub fn find_similar(&mut self, query: &[f64]) -> Option<CompletionResponse> {
+        let mut best_score = self.threshold - f64::EPSILON;
+        let mut best: Option<&CompletionResponse> = None;
+        for (emb, resp) in &self.entries {
+            let score = cosine_similarity(query, emb);
+            if score > best_score {
+                best_score = score;
+                best = Some(resp);
+            }
+        }
+        match best {
+            Some(resp) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(resp.clone())
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Store an embedding → response pair, evicting the oldest when over capacity.
+    pub fn put(&mut self, embedding: Vec<f64>, resp: CompletionResponse) {
+        if self.cap == 0 {
+            return;
+        }
+        self.entries.push_back((embedding, resp));
+        while self.entries.len() > self.cap {
+            self.entries.pop_front();
+        }
+    }
+}
+
+// ── Exact-match cache ────────────────────────────────────────────────────────
+
 /// Stable key for a request: model + ordered (role, content) of each message +
 /// the sampling parameters. Sampling is part of the key so that, e.g., a
 /// `temperature:0` response is never served to a `temperature:1` request.
@@ -351,5 +457,97 @@ mod tests {
         c.put(7, resp("g")); // evicts key 3
         assert!(c.get(3).is_none(), "FIFO eviction must still work after TTL-expiry cleanup");
         assert!(c.get(7).is_some());
+    }
+
+    // ── SemanticCache tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_cosine_similarity_identical() {
+        let v = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert!((cosine_similarity(&a, &b)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_cosine_similarity_opposite() {
+        let a = vec![1.0, 0.0];
+        let b = vec![-1.0, 0.0];
+        assert!((cosine_similarity(&a, &b) + 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_cosine_similarity_length_mismatch_returns_zero() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_zero_vector_returns_zero() {
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn test_semantic_cache_hit_above_threshold() {
+        let mut c = SemanticCache::new(4, 0.9);
+        let v = vec![1.0_f64, 0.0, 0.0];
+        c.put(v.clone(), resp("answer"));
+        // Identical query → cosine = 1.0 ≥ 0.9
+        let hit = c.find_similar(&v);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().content, "answer");
+        assert_eq!(c.hits(), 1);
+        assert_eq!(c.misses(), 0);
+    }
+
+    #[test]
+    fn test_semantic_cache_miss_below_threshold() {
+        let mut c = SemanticCache::new(4, 0.95);
+        c.put(vec![1.0, 0.0], resp("a"));
+        // Orthogonal vector → cosine = 0 < 0.95
+        let hit = c.find_similar(&[0.0, 1.0]);
+        assert!(hit.is_none());
+        assert_eq!(c.misses(), 1);
+    }
+
+    #[test]
+    fn test_semantic_cache_picks_best_match() {
+        let mut c = SemanticCache::new(4, 0.8);
+        // Store two vectors at different angles from [1,0]
+        let v_close = vec![0.99f64, 0.14142f64]; // cos ~ 0.99
+        let v_far = vec![0.70711f64, 0.70711f64]; // cos ~ 0.707
+        c.put(v_far.clone(), resp("far"));
+        c.put(v_close.clone(), resp("close"));
+        let hit = c.find_similar(&[1.0, 0.0]);
+        // Should return the closest match ("close")
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().content, "close");
+    }
+
+    #[test]
+    fn test_semantic_cache_fifo_eviction() {
+        let mut c = SemanticCache::new(2, 0.9);
+        let v = vec![1.0f64, 0.0];
+        c.put(vec![1.0, 0.0], resp("first"));
+        c.put(vec![0.0, 1.0], resp("second"));
+        c.put(vec![0.5, 0.5], resp("third")); // evicts "first"
+        assert_eq!(c.len(), 2);
+        // "first" entry ([1,0]) was evicted; an identical query returns one of the remaining
+        let hit = c.find_similar(&v);
+        // After eviction, [1,0] is gone; [0,1] and [0.5,0.5] remain.
+        // cos([1,0],[0,1])=0, cos([1,0],[0.5,0.5])≈0.707 — both below threshold 0.9
+        assert!(hit.is_none(), "evicted entry must not be found");
+    }
+
+    #[test]
+    fn test_semantic_cache_cap_zero_stores_nothing() {
+        let mut c = SemanticCache::new(0, 0.9);
+        c.put(vec![1.0, 0.0], resp("x"));
+        assert!(c.is_empty());
+        assert!(c.find_similar(&[1.0, 0.0]).is_none());
     }
 }
