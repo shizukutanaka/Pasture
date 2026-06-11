@@ -913,7 +913,12 @@ impl Proxy {
         if planned_route == Route::Cloud
             && (self.budget_daily_tokens > 0 || self.spike_factor > 0)
         {
-            let estimated = crate::routing::estimate_tokens(&req.routing_text()) as u64;
+            // IMP-24: estimate input + predicted output tokens. Cloud cost is
+            // driven mostly by output, so counting input alone under-estimates
+            // the spend a request will incur against the budget.
+            let estimated =
+                crate::routing::estimate_total_tokens(&req.routing_text(), req.sampling.max_tokens)
+                    as u64;
             if let Some(reason) = self.check_budget_and_spike(estimated) {
                 match self.budget_action.as_str() {
                     "block" => {
@@ -986,9 +991,7 @@ impl Proxy {
         }
 
         // Finish and emit the OTel span (IMP-23).
-        if let (Some(ref mut span), Some(ref log_path)) =
-            (otel_span.as_mut(), self.otel_log.as_deref())
-        {
+        if let (Some(span), Some(log_path)) = (otel_span.as_mut(), self.otel_log.as_deref()) {
             span.response_model = resp.model.clone();
             span.input_tokens = resp.prompt_tokens;
             span.output_tokens = resp.completion_tokens;

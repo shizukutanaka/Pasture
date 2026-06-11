@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Changed — Output-length prediction sharpens budget/spike cost estimation (IMP-24)
+
+- The budget/spike guard (`PASTURE_BUDGET_DAILY_TOKENS` / `PASTURE_SPIKE_FACTOR`) now estimates
+  **input + predicted output** tokens instead of input alone. Cloud cost is driven mostly by
+  output (priced 3–5× input), so the previous input-only estimate under-counted spend.
+  `routing::estimate_output_tokens` predicts completion length from task type (code 3.0×,
+  reason 4.0×, math 2.0×, translate 1.1×, summarize 0.3×, generic 1.5×), clamped to the client's
+  `max_tokens` and a 4096 ceiling. Std-only heuristic — the proxy-model form (SSJF arXiv:2404.08509)
+  remains deferred to avoid a dependency. 6 new tests. (ADR-135)
+
 ### Added — PII pseudonymization, OTel trace log, Anthropic cache hints, supply-chain CI (IMP-18, IMP-19, IMP-23, IMP-27)
 
 - **IMP-19 Reversible PII pseudonymization** (`PASTURE_PSEUDONYMIZE=1`): cloud-bound messages

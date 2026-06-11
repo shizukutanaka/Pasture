@@ -1054,3 +1054,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   (cargo-deny check) on every push and pull request. The supply-chain gate mirrors the
   IMP-10/IMP-27 "zero new dependency by default" invariant: if a PR adds a crate, CI forces
   a licence + advisory review before merge.
+- **ADR-135 Heuristic output-length prediction for cost estimation (IMP-24).**
+  Cloud pricing is driven mostly by *output* tokens (typically 3–5× the input rate), but the
+  budget/spike guard (ADR-129) previously estimated only *input* tokens, systematically
+  under-counting a request's true spend. `routing::estimate_output_tokens(text, input_tokens,
+  max_tokens)` predicts completion length from a per-task-type output/input ratio
+  (code 3.0×, reason 4.0×, math 2.0×, translate 1.1×, summarize 0.3×, generic 1.5×), with a
+  ×1.5 bump for multi-question prompts, a 16-token floor, a 4096-token default ceiling, and a
+  hard clamp to the client's `max_tokens` when supplied. `estimate_total_tokens` sums input +
+  predicted output; the budget/spike check in `run_completion` now compares against this total.
+  The proxy-model predictor from SSJF (arXiv:2404.08509) remains **deferred** — it would add a
+  dependency — so this is the std-only heuristic alternative noted in RESEARCH.md IMP-24. The
+  multipliers lean high deliberately: for a budget guard, over-estimating output keeps the user
+  safely under-cap, whereas under-estimating risks a surprise overage. Deterministic, label-free,
+  zero new dependencies; 6 unit tests.

@@ -94,6 +94,64 @@ pub fn estimate_tokens(text: &str) -> usize {
     dense + digits.div_ceil(2) + latin.div_ceil(4)
 }
 
+/// Predict the number of completion (output) tokens a request will generate
+/// (IMP-24, heuristic form). Cloud pricing is driven mostly by output tokens
+/// (typically 3–5× the input rate), so a budget/spike guard that counts only
+/// input tokens systematically under-estimates a request's true cost. This is a
+/// std-only, zero-dependency, deterministic heuristic — not the proxy-model
+/// predictor from SSJF (arXiv:2404.08509), which was deferred to avoid a
+/// dependency. The signal: output length correlates with task type and with
+/// input length.
+///
+/// `input_tokens` is the estimated prompt size (from `estimate_tokens`).
+/// `max_tokens` is the client-supplied hard cap, if any — the model can never
+/// exceed it, so the prediction is clamped to it.
+///
+/// Multipliers are deliberately conservative (lean high): for a budget guard,
+/// over-estimating output keeps the user safely under their cap, whereas
+/// under-estimating risks a surprise overage.
+pub fn estimate_output_tokens(text: &str, input_tokens: usize, max_tokens: Option<u64>) -> usize {
+    // Per-task output/input ratio (×100 to stay in integer arithmetic).
+    // Grounded in the task-shape intuition: code/reasoning expand, summaries
+    // compress, translation is roughly length-preserving.
+    let ratio_x100 = match detect_skill(text) {
+        Some("code") => 300,      // code generation expands well past the prompt
+        Some("reason") => 400,    // chain-of-thought answers are verbose
+        Some("math") => 200,      // worked solutions are moderately long
+        Some("translate") => 110, // output ≈ input length
+        Some("summarize") => 30,  // compression: output is a fraction of input
+        _ => 150,                 // generic chat answer: moderate expansion
+    };
+    let mut predicted = input_tokens.saturating_mul(ratio_x100) / 100;
+
+    // Multi-question prompts produce one answer block per question.
+    if question_count(text) >= 3 {
+        predicted = predicted.saturating_mul(3) / 2;
+    }
+
+    // Floor: even a one-word prompt yields a sentence or two of output.
+    predicted = predicted.max(16);
+
+    // Ceiling: without a client cap, models still stop well before infinity.
+    // 4096 is a common provider default for chat completions.
+    const DEFAULT_OUTPUT_CEIL: usize = 4096;
+    predicted = predicted.min(DEFAULT_OUTPUT_CEIL);
+
+    // A client-supplied max_tokens is a hard upper bound the model cannot exceed.
+    if let Some(cap) = max_tokens {
+        predicted = predicted.min(cap as usize);
+    }
+    predicted
+}
+
+/// Total estimated tokens (input + predicted output) for cost/budget estimation
+/// (IMP-24). This is what a budget or spike guard should compare against, since
+/// cloud cost is charged on both halves.
+pub fn estimate_total_tokens(text: &str, max_tokens: Option<u64>) -> usize {
+    let input = estimate_tokens(text);
+    input + estimate_output_tokens(text, input, max_tokens)
+}
+
 /// True for characters that tokenize at roughly one token each (CJK, kana,
 /// Hangul, fullwidth/halfwidth forms, emoji, Thai, Devanagari).
 /// Emoji (U+1F000–U+1FAFF) average 1-3 tokens per character in common
@@ -588,6 +646,72 @@ mod tests {
         // Mixed: 4 Latin chars (ceil(4/4)=1) + 6 Thai codepoints (สวัสดี
         // has 6 Unicode codepoints including combining vowel marks) = 7.
         assert_eq!(estimate_tokens("hi! สวัสดี"), 1 + 6);
+    }
+
+    #[test]
+    fn test_estimate_output_tokens_floor() {
+        // IMP-24: even a one-word prompt yields at least the floor of output.
+        let out = estimate_output_tokens("hi", estimate_tokens("hi"), None);
+        assert_eq!(out, 16, "short prompt should hit the 16-token floor");
+    }
+
+    #[test]
+    fn test_estimate_output_tokens_summarize_compresses() {
+        // A summarize task should predict fewer output than input tokens.
+        let text = "Please summarize the following article in one sentence: \
+                    the quick brown fox jumps over the lazy dog repeatedly all \
+                    afternoon while the farmer watches from his porch and sips tea";
+        let input = estimate_tokens(text);
+        let out = estimate_output_tokens(text, input, None);
+        assert!(out < input, "summary output ({out}) must be smaller than input ({input})");
+    }
+
+    #[test]
+    fn test_estimate_output_tokens_code_expands() {
+        // A code task should predict more output than a generic chat answer.
+        let code_text = "write a function:\n```\nfn f(){}\n```";
+        let plain_text = "tell me about your day in a few words please thanks";
+        let code_in = estimate_tokens(code_text);
+        let plain_in = estimate_tokens(plain_text);
+        let code_out = estimate_output_tokens(code_text, code_in, None);
+        let plain_out = estimate_output_tokens(plain_text, plain_in, None);
+        // Normalise by input: code's output/input ratio must exceed plain chat's.
+        assert!(
+            code_out * plain_in > plain_out * code_in,
+            "code ratio ({code_out}/{code_in}) should exceed plain ratio ({plain_out}/{plain_in})"
+        );
+    }
+
+    #[test]
+    fn test_estimate_output_tokens_respects_max_tokens_cap() {
+        // A client max_tokens is a hard upper bound the prediction cannot exceed.
+        let text = "write a very long detailed essay ".repeat(50);
+        let input = estimate_tokens(&text);
+        let capped = estimate_output_tokens(&text, input, Some(32));
+        assert!(capped <= 32, "prediction ({capped}) must respect max_tokens=32");
+    }
+
+    #[test]
+    fn test_estimate_output_tokens_default_ceiling() {
+        // Without a client cap, a huge prompt is still bounded by the ceiling.
+        let text = "write a function:\n```\nfn f(){}\n```\n".repeat(2000);
+        let input = estimate_tokens(&text);
+        let out = estimate_output_tokens(&text, input, None);
+        assert!(out <= 4096, "uncapped prediction ({out}) must respect the 4096 ceiling");
+    }
+
+    #[test]
+    fn test_estimate_total_tokens_includes_output() {
+        // Total must exceed input-only estimate (output is always >= the floor).
+        let text = "explain quantum entanglement to a curious beginner";
+        let input = estimate_tokens(text);
+        let total = estimate_total_tokens(text, None);
+        assert!(total > input, "total ({total}) must exceed input-only ({input})");
+        assert_eq!(
+            total,
+            input + estimate_output_tokens(text, input, None),
+            "total must equal input + predicted output"
+        );
     }
 
     #[test]

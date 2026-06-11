@@ -238,7 +238,7 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 | **IMP-21** | Latency DoS hardening (body size/connection time/output length limits) | ✅ **SHIPPED (ADR-130 — `PASTURE_MAX_BODY_BYTES` configurable)** |
 | **IMP-22** | Fertility-based token estimation (whitespace=0, digits=0.5 tok/char) | ✅ **SHIPPED (ADR-126)** |
 | **IMP-23** | OpenTelemetry GenAI–compliant optional metrics/trace export | ✅ **SHIPPED (ADR-133 — `PASTURE_OTEL_LOG`)** |
-| **IMP-24** | Output-length prediction for cost estimation (deferred) | Deferred |
+| **IMP-24** | Output-length prediction for cost estimation | ✅ **SHIPPED (ADR-135 — std-only heuristic; proxy-model form remains deferred)** |
 | **IMP-25** | Skill-profile routing: task-type → route override table | ✅ **SHIPPED (ADR-127)** |
 | **IMP-26** | Budget-aware dynamic threshold (cost velocity + daily cap) | ✅ **SHIPPED (ADR-129 — `PASTURE_BUDGET_DAILY_TOKENS`)** |
 | **IMP-27** | Supply-chain hardening: cargo-deny/SBOM/cosign in CI | ✅ **SHIPPED (ADR-134 — `deny.toml` + `.github/workflows/ci.yml`)** |
