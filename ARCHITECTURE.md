@@ -1049,10 +1049,11 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   `deny.toml` (cargo-deny configuration) enumerates the permitted SPDX licence set
   (MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, ISC, OpenSSL, BSD-2-Clause, BSD-3-Clause)
   and denies unlicensed, copyleft, unknown-registry, unknown-git, and yanked crates. Any new
-  dependency outside the allowed set fails CI. `.github/workflows/ci.yml` runs `build-and-test`
-  (cargo build --release, cargo test, clippy -D warnings, fmt --check) and `supply-chain`
-  (cargo-deny check) on every push and pull request. The supply-chain gate mirrors the
-  IMP-10/IMP-27 "zero new dependency by default" invariant: if a PR adds a crate, CI forces
+  dependency outside the allowed set fails CI. The workflow (`ci/ci.yml`; see `ci/README.md` for
+  why it is staged outside `.github/workflows/` and how to activate it) runs `build-and-test`
+  (cargo build --release, cargo test, clippy -D warnings, fmt --check informational) and
+  `supply-chain` (cargo-deny check) on every push and pull request. The supply-chain gate mirrors
+  the IMP-10/IMP-27 "zero new dependency by default" invariant: if a PR adds a crate, CI forces
   a licence + advisory review before merge.
 - **ADR-135 Heuristic output-length prediction for cost estimation (IMP-24).**
   Cloud pricing is driven mostly by *output* tokens (typically 3–5× the input rate), but the
