@@ -2895,3 +2895,51 @@ fn test_streaming_no_otel_span_when_disabled() {
     assert_eq!(status, 200);
     let _ = std::fs::remove_file(&cost_log);
 }
+
+// ── IMP-23 gen_ai.system correctness (Socratic-dialogue fix) ───────────────
+#[test]
+fn test_otel_system_reflects_cloud_provider() {
+    // A cloud-routed span must report the configured provider as gen_ai.system,
+    // not the placeholder "cloud".
+    let cost_log = tmp_log();
+    let otel = tmp_log();
+    let p = proxy_with(true, true, 5, &cost_log) // low threshold + long text → cloud
+        .with_otel_log(Some(otel.clone()))
+        .with_cloud_system("anthropic");
+    let long = "word ".repeat(20);
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let _ = p.handle_chat(&body).unwrap();
+    let content = std::fs::read_to_string(&otel).unwrap_or_default();
+    assert!(
+        content.contains("\"gen_ai.system\":\"anthropic\""),
+        "cloud span must report the provider: {content}"
+    );
+    assert!(content.contains("\"pasture.route\":\"cloud\""), "{content}");
+    let _ = std::fs::remove_file(&cost_log);
+    let _ = std::fs::remove_file(&otel);
+}
+
+#[test]
+fn test_otel_system_local_not_mislabeled_as_cloud() {
+    // Regression: a local-routed request must NOT report gen_ai.system="cloud"
+    // (nor the cloud provider) merely because a cloud backend is configured.
+    let cost_log = tmp_log();
+    let otel = tmp_log();
+    let p = proxy_with(true, true, 100, &cost_log) // high threshold → local
+        .with_otel_log(Some(otel.clone()))
+        .with_cloud_system("openai");
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let _ = p.handle_chat(body).unwrap();
+    let content = std::fs::read_to_string(&otel).unwrap_or_default();
+    assert!(content.contains("\"pasture.route\":\"local\""), "{content}");
+    assert!(
+        !content.contains("\"gen_ai.system\":\"cloud\""),
+        "local route must not be labeled cloud: {content}"
+    );
+    assert!(
+        !content.contains("\"gen_ai.system\":\"openai\""),
+        "local route must not report the cloud provider: {content}"
+    );
+    let _ = std::fs::remove_file(&cost_log);
+    let _ = std::fs::remove_file(&otel);
+}

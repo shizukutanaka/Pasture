@@ -1128,3 +1128,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   fingerprint) that warrants its own design, and the gap is a missed optimization, not a
   correctness/cost/observability defect. Zero new dependencies; 2 tests (span written on a
   stream; no file when disabled).
+
+- **ADR-140 Correct `gen_ai.system` in OTel spans (IMP-23 fix).**
+  Having wired spans onto both paths, the Socratic review turned to *what they actually write*.
+  `gen_ai.system` — an OTel GenAI attribute meant to identify the provider (`openai`,
+  `anthropic`, `ollama`, …) — was emitting the placeholder `"cloud"`/`"local"`, and worse, it
+  was computed at span *creation* from whether a cloud backend was merely *configured*. So a
+  request that actually routed **local** while a cloud backend existed was mislabeled
+  `gen_ai.system="cloud"`; only `pasture.route` reflected the truth. The value is now derived
+  from the *actual route* at emit time (when the route is known): cloud routes report the
+  configured provider via the new `Proxy::with_cloud_system` (wired from `PASTURE_CLOUD_PROVIDER`
+  in `run_serve`), local routes report the local backend's own `name()` (`ollama`/`local`). The
+  creation-time guess was removed (`Span::start("", model)`; system filled on completion). A
+  fallback-provider completion still reports the primary provider name (minor, documented). Zero
+  new dependencies; 2 tests (cloud span reports the provider; a local route is never labeled
+  `cloud` or the cloud provider).

@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Correct `gen_ai.system` in OTel spans (IMP-23, ADR-140)
+
+- The OTel `gen_ai.system` attribute emitted `"cloud"`/`"local"` (not valid provider values)
+  and was computed from whether a cloud backend was *configured* — so a request that actually
+  routed local was mislabeled `"cloud"`. It is now derived from the real route at emit time:
+  cloud spans report the configured provider (`PASTURE_CLOUD_PROVIDER`, e.g. `openai`/`anthropic`)
+  via the new `Proxy::with_cloud_system`; local spans report the local backend's name. 2 new
+  tests. (ADR-140)
+
 ### Fixed — OTel trace log now covers streaming (IMP-23, ADR-139)
 
 - The OpenTelemetry GenAI span (`PASTURE_OTEL_LOG`) was written only for buffered completions;

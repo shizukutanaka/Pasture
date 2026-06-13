@@ -1405,6 +1405,7 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         } else {
             Some(config.otel_log.clone())
         })
+        .with_cloud_system(&config.cloud_provider)
         .with_cloud_fallback(make_fallback_cloud_backend(config));
     print!(
         "{}",

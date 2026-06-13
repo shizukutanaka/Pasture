@@ -211,6 +211,10 @@ pub struct Proxy {
     pseudonymize: bool,
     /// Optional OTel-compatible GenAI trace log path (IMP-23). Empty = disabled.
     otel_log: Option<String>,
+    /// OTel `gen_ai.system` value for cloud-routed spans (IMP-23): the configured
+    /// cloud provider name (e.g. `"openai"`, `"anthropic"`). Empty falls back to
+    /// `"cloud"`. Used only when `otel_log` is set.
+    cloud_system: String,
     /// Optional secondary cloud backend tried when the primary cloud fails all
     /// retries (IMP-9 multi-provider follow-up). When set, a primary cloud failure
     /// attempts this backend before falling back to local. None = disabled.
@@ -255,6 +259,7 @@ impl Proxy {
             injection_guard: "off".to_string(),
             pseudonymize: false,
             otel_log: None,
+            cloud_system: String::new(),
             today_cloud_tokens: AtomicU64::new(0),
             cloud_request_count: AtomicU64::new(0),
             cloud_token_sum: AtomicU64::new(0),
@@ -314,6 +319,36 @@ impl Proxy {
     pub fn with_otel_log(mut self, path: Option<String>) -> Self {
         self.otel_log = path.filter(|p| !p.is_empty());
         self
+    }
+
+    /// Set the `gen_ai.system` value emitted for cloud-routed OTel spans (IMP-23):
+    /// the cloud provider name (e.g. `"openai"`, `"anthropic"`). Empty leaves the
+    /// generic `"cloud"` fallback.
+    pub fn with_cloud_system(mut self, system: &str) -> Self {
+        self.cloud_system = system.trim().to_string();
+        self
+    }
+
+    /// OTel `gen_ai.system` for an actually-taken route (IMP-23). Reflects the
+    /// backend that served the request — cloud routes report the configured
+    /// provider (`openai`/`anthropic`), local routes report the local backend's
+    /// own name (`ollama`/`local`). This is set after completion because the
+    /// route is not known when the span is started.
+    fn otel_system_for(&self, route: Route) -> String {
+        match route {
+            Route::Cloud => {
+                if self.cloud_system.is_empty() {
+                    "cloud".to_string()
+                } else {
+                    self.cloud_system.clone()
+                }
+            }
+            Route::Local => self
+                .local
+                .as_deref()
+                .map(|b| b.name().to_string())
+                .unwrap_or_else(|| "local".to_string()),
+        }
     }
 
     /// Set a secondary cloud backend for multi-provider fallback (IMP-9 follow-up).
@@ -980,16 +1015,12 @@ impl Proxy {
             req
         };
 
-        // OTel span (IMP-23): start before the completion call.
-        let mut otel_span = self.otel_log.as_deref().map(|_| {
-            let system = match self.cloud.as_deref().map(|b| b.name()) {
-                Some("cloud") => "cloud",
-                _ => "local",
-            };
-            let mut s = crate::telemetry::Span::start(system, &req.model);
-            s.route = "local"; // default; overwritten after completion
-            s
-        });
+        // OTel span (IMP-23): start before the completion call. system/route are
+        // set after completion, once the actual backend is known.
+        let mut otel_span = self
+            .otel_log
+            .as_deref()
+            .map(|_| crate::telemetry::Span::start("", &req.model));
 
         // Pick the completion strategy. Cascade (try local, escalate on low
         // confidence) is never used for sensitive content (privacy) or when
@@ -1014,8 +1045,10 @@ impl Proxy {
             }
         }
 
-        // Finish and emit the OTel span (IMP-23).
+        // Finish and emit the OTel span (IMP-23). gen_ai.system reflects the
+        // backend that actually served the request, now that the route is known.
         if let (Some(span), Some(log_path)) = (otel_span.as_mut(), self.otel_log.as_deref()) {
+            span.system = self.otel_system_for(route);
             span.response_model = resp.model.clone();
             span.input_tokens = resp.prompt_tokens;
             span.output_tokens = resp.completion_tokens;
@@ -1809,14 +1842,11 @@ impl Proxy {
         let fp = fingerprint_for_model(&model);
         // OTel span (IMP-23): the streaming path emits a span too, so PASTURE_OTEL_LOG
         // does not silently drop streaming traffic. Started before the backend call;
-        // filled and appended on success below.
-        let mut otel_span = self.otel_log.as_deref().map(|_| {
-            let system = match self.cloud.as_deref().map(|b| b.name()) {
-                Some("cloud") => "cloud",
-                _ => "local",
-            };
-            crate::telemetry::Span::start(system, &model)
-        });
+        // system/route/usage are filled and appended on success below.
+        let mut otel_span = self
+            .otel_log
+            .as_deref()
+            .map(|_| crate::telemetry::Span::start("", &model));
         let mut io_err: Option<std::io::Error> = None;
         let resp = backend.stream_complete(req, &mut |delta| {
             if io_err.is_some() {
@@ -1862,6 +1892,7 @@ impl Proxy {
                 if let (Some(span), Some(log_path)) =
                     (otel_span.as_mut(), self.otel_log.as_deref())
                 {
+                    span.system = self.otel_system_for(route);
                     span.response_model = r.model.clone();
                     span.input_tokens = r.prompt_tokens;
                     span.output_tokens = r.completion_tokens;
