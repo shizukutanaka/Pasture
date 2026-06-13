@@ -192,6 +192,11 @@ pub struct Proxy {
     /// cloud prompt+completion tokens today (UTC day), initialized from the cost
     /// log at startup and incremented atomically on each cloud completion.
     today_cloud_tokens: AtomicU64,
+    /// UTC day number (days since epoch) the `today_cloud_tokens` counter belongs
+    /// to (IMP-26). When the current day moves past this, the counter is lazily
+    /// reset to 0 so the budget is truly *daily* for a long-running process — not
+    /// cumulative-since-startup. Checked on each budget access; no timer thread.
+    budget_day: AtomicU64,
     /// Cloud request count and token sum for spike detection (IMP-26).
     cloud_request_count: AtomicU64,
     cloud_token_sum: AtomicU64,
@@ -261,6 +266,7 @@ impl Proxy {
             otel_log: None,
             cloud_system: String::new(),
             today_cloud_tokens: AtomicU64::new(0),
+            budget_day: AtomicU64::new(unix_now() / 86_400),
             cloud_request_count: AtomicU64::new(0),
             cloud_token_sum: AtomicU64::new(0),
             budget_daily_tokens: 0,
@@ -294,6 +300,8 @@ impl Proxy {
         if daily_tokens > 0 {
             let used = crate::cost::today_cloud_tokens(cost_log_path);
             self.today_cloud_tokens = AtomicU64::new(used);
+            // The seeded count is today's usage; anchor the rollover day to match.
+            self.budget_day = AtomicU64::new(unix_now() / 86_400);
         }
         self
     }
@@ -796,10 +804,29 @@ impl Proxy {
         .ok_or_else(|| ProxyError::Routing(format!("no backend for route {}", route.as_str())))
     }
 
+    /// Reset the daily token counter when the UTC day has advanced past the day
+    /// it was last anchored to (IMP-26). Lazy — invoked on each budget access, so
+    /// a long-running process gets a *daily* budget without a timer thread. The
+    /// thread that wins the day swap performs the reset; concurrent callers see
+    /// the new day and skip it.
+    fn roll_budget_day_if_needed(&self) {
+        let today = unix_now() / 86_400;
+        let stored = self.budget_day.load(Ordering::Relaxed);
+        if stored != today
+            && self
+                .budget_day
+                .compare_exchange(stored, today, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.today_cloud_tokens.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Budget + spike check (IMP-26). Returns `Some(reason)` when the cloud route
     /// should be overridden or blocked; `None` when the request may proceed normally.
     /// Called only when the routing engine has decided Cloud.
     fn check_budget_and_spike(&self, estimated_tokens: u64) -> Option<&'static str> {
+        self.roll_budget_day_if_needed();
         // Spike: single request far above the running average → route local instead.
         if self.spike_factor > 0 && estimated_tokens > 0 {
             let count = self.cloud_request_count.load(Ordering::Relaxed);
@@ -872,6 +899,9 @@ impl Proxy {
         }
         // Update IMP-26 budget / spike counters for cloud completions.
         if route_label == "cloud" {
+            // Reset the daily counter first if the UTC day rolled over, so this
+            // completion accrues to the new day rather than a stale total.
+            self.roll_budget_day_if_needed();
             let tokens = resp.prompt_tokens + resp.completion_tokens;
             self.today_cloud_tokens.fetch_add(tokens, Ordering::Relaxed);
             self.cloud_token_sum.fetch_add(tokens, Ordering::Relaxed);

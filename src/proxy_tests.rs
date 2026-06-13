@@ -2943,3 +2943,46 @@ fn test_otel_system_local_not_mislabeled_as_cloud() {
     let _ = std::fs::remove_file(&cost_log);
     let _ = std::fs::remove_file(&otel);
 }
+
+// ── IMP-26 daily budget resets at UTC day rollover (Socratic-dialogue fix) ──
+#[test]
+fn test_budget_resets_on_utc_day_rollover() {
+    // A long-running process must get a *daily* budget, not cumulative-since-start.
+    // Simulate a counter that is over budget but belongs to a previous UTC day:
+    // the next request must reset it and proceed, not stay blocked forever.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log) // low threshold → cloud
+        .with_budget(1000, "block", 0, "/dev/null");
+    p.today_cloud_tokens.store(5000, Ordering::Relaxed); // over the 1000 budget…
+    p.budget_day.store(0, Ordering::Relaxed); // …but anchored to epoch day (past)
+    let long = "word ".repeat(20);
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let resp = p
+        .handle_chat(&body)
+        .expect("day rollover must reset the counter, not block");
+    assert!(
+        resp.contains("\"x_pasture_route\":\"cloud\""),
+        "after rollover the request should reach cloud: {resp}"
+    );
+    // Counter was reset (then incremented only by this request's tokens).
+    assert!(
+        p.today_cloud_tokens.load(Ordering::Relaxed) < 5000,
+        "stale daily total must have been reset"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_budget_same_day_still_blocks() {
+    // Control: within the same UTC day an over-budget counter still blocks —
+    // the rollover reset must not weaken same-day enforcement.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log)
+        .with_budget(1, "block", 0, "/dev/null");
+    p.today_cloud_tokens.store(100, Ordering::Relaxed); // budget_day == today (set by with_budget)
+    let long = "word ".repeat(20);
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let err = p.handle_chat(&body).unwrap_err();
+    assert!(matches!(err, ProxyError::BudgetExceeded(_)), "got {err:?}");
+    let _ = std::fs::remove_file(&log);
+}

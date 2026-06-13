@@ -1143,3 +1143,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   fallback-provider completion still reports the primary provider name (minor, documented). Zero
   new dependencies; 2 tests (cloud span reports the provider; a local route is never labeled
   `cloud` or the cloud provider).
+
+- **ADR-141 Daily budget resets at UTC midnight (IMP-26 fix).**
+  The Socratic review of the budget guard turned from *integration* to *time semantics*: the
+  `today_cloud_tokens` counter (`PASTURE_BUDGET_DAILY_TOKENS`) was seeded from the cost log at
+  startup and only ever incremented — never reset on a UTC day rollover. For a long-running
+  `pasture serve` process (the documented deployment) the "daily" budget silently became
+  cumulative-since-startup after the first midnight: once exceeded, every subsequent request was
+  capped to local (or 429'd) until the process restarted. Day-1 looked correct only because the
+  startup seed reads *today's* log. The counter now carries a `budget_day` (days since epoch);
+  `roll_budget_day_if_needed()` — invoked on each budget check and each cloud completion — resets
+  the counter to 0 when the day advances, via a `compare_exchange` so exactly one thread performs
+  the reset. Lazy and std-only: no timer thread, no async, checked on access. Zero new
+  dependencies; 2 tests (over-budget counter from a past day resets and proceeds; same-day
+  over-budget still blocks).

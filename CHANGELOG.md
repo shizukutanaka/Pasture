@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Daily token budget resets at UTC midnight (IMP-26, ADR-141)
+
+- The daily cloud-token budget (`PASTURE_BUDGET_DAILY_TOKENS`) never reset on a UTC day rollover:
+  for a long-running `serve` process the counter accumulated across days, so after the first
+  midnight the "daily" cap silently became cumulative-since-startup and, once exceeded, stayed
+  exceeded until restart. The counter now tracks the UTC day it belongs to and resets lazily on
+  the first budget access of a new day (no timer thread; std-only). 2 new tests. (ADR-141)
+
 ### Fixed — Correct `gen_ai.system` in OTel spans (IMP-23, ADR-140)
 
 - The OTel `gen_ai.system` attribute emitted `"cloud"`/`"local"` (not valid provider values)
