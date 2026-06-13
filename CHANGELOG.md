@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Authenticate before rate-limiting (IMP-15, ADR-142)
+
+- `check_gate` consumed a global rate-limit token *before* authenticating, so an unauthenticated
+  request spent budget before its 401. With both `PASTURE_AUTH_TOKEN` and `PASTURE_RATE_LIMIT`
+  set, an attacker without the token could flood the proxy, drain the shared bucket, and 429 the
+  legitimate client. The gate now authenticates first and meters only authenticated requests;
+  `/health` stays exempt from both. 1 new test. (ADR-142)
+
 ### Fixed — Daily token budget resets at UTC midnight (IMP-26, ADR-141)
 
 - The daily cloud-token budget (`PASTURE_BUDGET_DAILY_TOKENS`) never reset on a UTC day rollover:

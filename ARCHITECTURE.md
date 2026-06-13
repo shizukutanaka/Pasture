@@ -1157,3 +1157,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   the reset. Lazy and std-only: no timer thread, no async, checked on access. Zero new
   dependencies; 2 tests (over-budget counter from a past day resets and proceeds; same-day
   over-budget still blocks).
+
+- **ADR-142 Authenticate before rate-limiting (IMP-15 fix).**
+  Probing the other exposed-deployment surface, `check_gate` metered *before* it authenticated:
+  an unauthenticated request consumed a token from the global bucket before receiving its 401.
+  With both `PASTURE_AUTH_TOKEN` and `PASTURE_RATE_LIMIT` enabled, an attacker who does not know
+  the token could flood the proxy, drain the single shared bucket, and 429 the legitimate
+  authenticated client — the rate limit, meant to protect the server, became a denial-of-service
+  lever for an anonymous party. The gate now authenticates first (rejecting unknown tokens with
+  401 at near-zero cost via the existing constant-time compare) and only meters requests that
+  pass auth, so the budget is spent solely by legitimate traffic. `/health` remains exempt from
+  both. The token bucket itself was already correct (continuous refill, capacity cap,
+  round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
+  anonymous flood does not consume the bucket; the authenticated client is still admitted).

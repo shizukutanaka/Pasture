@@ -510,16 +510,11 @@ impl Proxy {
         if path.starts_with("/health") {
             return None;
         }
-        if let Some(rl) = &self.rate_limiter {
-            // Hold the guard so the Retry-After estimate reflects the same bucket
-            // state as the denial. A poisoned lock fails open (request allowed).
-            if let Ok(mut g) = rl.lock() {
-                if !g.allow() {
-                    let retry = g.retry_after_secs();
-                    return Some((429, "rate limit exceeded", "rate_limit_error", Some(retry)));
-                }
-            }
-        }
+        // Authenticate BEFORE metering: an unauthenticated request is rejected
+        // cheaply with 401 and must NOT consume a token from the global bucket.
+        // Otherwise an anonymous flood (no valid token) could drain the single
+        // shared bucket and 429 the legitimate authenticated client — turning the
+        // rate limit into a denial-of-service lever for an unauthenticated party.
         if let Some(expected) = &self.auth_token {
             if !auth_ok(auth, expected) {
                 return Some((
@@ -528,6 +523,16 @@ impl Proxy {
                     "invalid_request_error",
                     None,
                 ));
+            }
+        }
+        if let Some(rl) = &self.rate_limiter {
+            // Hold the guard so the Retry-After estimate reflects the same bucket
+            // state as the denial. A poisoned lock fails open (request allowed).
+            if let Ok(mut g) = rl.lock() {
+                if !g.allow() {
+                    let retry = g.retry_after_secs();
+                    return Some((429, "rate limit exceeded", "rate_limit_error", Some(retry)));
+                }
             }
         }
         None

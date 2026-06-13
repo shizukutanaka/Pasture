@@ -2986,3 +2986,32 @@ fn test_budget_same_day_still_blocks() {
     assert!(matches!(err, ProxyError::BudgetExceeded(_)), "got {err:?}");
     let _ = std::fs::remove_file(&log);
 }
+
+// ── IMP-15 auth precedes rate limiting (Socratic-dialogue fix) ─────────────
+#[test]
+fn test_unauthenticated_request_does_not_consume_rate_budget() {
+    // With both auth and a 1-token bucket, an anonymous flood must NOT drain the
+    // bucket: each unauthenticated request is 401'd before metering, so the
+    // legitimate client's request is still admitted.
+    let p = proxy_with(true, false, 100, "unused")
+        .with_auth_token(Some("s3cret".to_string()))
+        .with_rate_limit(1);
+    for _ in 0..5 {
+        assert_eq!(
+            p.check_gate("/v1/models", None).map(|g| g.0),
+            Some(401),
+            "anonymous request must be 401 (and not consume a token)"
+        );
+    }
+    // The single token is intact for the authenticated client.
+    assert!(
+        p.check_gate("/v1/models", Some("Bearer s3cret")).is_none(),
+        "authenticated request must be admitted despite the anonymous flood"
+    );
+    // It genuinely consumed the token: the next authenticated request is 429.
+    assert_eq!(
+        p.check_gate("/v1/models", Some("Bearer s3cret")).map(|g| g.0),
+        Some(429),
+        "the authenticated request should consume the bucket"
+    );
+}
