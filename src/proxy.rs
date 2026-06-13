@@ -1807,6 +1807,16 @@ impl Proxy {
         let id = next_completion_id();
         let model = req.model.clone();
         let fp = fingerprint_for_model(&model);
+        // OTel span (IMP-23): the streaming path emits a span too, so PASTURE_OTEL_LOG
+        // does not silently drop streaming traffic. Started before the backend call;
+        // filled and appended on success below.
+        let mut otel_span = self.otel_log.as_deref().map(|_| {
+            let system = match self.cloud.as_deref().map(|b| b.name()) {
+                Some("cloud") => "cloud",
+                _ => "local",
+            };
+            crate::telemetry::Span::start(system, &model)
+        });
         let mut io_err: Option<std::io::Error> = None;
         let resp = backend.stream_complete(req, &mut |delta| {
             if io_err.is_some() {
@@ -1848,6 +1858,20 @@ impl Proxy {
         match resp {
             Ok(r) => {
                 self.log_cost(route_label, &r, None);
+                // Emit the OTel span (IMP-23) for this streamed completion.
+                if let (Some(span), Some(log_path)) =
+                    (otel_span.as_mut(), self.otel_log.as_deref())
+                {
+                    span.response_model = r.model.clone();
+                    span.input_tokens = r.prompt_tokens;
+                    span.output_tokens = r.completion_tokens;
+                    span.route = route_label;
+                    span.finish_reason = Some("stop".to_string());
+                    span.finish();
+                    if let Err(e) = span.append_to(log_path) {
+                        eprintln!("pasture: otel log write failed: {e}");
+                    }
+                }
                 let stop = sse_frame(&build_openai_chunk(
                     &id,
                     &model,

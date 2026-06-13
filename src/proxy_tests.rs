@@ -2857,3 +2857,41 @@ fn test_streaming_budget_ok_allows_cloud() {
     );
     let _ = std::fs::remove_file(&log);
 }
+
+// ── IMP-23 OTel span on the streaming path (Socratic-dialogue fix) ─────────
+#[test]
+fn test_streaming_emits_otel_span() {
+    // Regression: PASTURE_OTEL_LOG must capture streaming requests, not only
+    // buffered ones — observability that drops all streams is a defect.
+    let cost_log = tmp_log();
+    let otel = tmp_log();
+    let p = proxy_with(true, false, 100, &cost_log).with_otel_log(Some(otel.clone()));
+    let body = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, _sse) = roundtrip(p, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    let content = std::fs::read_to_string(&otel).unwrap_or_default();
+    assert!(
+        content.contains("\"name\":\"gen_ai.chat\""),
+        "streaming must write an OTel span: {content:?}"
+    );
+    assert!(content.contains("\"pasture.route\":\"local\""), "{content}");
+    let line = content.lines().next().unwrap_or("");
+    assert!(
+        crate::json::parse(line).is_ok(),
+        "span must be valid JSON: {line}"
+    );
+    let _ = std::fs::remove_file(&cost_log);
+    let _ = std::fs::remove_file(&otel);
+}
+
+#[test]
+fn test_streaming_no_otel_span_when_disabled() {
+    // Control: with PASTURE_OTEL_LOG unset there is zero overhead / no file.
+    let cost_log = tmp_log();
+    let p = proxy_with(true, false, 100, &cost_log);
+    assert!(p.otel_log.is_none(), "otel disabled by default");
+    let body = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, _sse) = roundtrip(p, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    let _ = std::fs::remove_file(&cost_log);
+}

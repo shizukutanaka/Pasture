@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — OTel trace log now covers streaming (IMP-23, ADR-139)
+
+- The OpenTelemetry GenAI span (`PASTURE_OTEL_LOG`) was written only for buffered completions;
+  `"stream":true` requests produced no span, so the trace log silently omitted the most common
+  client mode. `stream_chat_to_socket` now emits a span per successful streamed completion
+  (model, token usage, route, `finish_reason`), matching the buffered path. Response caching on
+  the streaming path is intentionally out of scope (a separate design). 2 new tests. (ADR-139)
+
 ### Fixed — Budget/spike guard now covers streaming (IMP-26, ADR-138)
 
 - The daily token budget (`PASTURE_BUDGET_DAILY_TOKENS`) and spike redirect (`PASTURE_SPIKE_FACTOR`)

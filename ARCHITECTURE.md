@@ -1113,3 +1113,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   difficulty-signal escalation remains buffered-only by design — it only flips Local→Cloud
   (a quality optimization, not a cost/privacy guarantee) and needs the embedding pipeline.
   Zero new dependencies; 3 streaming budget tests (block→429, local-only redirect, control).
+
+- **ADR-139 OTel span on the streaming path (IMP-23 fix).**
+  Third application of the ADR-138 checklist (*which `run_completion` behaviours are missing
+  from `stream_chat_to_socket`?*). OTel GenAI span emission (IMP-23) was buffered-path only, so
+  `PASTURE_OTEL_LOG` silently dropped every `"stream":true` request — observability that omits
+  the most common client mode (streaming) is a defect. `stream_chat_to_socket` now starts a
+  `telemetry::Span` before the backend call (same `gen_ai.system` derivation as the buffered
+  path) and, on successful completion, fills `response.model` / `usage.input_tokens` /
+  `usage.output_tokens` / `pasture.route` / `finish_reason="stop"`, then appends the JSONL
+  record. Errors do not emit a span, matching the buffered path (which returns before the span
+  is written). Response caching on the streaming path is deliberately *out of scope*: serving a
+  cached completion as a synthesized SSE stream is a semantics change (chunking, usage chunk,
+  fingerprint) that warrants its own design, and the gap is a missed optimization, not a
+  correctness/cost/observability defect. Zero new dependencies; 2 tests (span written on a
+  stream; no file when disabled).
