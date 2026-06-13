@@ -535,6 +535,34 @@ fn roundtrip(proxy: Proxy, raw_request: String) -> (u16, String) {
     (status, body)
 }
 
+/// Like `roundtrip` but borrows the proxy so a test can issue several requests
+/// against the same instance (e.g. to exercise the shared response cache).
+fn roundtrip_ref(proxy: &Proxy, raw_request: String) -> (u16, String) {
+    use std::net::Shutdown;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(raw_request.as_bytes()).unwrap();
+        c.shutdown(Shutdown::Write).ok();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).unwrap();
+        resp
+    });
+    let (mut server, _) = listener.accept().unwrap();
+    proxy.handle_connection(&mut server).unwrap();
+    drop(server);
+    let resp = client.join().unwrap();
+    let status = resp
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
+}
+
 /// Like `roundtrip` but returns the full raw HTTP response string so tests
 /// can inspect response headers.
 fn roundtrip_raw(proxy: Proxy, raw_request: String) -> String {
@@ -1860,6 +1888,88 @@ fn test_cache_hit_emits_otel_span() {
     );
     let _ = std::fs::remove_file(&cost_log);
     let _ = std::fs::remove_file(&otel);
+}
+
+// ── ADR-147 streaming exact-match cache parity ──────────────────────────────
+
+#[test]
+fn test_streaming_served_from_cache_after_buffered_warm() {
+    // ADR-147: a buffered request warms the cache; a subsequent stream:true
+    // request for the same prompt is served from cache (route "cache") without a
+    // backend call, replaying the cached content as SSE.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_cache(8);
+    let buffered = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let _ = p.handle_chat(buffered).unwrap(); // miss → populates cache
+    let stream = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, sse) = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    assert_eq!(status, 200);
+    assert!(
+        sse.contains("\"x_pasture_route\":\"cache\""),
+        "stream must be served from cache: {sse}"
+    );
+    assert!(sse.contains("local-reply"), "cached content replayed: {sse}");
+    assert!(sse.contains("data: [DONE]"), "stream must terminate: {sse}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_miss_populates_cache_for_buffered() {
+    // ADR-147: a stream:true miss must populate the cache so a later request is
+    // served for free — the write half of streaming/buffered parity.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_cache(8);
+    let stream = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (s1, sse1) = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    assert_eq!(s1, 200);
+    assert!(
+        sse1.contains("\"x_pasture_route\":\"local\""),
+        "first stream is a miss: {sse1}"
+    );
+    // A buffered request for the same prompt now hits the stream-populated cache.
+    let buffered = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = p.handle_chat(buffered).unwrap();
+    assert!(
+        resp.contains("\"x_pasture_route\":\"cache\""),
+        "buffered request must hit the stream-populated cache: {resp}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_sensitive_neither_reads_nor_writes_cache() {
+    // ADR-147 / I5: a sensitive prompt must not be cached on the stream path. A
+    // stream:true request whose content is sensitive must not populate the cache,
+    // so a later identical buffered request is still a miss (route "local").
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_cache(8);
+    let stream = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"my password is hunter2"}]}"#;
+    let (s1, _sse1) = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    assert_eq!(s1, 200);
+    let buffered = r#"{"model":"m","messages":[{"role":"user","content":"my password is hunter2"}]}"#;
+    let resp = p.handle_chat(buffered).unwrap();
+    assert!(
+        !resp.contains("\"x_pasture_route\":\"cache\""),
+        "sensitive prompt must not have been cached by the stream path: {resp}"
+    );
+    assert!(resp.contains("\"x_pasture_route\":\"local\""), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_cache_disabled_always_calls_backend() {
+    // Control: with no cache configured, a repeated stream:true request is never
+    // served as "cache" — the feature is attributable to the cache, not routing.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log); // no .with_cache
+    let stream = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let _ = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    let (_s, sse) = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    assert!(
+        !sse.contains("\"x_pasture_route\":\"cache\""),
+        "no cache configured → never a cache hit: {sse}"
+    );
+    let _ = std::fs::remove_file(&log);
 }
 
 #[test]

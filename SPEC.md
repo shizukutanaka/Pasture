@@ -226,7 +226,9 @@ false negative = data leak (unacceptable).
   failure (after retries, §6) it keeps the local answer.
 - **Cache** (`PASTURE_CACHE=<n>`, opt-in): exact-match on hash(model + messages),
   bounded FIFO. Hits skip the backend (`x_pasture_route:"cache"`, cost 0). Never
-  caches sensitive prompts (I2).
+  caches sensitive prompts (I2). Applies to both buffered and `stream:true` requests
+  (IMP-31b): a streamed hit replays the cached content as SSE; a streamed miss
+  populates the cache. The semantic cache remains buffered-only.
 - **Backends.** Local: Ollama (default) or any OpenAI-compatible server
   (`PASTURE_LOCAL_BACKEND`). Cloud (`cloud` feature, BYOK): OpenAI or Anthropic over
   HTTPS. Both support streaming. **Cloud resilience (IMP-9):** a transient failure

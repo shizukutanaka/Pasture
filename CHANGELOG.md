@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Streaming requests now use the exact-match cache (IMP-31b, ADR-147)
+
+- The exact-match cache previously served only buffered requests; a `stream:true` request always
+  called the backend and never populated the cache. Streaming now checks the cache before the budget
+  guard (a hit costs nothing, so it is served even when over budget) and replays the cached content
+  as SSE with `x_pasture_route:"cache"`; a streamed miss populates the cache for later requests.
+  Sensitive prompts are still never cached (I2). The semantic cache stays buffered-only. SPEC §6
+  updated. 4 new tests. (ADR-147)
+
 ### Fixed — Empty local answer always escalates in cascade (IMP-1, ADR-146)
 
 - `should_escalate` let the logprob signal replace the text heuristic entirely, so an empty answer

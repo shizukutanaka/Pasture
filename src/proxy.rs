@@ -1896,8 +1896,8 @@ impl Proxy {
                 eprintln!("pasture: injection_flag:{label} (flag mode, stream proceeds)");
             }
         }
-        let decision = match self.classify_and_decide(req) {
-            Ok((d, _)) => d,
+        let (decision, sensitive) = match self.classify_and_decide(req) {
+            Ok(pair) => pair,
             Err(e) => {
                 return write_response(
                     sock,
@@ -1908,6 +1908,54 @@ impl Proxy {
                 );
             }
         };
+        // Exact-match cache read (IMP-31b/ADR-147): mirror the buffered path so a
+        // stream:true request is served from cache without a backend call. Checked
+        // BEFORE the budget guard (a cache hit costs nothing, so it is served even
+        // when over the cloud budget — matching the buffered ordering). Never for
+        // sensitive content (I5); keyed on the original request. The semantic cache
+        // stays buffered-only (it needs a query embedding the stream path skips).
+        let cache_key = if sensitive {
+            None
+        } else {
+            Some(crate::cache::request_key(req))
+        };
+        if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
+            let hit = cache.lock().ok().and_then(|mut g| g.get(key));
+            if let Some(hit) = hit {
+                write_sse_headers(sock, cors)?;
+                let id = next_completion_id();
+                let model = req.model.clone();
+                let fp = fingerprint_for_model(&model);
+                if !hit.content.is_empty() {
+                    let frame = sse_frame(&build_openai_chunk(
+                        &id, &model, &fp, &hit.content, "cache", None,
+                    ));
+                    sock.write_all(frame.as_bytes())?;
+                }
+                // OTel cache-hit span (ADR-144) + cost record (free), as buffered.
+                let mut span = self
+                    .otel_log
+                    .as_deref()
+                    .map(|_| crate::telemetry::Span::start("", &model));
+                self.emit_cache_hit_span(&mut span, &hit, "cache");
+                self.log_cost("cache", &hit, None);
+                let stop =
+                    sse_frame(&build_openai_chunk(&id, &model, &fp, "", "cache", Some("stop")));
+                sock.write_all(stop.as_bytes())?;
+                if include_usage {
+                    let usage = sse_frame(&build_openai_usage_chunk(
+                        &id,
+                        &model,
+                        &fp,
+                        "cache",
+                        hit.prompt_tokens,
+                        hit.completion_tokens,
+                    ));
+                    sock.write_all(usage.as_bytes())?;
+                }
+                return sock.write_all(b"data: [DONE]\n\n");
+            }
+        }
         // Budget / spike guard (IMP-26): mirror the buffered path so a stream:true
         // request cannot bypass the daily cap or spike redirect. May downgrade to
         // local or, in "block" mode, reject before the stream starts.
@@ -1946,9 +1994,17 @@ impl Proxy {
         // logged (I5). Tokens split across deltas are handled by StreamRestorer.
         let pseudo_req;
         let mut restorer: Option<crate::pseudonymize::StreamRestorer> = None;
+        // Keep a copy of the mapping so a streamed completion is cached with the
+        // PII *restored* (ADR-147), matching the buffered path — the cache must
+        // never hold the opaque `<EMAIL_n>` tokens. Defensive: maskable PII makes a
+        // request sensitive, and sensitive requests are not cached (key is None), so
+        // this normally stays None; it guards the case where the pseudonymizer masks
+        // something the sensitivity classifier did not flag.
+        let mut cache_mapping: Option<crate::pseudonymize::Mapping> = None;
         let req = if self.pseudonymize && route == Route::Cloud {
             let (msgs, mapping) = crate::pseudonymize::pseudonymize_messages(&req.messages);
             if !mapping.is_empty() {
+                cache_mapping = Some(mapping.clone());
                 restorer = Some(crate::pseudonymize::StreamRestorer::new(mapping));
             }
             pseudo_req = CompletionRequest {
@@ -2047,6 +2103,20 @@ impl Proxy {
                         r.completion_tokens,
                     ));
                     sock.write_all(usage.as_bytes())?;
+                }
+                // Store on miss (IMP-31b/ADR-147): cache the *restored* content so a
+                // later request (buffered or streamed) is served without a backend
+                // call. The backend returned the pseudonymized text; restore it
+                // before caching so the cache never holds `<EMAIL_n>` tokens, exactly
+                // as the buffered path does.
+                if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
+                    let mut to_cache = r.clone();
+                    if let Some(m) = cache_mapping.as_ref() {
+                        to_cache.content = crate::pseudonymize::restore(&r.content, m);
+                    }
+                    if let Ok(mut g) = cache.lock() {
+                        g.put(key, to_cache);
+                    }
                 }
             }
             Err(e) => {

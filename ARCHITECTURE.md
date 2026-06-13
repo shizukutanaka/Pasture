@@ -1171,6 +1171,22 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-147 Streaming exact-match cache parity (IMP-31b).**
+  The session's dominant bug class is "feature added to the buffered path, missing on the streaming
+  path." Socratic probe: "the exact-match cache serves buffered requests — what does a `stream:true`
+  request do?" It always called the backend and never populated the cache, so identical prompts paid
+  full cost on every stream and a streamed answer never warmed the cache for later buffered hits.
+  `stream_chat_to_socket` now checks the cache right after `classify_and_decide` (before the budget
+  guard, so a hit is served even when over budget — matching the buffered ordering) and, on a hit,
+  replays the cached content as a single SSE delta with `x_pasture_route:"cache"`, an ADR-144 cache
+  span, a free cost record, and the usual stop/usage/`[DONE]` framing. On a miss, the completed
+  response is stored. Sensitivity gating is identical to buffered (`cache_key = None` when sensitive,
+  so I2 holds), and the stored content is PII-*restored* before caching (defensive parity — a
+  pseudonymized request is sensitive and thus already uncached, but the cache must never hold
+  `<EMAIL_n>` tokens). The semantic cache stays buffered-only (it needs a query embedding the stream
+  path does not compute). SPEC §6 updated. Zero new dependencies; 4 tests (buffered-warm → streamed
+  hit; streamed miss → buffered hit; sensitive stream neither reads nor writes; no-cache control).
+
 - **ADR-146 Empty local answer always escalates (IMP-1 fix).**
   Socratic probe of the cascade's confidence logic: "the logprob signal *replaces* the text
   heuristic when present — what happens to an empty answer that carries a confident logprob?"
