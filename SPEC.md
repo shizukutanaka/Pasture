@@ -69,8 +69,11 @@ worker pool (size = `available_parallelism`, clamped 2..=32).
 
 ### 3.1 `POST /v1/chat/completions`
 Request body: OpenAI chat-completion JSON. Recognized fields:
-- `messages` (**required**, non-empty array of `{role, content}`; `content` MUST be a
-  string). Missing/empty ⇒ `400`.
+- `messages` (**required**, non-empty array of `{role, content}`). `content` is either a
+  string **or** an OpenAI array-of-parts (`[{"type":"text","text":...}, ...]`); text parts are
+  concatenated (newline-joined) and routed as text (IMP-31). A non-text part (image/audio/file)
+  ⇒ `400` (Pasture routes text only and must not answer a vision request as if the image were
+  absent). Missing/empty ⇒ `400`.
 - `model` (optional string; default `"default"`). Pasture routes by content, so the
   client's `model` is advisory.
 - `stream` (optional bool; default false). `true` ⇒ SSE response (§3.4).

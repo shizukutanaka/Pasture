@@ -1570,6 +1570,49 @@ fn test_parse_request_empty_messages_errors() {
     assert!(Proxy::parse_request(r#"{"messages":[]}"#).is_err());
 }
 
+// ── ADR-145 array-form content (OpenAI multimodal-shape compatibility) ──────
+
+#[test]
+fn test_parse_request_accepts_array_text_content() {
+    // OpenAI clients (and the official SDK's vision helper) send content as an
+    // array of parts even for plain text. Pasture must accept it and flatten the
+    // text, not reject the request with a 400.
+    let body = r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}]}"#;
+    let req = Proxy::parse_request(body).unwrap();
+    assert_eq!(req.messages.len(), 1);
+    assert_eq!(req.messages[0].content, "hello\nworld");
+}
+
+#[test]
+fn test_array_text_content_still_classified_for_pii() {
+    // The flattened array text must flow through the privacy guard exactly like
+    // string content — an email inside an array part must still be detected so it
+    // is never routed to the cloud (I3/privacy parity, not a regression hole).
+    let body = r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"my email is alice@example.com"}]}]}"#;
+    let req = Proxy::parse_request(body).unwrap();
+    let report = crate::privacy::classify(&req.routing_text());
+    assert!(
+        report.categories.contains(&"email"),
+        "PII inside array content must still be detected: {:?}",
+        report.categories
+    );
+}
+
+#[test]
+fn test_parse_request_rejects_non_text_content_part() {
+    // A genuine image part means the client wants vision, which a text router
+    // cannot serve faithfully — reject with 400 rather than silently drop the
+    // image and answer as if it were absent.
+    let body = r#"{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}"#;
+    assert!(Proxy::parse_request(body).is_err());
+}
+
+#[test]
+fn test_parse_request_missing_content_still_errors() {
+    // A message with no content at all is still a 400 (unchanged behaviour).
+    assert!(Proxy::parse_request(r#"{"messages":[{"role":"user"}]}"#).is_err());
+}
+
 #[test]
 fn test_handle_chat_short_goes_local() {
     let log = tmp_log();

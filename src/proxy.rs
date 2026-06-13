@@ -670,6 +670,51 @@ impl Proxy {
         self
     }
 
+    /// Extract a message's `content` (IMP-31 / ADR-145). Accepts both the
+    /// canonical string form and OpenAI's array-of-parts form
+    /// (`[{"type":"text","text":...}, ...]`) that vision-capable SDKs emit even
+    /// for plain text. Text parts are concatenated (newline-joined) so the result
+    /// still flows through `routing_text()` → privacy `classify()` (the PII guard
+    /// is unchanged). A genuinely multimodal part (image/audio/file) is rejected
+    /// with 400 rather than silently dropped: Pasture is a text-routing proxy and
+    /// must not answer a vision request as if the image were absent.
+    fn extract_message_content(m: &JsonValue) -> Result<String, ProxyError> {
+        let c = m
+            .get("content")
+            .ok_or_else(|| ProxyError::BadRequest("message missing 'content'".to_string()))?;
+        match c {
+            JsonValue::Str(s) => Ok(s.clone()),
+            JsonValue::Array(parts) => {
+                let mut out: Vec<String> = Vec::with_capacity(parts.len());
+                for part in parts {
+                    let kind = part.get("type").and_then(|t| t.as_str());
+                    let text = part.get("text").and_then(|t| t.as_str());
+                    match (kind, text) {
+                        // Canonical text part, or a bare {"text": "..."} with no
+                        // explicit type (some clients omit it).
+                        (Some("text"), Some(t)) | (None, Some(t)) => out.push(t.to_string()),
+                        // A non-text part means the client wants true multimodal
+                        // input, which a text router cannot serve faithfully.
+                        (Some(other), _) => {
+                            return Err(ProxyError::BadRequest(format!(
+                                "unsupported content part '{other}'; Pasture routes text only"
+                            )));
+                        }
+                        _ => {
+                            return Err(ProxyError::BadRequest(
+                                "content part missing 'text'".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok(out.join("\n"))
+            }
+            _ => Err(ProxyError::BadRequest(
+                "message 'content' must be a string or array of text parts".to_string(),
+            )),
+        }
+    }
+
     /// Parse an OpenAI-style chat-completion request body.
     pub fn parse_request(body: &str) -> Result<CompletionRequest, ProxyError> {
         let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
@@ -693,11 +738,7 @@ impl Proxy {
                 .and_then(|r| r.as_str())
                 .unwrap_or("user")
                 .to_string();
-            let content = m
-                .get("content")
-                .and_then(|c| c.as_str())
-                .ok_or_else(|| ProxyError::BadRequest("message missing 'content'".to_string()))?
-                .to_string();
+            let content = Self::extract_message_content(m)?;
             parsed.push(Message { role, content });
         }
         if parsed.is_empty() {

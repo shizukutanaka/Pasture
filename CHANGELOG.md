@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Array-form message `content` (OpenAI multimodal shape, IMP-31, ADR-145)
+
+- `content` may now be an OpenAI array-of-parts (`[{"type":"text","text":...}, ...]`), not only a
+  string. Text parts are concatenated and routed as text; the flattened text still flows through the
+  privacy classifier (PII guard unchanged). A non-text part (image/audio/file) is rejected with a
+  clear 400 — Pasture is a text router and must not answer a vision request as if the image were
+  absent. The official OpenAI SDK's vision helper emits array content even for plain text, so this
+  fixes a real compatibility gap. SPEC §3.1 updated. 4 new tests. (ADR-145)
+
 ### Fixed — OTel spans now emitted for cache hits (IMP-23, ADR-144)
 
 - The trace schema documents `pasture.route="cache"`, but cache hits returned before the span was

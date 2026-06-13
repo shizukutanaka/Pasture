@@ -1171,6 +1171,21 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-145 Accept array-form message `content` (IMP-31).**
+  Socratic probe of the OpenAI-compatibility claim: "real OpenAI accepts `content` as an array of
+  parts — what does Pasture do with it?" It returned `400 "message missing 'content'"`, because
+  `parse_request` read content with `.as_str()`, which only matches a JSON string. The official
+  OpenAI SDK's vision helper (and LangChain, and others) emit array-of-parts content *even for
+  plain text*, so a standard client was rejected outright. New `extract_message_content()` accepts
+  both forms: a string passes through unchanged, and an array has its `text` parts concatenated
+  (newline-joined). The flattened text still flows through `routing_text()` → privacy `classify()`,
+  so the PII guard is unchanged (verified by a test that an email inside an array part is still
+  detected). A genuinely multimodal part (`image_url`, `input_audio`, …) is rejected with a clear
+  400 rather than silently dropped — a text router must not answer a vision request as if the image
+  were absent, so this stays fail-closed and honest. SPEC §3.1 updated. Zero new dependencies;
+  4 tests (array text accepted and flattened; PII in array still classified; non-text part
+  rejected; truly-missing content still 400).
+
 - **ADR-144 OTel spans for cache hits (IMP-23 fix).**
   Following the error-span work, the next trace-log question: "the schema documents
   `pasture.route="cache"` (telemetry.rs) — when is that span actually written?" Never. Both the
