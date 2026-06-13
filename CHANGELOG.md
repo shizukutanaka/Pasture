@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Empty local answer always escalates in cascade (IMP-1, ADR-146)
+
+- `should_escalate` let the logprob signal replace the text heuristic entirely, so an empty answer
+  carrying a confident mean-logprob (e.g. `0.0`, above a `-1.0` threshold) stayed local and returned
+  a blank response to the user. An empty/near-empty answer now escalates unconditionally, before the
+  logprob is consulted; the logprob still governs non-empty answers. 1 new test. (ADR-146)
+
 ### Added — Array-form message `content` (OpenAI multimodal shape, IMP-31, ADR-145)
 
 - `content` may now be an OpenAI array-of-parts (`[{"type":"text","text":...}, ...]`), not only a

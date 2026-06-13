@@ -48,7 +48,19 @@ pub fn is_low_confidence(answer: &str) -> bool {
 /// Ollama without logprobs), falls back to the text heuristic.
 ///
 /// `mean_logprob` is <= 0; escalate when it drops below `logprob_threshold`.
+///
+/// An empty / near-empty answer always escalates, *regardless* of the logprob:
+/// the two signals measure different things — a model can emit nothing (or just
+/// an EOS token) while reporting a high token-confidence, and an empty answer is
+/// never useful to return. Without this guard a confident empty response
+/// (`mean_logprob` above threshold) would stay local and hand the user a blank
+/// answer when the cloud could have answered (ADR-146). The logprob signal only
+/// governs the *non-empty* case, where it adds escalation for subtle uncertainty
+/// the text heuristic cannot see.
 pub fn should_escalate(answer: &str, mean_logprob: Option<f64>, logprob_threshold: f64) -> bool {
+    if answer.trim().chars().count() < 2 {
+        return true;
+    }
     match mean_logprob {
         Some(lp) => lp < logprob_threshold,
         None => is_low_confidence(answer),
@@ -66,6 +78,18 @@ mod tests {
         assert!(should_escalate("anything", Some(-1.5), -1.0));
         // Exactly at threshold does not escalate (strict <).
         assert!(!should_escalate("anything", Some(-1.0), -1.0));
+    }
+
+    #[test]
+    fn test_empty_answer_escalates_despite_confident_logprob() {
+        // ADR-146: a model can emit nothing while reporting high token confidence.
+        // An empty / near-empty answer must escalate regardless of the logprob —
+        // the logprob must never suppress the empty-answer signal.
+        assert!(should_escalate("", Some(0.0), -1.0));
+        assert!(should_escalate("   ", Some(-0.1), -1.0));
+        assert!(should_escalate("x", Some(0.0), -1.0));
+        // Control: a confident *non-empty* answer with a good logprob stays local.
+        assert!(!should_escalate("Paris.", Some(-0.1), -1.0));
     }
 
     #[test]

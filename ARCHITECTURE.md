@@ -1171,6 +1171,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-146 Empty local answer always escalates (IMP-1 fix).**
+  Socratic probe of the cascade's confidence logic: "the logprob signal *replaces* the text
+  heuristic when present — what happens to an empty answer that carries a confident logprob?"
+  `should_escalate` was `match mean_logprob { Some(lp) => lp < threshold, None => heuristic }`, so a
+  local model that emitted nothing (or just an EOS token) while reporting a high mean token-logprob
+  (e.g. `0.0`) evaluated `0.0 < -1.0 = false` and **stayed local**, handing the user a blank answer
+  when the cloud could have answered. The two signals measure different things: token-logprob is
+  answer-quality uncertainty, but an empty string is a structural failure independent of how
+  "confident" the tokens were. Fix: `should_escalate` now escalates unconditionally when the trimmed
+  answer is shorter than 2 chars, *before* consulting the logprob; the logprob still governs the
+  non-empty case (where it adds escalation for subtle uncertainty). Zero false-positive cost (an
+  empty answer is never a useful local result) and zero new dependencies; 1 test (empty/near-empty
+  answers escalate despite a confident logprob; a confident non-empty answer still stays local).
+
 - **ADR-145 Accept array-form message `content` (IMP-31).**
   Socratic probe of the OpenAI-compatibility claim: "real OpenAI accepts `content` as an array of
   parts — what does Pasture do with it?" It returned `400 "message missing 'content'"`, because
