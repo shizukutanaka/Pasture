@@ -2799,3 +2799,61 @@ fn test_streaming_without_pseudonymize_sends_raw() {
     );
     let _ = std::fs::remove_file(&log);
 }
+
+// ── IMP-26 budget guard on the streaming path (Socratic-dialogue fix) ──────
+// The budget/spike guard was applied only on the buffered path; a stream:true
+// request bypassed the daily cap entirely. These assert parity.
+
+#[test]
+fn test_streaming_budget_exceeded_block_returns_429() {
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log) // low threshold → cloud
+        .with_budget(1, "block", 0, "/dev/null");
+    p.today_cloud_tokens.store(100, Ordering::Relaxed);
+    let long = "word ".repeat(20);
+    let body =
+        format!(r#"{{"model":"m","stream":true,"messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let (status, _sse) = roundtrip(p, http_post("/v1/chat/completions", &body));
+    assert_eq!(status, 429, "streaming must honour budget block, not bypass it");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_budget_exceeded_local_only_redirects() {
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log)
+        .with_budget(1, "local-only", 0, "/dev/null");
+    p.today_cloud_tokens.store(100, Ordering::Relaxed);
+    let long = "word ".repeat(20);
+    let body =
+        format!(r#"{{"model":"m","stream":true,"messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let (status, sse) = roundtrip(p, http_post("/v1/chat/completions", &body));
+    assert_eq!(status, 200);
+    assert!(
+        sse.contains("\"x_pasture_route\":\"local\""),
+        "budget exceeded must redirect the stream to local: {sse}"
+    );
+    assert!(
+        !sse.contains("\"x_pasture_route\":\"cloud\""),
+        "no cloud chunk should be emitted once over budget: {sse}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_budget_ok_allows_cloud() {
+    // Control: ample budget → the stream still routes to cloud as before.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log)
+        .with_budget(1_000_000, "block", 0, "/dev/null");
+    let long = "word ".repeat(20);
+    let body =
+        format!(r#"{{"model":"m","stream":true,"messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let (status, sse) = roundtrip(p, http_post("/v1/chat/completions", &body));
+    assert_eq!(status, 200);
+    assert!(
+        sse.contains("\"x_pasture_route\":\"cloud\""),
+        "ample budget should stream from cloud: {sse}"
+    );
+    let _ = std::fs::remove_file(&log);
+}

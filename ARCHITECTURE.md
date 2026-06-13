@@ -1098,3 +1098,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   flushed verbatim. Zero new dependencies; 5 `StreamRestorer` unit tests + 2 proxy integration
   tests (one asserting the backend receives the masked token and the streamed output is
   restored, one control asserting raw text flows when the feature is off).
+
+- **ADR-138 Budget/spike guard on the streaming path (IMP-26 fix).**
+  Continuing the same Socratic line as ADR-137 — *which guards live in `run_completion` but not
+  `stream_chat_to_socket`?* — the IMP-26 budget/spike guard was buffered-path only. A
+  `"stream":true` request ran `classify_and_decide` → `backend_for` and never consulted the
+  daily token cap or spike redirect, so `PASTURE_BUDGET_DAILY_TOKENS` / `PASTURE_SPIKE_FACTOR`
+  were silently bypassed for streaming. Since most chat clients stream by default, the spend cap
+  a user set to control cost was trivially evaded. The guard is now a shared method,
+  `Proxy::apply_budget_guard(req, route)`, called from both paths: it returns the (possibly
+  downgraded-to-local) route, or `Err(BudgetExceeded)` → 429 in `block` mode before the stream
+  starts. Streaming cloud completions already fed the counters via `log_cost`, so enforcement is
+  now symmetric (the same requests both update and respect the running total). The IMP-14
+  difficulty-signal escalation remains buffered-only by design — it only flips Local→Cloud
+  (a quality optimization, not a cost/privacy guarantee) and needs the embedding pipeline.
+  Zero new dependencies; 3 streaming budget tests (block→429, local-only redirect, control).

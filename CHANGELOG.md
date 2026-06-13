@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Budget/spike guard now covers streaming (IMP-26, ADR-138)
+
+- The daily token budget (`PASTURE_BUDGET_DAILY_TOKENS`) and spike redirect (`PASTURE_SPIKE_FACTOR`)
+  were enforced only on buffered completions; a `"stream":true` request bypassed them entirely.
+  Because most chat clients stream by default, the spend cap was trivially evaded. The guard is
+  now a shared `Proxy::apply_budget_guard` called from both the buffered and streaming paths —
+  in `block` mode a streaming request over budget is rejected with 429 before the stream starts;
+  in `local-only` mode it is redirected to the local model. 3 new streaming tests. (ADR-138)
+
 ### Fixed — Streaming pseudonymization parity (IMP-19, ADR-137)
 
 - PII pseudonymization (`PASTURE_PSEUDONYMIZE=1`) was applied only on the buffered completion

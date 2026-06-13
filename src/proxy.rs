@@ -786,6 +786,41 @@ impl Proxy {
         None
     }
 
+    /// Apply the IMP-26 budget/spike guard to an already-decided route. Returns
+    /// the (possibly downgraded) route, or `Err(BudgetExceeded)` when the action
+    /// is `block`. A no-op for non-cloud routes or when neither guard is
+    /// configured. Shared by the buffered (`run_completion`) and streaming
+    /// (`stream_chat_to_socket`) paths so a `stream:true` request cannot bypass
+    /// the daily token cap or spike redirect.
+    fn apply_budget_guard(
+        &self,
+        req: &CompletionRequest,
+        route: Route,
+    ) -> Result<Route, ProxyError> {
+        if route != Route::Cloud || (self.budget_daily_tokens == 0 && self.spike_factor == 0) {
+            return Ok(route);
+        }
+        // IMP-24: estimate input + predicted output tokens (cloud cost is driven
+        // mostly by output, so input alone under-estimates spend).
+        let estimated =
+            crate::routing::estimate_total_tokens(&req.routing_text(), req.sampling.max_tokens)
+                as u64;
+        if let Some(reason) = self.check_budget_and_spike(estimated) {
+            match self.budget_action.as_str() {
+                "block" => return Err(ProxyError::BudgetExceeded(reason.to_string())),
+                "warn" => {
+                    eprintln!("pasture: budget warning: {reason} (cloud request proceeds)");
+                }
+                _ => {
+                    // "local-only" (default): silently redirect to local.
+                    eprintln!("pasture: {reason} -> routing local");
+                    return Ok(Route::Local);
+                }
+            }
+        }
+        Ok(route)
+    }
+
     fn log_cost(&self, route_label: &'static str, resp: &CompletionResponse, logprob: Option<f64>) {
         // Record cost (local and cache are free). PII is never written (I5);
         // logprob is the local-answer confidence number, not content.
@@ -922,32 +957,8 @@ impl Proxy {
         // Budget / spike guard (IMP-26): only applies when routing to cloud and
         // budget or spike detection is configured. Sensitive content was excluded
         // from cloud routing above (privacy), so this check runs on non-sensitive
-        // cloud-bound requests only.
-        if planned_route == Route::Cloud
-            && (self.budget_daily_tokens > 0 || self.spike_factor > 0)
-        {
-            // IMP-24: estimate input + predicted output tokens. Cloud cost is
-            // driven mostly by output, so counting input alone under-estimates
-            // the spend a request will incur against the budget.
-            let estimated =
-                crate::routing::estimate_total_tokens(&req.routing_text(), req.sampling.max_tokens)
-                    as u64;
-            if let Some(reason) = self.check_budget_and_spike(estimated) {
-                match self.budget_action.as_str() {
-                    "block" => {
-                        return Err(ProxyError::BudgetExceeded(reason.to_string()));
-                    }
-                    "warn" => {
-                        eprintln!("pasture: budget warning: {reason} (cloud request proceeds)");
-                    }
-                    _ => {
-                        // "local-only" (default): silently redirect to local.
-                        eprintln!("pasture: {reason} -> routing local");
-                        planned_route = Route::Local;
-                    }
-                }
-            }
-        }
+        // cloud-bound requests only. Shared with the streaming path.
+        let planned_route = self.apply_budget_guard(req, planned_route)?;
 
         // Pseudonymization (IMP-19): replace PII with opaque tokens before
         // sending to the cloud. Only applied to cloud-bound, non-sensitive
@@ -1740,7 +1751,22 @@ impl Proxy {
                 );
             }
         };
-        let backend = match self.backend_for(decision.route) {
+        // Budget / spike guard (IMP-26): mirror the buffered path so a stream:true
+        // request cannot bypass the daily cap or spike redirect. May downgrade to
+        // local or, in "block" mode, reject before the stream starts.
+        let route = match self.apply_budget_guard(req, decision.route) {
+            Ok(r) => r,
+            Err(e) => {
+                return write_response(
+                    sock,
+                    e.status(),
+                    &build_error_response(e.message(), e.kind()),
+                    cors,
+                    false,
+                );
+            }
+        };
+        let backend = match self.backend_for(route) {
             Ok(b) => b,
             Err(e) => {
                 return write_response(
@@ -1754,7 +1780,7 @@ impl Proxy {
         };
 
         write_sse_headers(sock, cors)?;
-        let route_label = decision.route.as_str();
+        let route_label = route.as_str();
 
         // Pseudonymization for streaming (IMP-19): mirror the buffered path —
         // mask PII before the request reaches the cloud, and restore tokens in
@@ -1763,7 +1789,7 @@ impl Proxy {
         // logged (I5). Tokens split across deltas are handled by StreamRestorer.
         let pseudo_req;
         let mut restorer: Option<crate::pseudonymize::StreamRestorer> = None;
-        let req = if self.pseudonymize && decision.route == Route::Cloud {
+        let req = if self.pseudonymize && route == Route::Cloud {
             let (msgs, mapping) = crate::pseudonymize::pseudonymize_messages(&req.messages);
             if !mapping.is_empty() {
                 restorer = Some(crate::pseudonymize::StreamRestorer::new(mapping));
