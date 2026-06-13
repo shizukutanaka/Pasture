@@ -52,7 +52,7 @@ pasture stats              # summarize the cost log (routes, tokens, spend)
 pasture improvements       # show the self-improvement ledger (verified change history)
 ```
 
-Force a route with `--local` or `--cloud`. Enable cascade (answer locally, escalate to cloud only when the local answer is weak) with `PASTURE_CASCADE=1` (requires the `cloud` feature and a key). Enable an exact-match response cache with `PASTURE_CACHE=<size>` to avoid paying for repeated identical prompts, and a semantic cache with `PASTURE_SEMANTIC_CACHE=<size>` to also serve paraphrased repeats (cosine similarity via the local backend's embeddings; threshold `PASTURE_SEMANTIC_THRESHOLD`, default 0.92). List prompts your local model handles badly in a file and set `PASTURE_HARD_PROMPTS=<file>` to escalate anything embedding-similar to them (threshold `PASTURE_HARD_THRESHOLD`, default 0.85). Pin task types to backends with `PASTURE_SKILLS=code:local,summarize:cloud` (comma-separated `skill:route`; recognised: `code`, `math`, `reason`, `summarize`, `translate`). Enable prompt-injection detection with `PASTURE_INJECTION_GUARD=flag` (annotate) or `=block` (reject 400). Cap daily cloud token spend with `PASTURE_BUDGET_DAILY_TOKENS=<n>` (action via `PASTURE_BUDGET_ACTION`: `local-only`/`warn`/`block`); spike detection redirects outlier requests with `PASTURE_SPIKE_FACTOR=<n>` (default 50). Mask PII in cloud-bound requests with `PASTURE_PSEUDONYMIZE=1` (reversible; tokens swapped back in the response). Enable Anthropic prefix caching with `PASTURE_CACHE_CONTROL=1`. Write OTel GenAI trace records with `PASTURE_OTEL_LOG=<path>`. Set the listen address for the proxy with `--addr host:port`.
+Force a route with `--local` or `--cloud`. Enable cascade (answer locally, escalate to cloud only when the local answer is weak) with `PASTURE_CASCADE=1` (requires the `cloud` feature and a key). Enable an exact-match response cache with `PASTURE_CACHE=<size>` to avoid paying for repeated identical prompts, and a semantic cache with `PASTURE_SEMANTIC_CACHE=<size>` to also serve paraphrased repeats (cosine similarity via the local backend's embeddings; threshold `PASTURE_SEMANTIC_THRESHOLD`, default 0.92). List prompts your local model handles badly in a file and set `PASTURE_HARD_PROMPTS=<file>` to escalate anything embedding-similar to them (threshold `PASTURE_HARD_THRESHOLD`, default 0.85). Pin task types to backends with `PASTURE_SKILLS=code:local,summarize:cloud` (comma-separated `skill:route`; recognised: `code`, `math`, `reason`, `summarize`, `translate`). Enable prompt-injection detection with `PASTURE_INJECTION_GUARD=flag` (annotate) or `=block` (reject 400). Cap daily cloud token spend with `PASTURE_BUDGET_DAILY_TOKENS=<n>` (action via `PASTURE_BUDGET_ACTION`: `local-only`/`warn`/`block`); spike detection redirects outlier requests with `PASTURE_SPIKE_FACTOR=<n>` (default 50). Mask PII in cloud-bound requests with `PASTURE_PSEUDONYMIZE=1` (reversible; tokens swapped back in the response). Enable Anthropic prefix caching with `PASTURE_CACHE_CONTROL=1`. Write OTel GenAI trace records with `PASTURE_OTEL_LOG=<path>`. Configure a secondary cloud provider for failover with `PASTURE_CLOUD_FALLBACK_PROVIDER=anthropic` (tried after the primary exhausts retries, before falling back to local). Set the listen address for the proxy with `--addr host:port`.
 
 Point any OpenAI-compatible client at the proxy:
 
@@ -87,7 +87,7 @@ Defaults are sensible; override via environment variables:
 | `PASTURE_LISTEN_ADDR` | `127.0.0.1:8645` | proxy listen address |
 | `PASTURE_OLLAMA_HOST` | `127.0.0.1` | local Ollama host |
 | `PASTURE_OLLAMA_PORT` | `11434` | local Ollama port |
-| `PASTURE_LOCAL_MODEL` | `llama3` | local model name |
+| `PASTURE_LOCAL_MODEL` | `llama3.2` | local model name |
 | `PASTURE_COST_LOG` | `pasture-cost.jsonl` | cost log path |
 | `PASTURE_CLOUD_RETRY` | `2` | retry transient cloud failures (5xx/timeouts) this many times, then fall back to local |
 | `PASTURE_LOCAL_ONLY` | _(off)_ | when set, all traffic routes local; cloud backend disabled (GPU-less / air-gapped use) |
@@ -107,6 +107,8 @@ Defaults are sensible; override via environment variables:
 | `PASTURE_CACHE_CONTROL` | _(off)_ | set to `1` to add `cache_control` hints on Anthropic system messages (prompt prefix caching); no-op for OpenAI |
 | `PASTURE_PSEUDONYMIZE` | _(off)_ | set to `1` to replace detected PII (email, IPv4, phone, API-key prefix) with stable opaque tokens in cloud-bound requests, then restore in the response; mapping never logged |
 | `PASTURE_OTEL_LOG` | _(off)_ | path to a JSONL file for OpenTelemetry GenAI semantic convention trace records; appended per request; off when unset |
+| `PASTURE_CLOUD_FALLBACK_PROVIDER` | _(off)_ | secondary cloud provider tried when the primary fails all retries (`openai` or `anthropic`); off when unset |
+| `PASTURE_CLOUD_FALLBACK_MODEL` | _(same as primary)_ | model to use on the fallback provider; defaults to `PASTURE_CLOUD_MODEL` when empty |
 
 The local backend talks to [Ollama](https://ollama.com) over plain HTTP. GPU acceleration (CUDA/Metal/ROCm) is handled by Ollama; Pasture writes no GPU code itself.
 

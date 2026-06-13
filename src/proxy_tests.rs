@@ -2613,3 +2613,97 @@ fn test_max_body_bytes_default_allows_small_bodies() {
     assert_eq!(status, 200);
     let _ = std::fs::remove_file(&log);
 }
+
+// ── IMP-9 multi-provider cloud fallback ──────────────────────────────────────
+
+struct AlwaysFailBackend;
+impl Backend for AlwaysFailBackend {
+    fn name(&self) -> &str {
+        "always-fail"
+    }
+    fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
+        Err(BackendError::Transport("provider down".into()))
+    }
+}
+
+#[test]
+fn test_cloud_fallback_used_when_primary_fails() {
+    // Primary cloud always fails; fallback cloud succeeds. The response should
+    // come from the fallback, and the route should still be Cloud.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, true, true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    )
+    .with_cloud_retry(0)
+    .with_cloud_fallback(Some(
+        Box::new(MockBackend::new("fallback", "fallback-reply")),
+    ));
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    let (resp, route, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    assert_eq!(resp.content, "fallback-reply");
+    assert_eq!(route, Route::Cloud);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_fallback_falls_to_local_when_both_fail() {
+    // Both primary and fallback cloud fail; local backend should answer.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, true, true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    )
+    .with_cloud_retry(0)
+    .with_cloud_fallback(Some(Box::new(AlwaysFailBackend)));
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    let (resp, route, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    assert_eq!(resp.content, "local-reply");
+    assert_eq!(route, Route::Local);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_fallback_not_used_when_primary_succeeds() {
+    // Primary cloud succeeds; fallback (AlwaysFailBackend) should never be called.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, true, true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(MockBackend::new("primary", "primary-reply"))),
+        &log,
+    )
+    .with_cloud_retry(0)
+    .with_cloud_fallback(Some(Box::new(AlwaysFailBackend)));
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    let (resp, route, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    assert_eq!(resp.content, "primary-reply");
+    assert_eq!(route, Route::Cloud);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_fallback_none_still_falls_to_local() {
+    // No fallback configured; behaviour is identical to before this feature.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, true, true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    )
+    .with_cloud_retry(0);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    let (resp, route, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    assert_eq!(resp.content, "local-reply");
+    assert_eq!(route, Route::Local);
+    let _ = std::fs::remove_file(&log);
+}

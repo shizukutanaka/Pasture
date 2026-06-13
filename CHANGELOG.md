@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Multi-provider cloud fallback chain (IMP-9 follow-up, ADR-136)
+
+- `PASTURE_CLOUD_FALLBACK_PROVIDER` (`openai` or `anthropic`) configures a secondary cloud
+  provider tried when the primary provider fails all retries. `PASTURE_CLOUD_FALLBACK_MODEL`
+  sets the model on the fallback (defaults to the primary model). When both providers fail,
+  the request falls back to local. When no fallback is configured, behaviour is identical to
+  before (unchanged). API keys for each provider use their own env vars
+  (`PASTURE_OPENAI_API_KEY`, `PASTURE_ANTHROPIC_API_KEY`). 4 new tests. (ADR-136)
+
 ### Changed — Output-length prediction sharpens budget/spike cost estimation (IMP-24)
 
 - The budget/spike guard (`PASTURE_BUDGET_DAILY_TOKENS` / `PASTURE_SPIKE_FACTOR`) now estimates

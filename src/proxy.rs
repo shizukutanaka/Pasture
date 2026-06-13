@@ -211,6 +211,10 @@ pub struct Proxy {
     pseudonymize: bool,
     /// Optional OTel-compatible GenAI trace log path (IMP-23). Empty = disabled.
     otel_log: Option<String>,
+    /// Optional secondary cloud backend tried when the primary cloud fails all
+    /// retries (IMP-9 multi-provider follow-up). When set, a primary cloud failure
+    /// attempts this backend before falling back to local. None = disabled.
+    cloud_fallback: Option<Box<dyn Backend>>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -258,6 +262,7 @@ impl Proxy {
             budget_action: "local-only".to_string(),
             spike_factor: 50,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            cloud_fallback: None,
         }
     }
 
@@ -308,6 +313,14 @@ impl Proxy {
     /// Empty path disables the feature.
     pub fn with_otel_log(mut self, path: Option<String>) -> Self {
         self.otel_log = path.filter(|p| !p.is_empty());
+        self
+    }
+
+    /// Set a secondary cloud backend for multi-provider fallback (IMP-9 follow-up).
+    /// When the primary cloud provider fails all retries, this backend is tried
+    /// before giving up to the local model. `None` keeps single-provider behaviour.
+    pub fn with_cloud_fallback(mut self, backend: Option<Box<dyn Backend>>) -> Self {
+        self.cloud_fallback = backend;
         self
     }
 
@@ -1057,16 +1070,35 @@ impl Proxy {
         let cloud = self.backend_for(Route::Cloud)?;
         match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
             Ok(resp) => Ok((resp, Route::Cloud, None)),
-            Err(e) => match self.local.as_deref() {
-                Some(local) => {
-                    eprintln!("pasture: cloud failed ({e}); falling back to local");
-                    let resp = local
-                        .complete(req)
-                        .map_err(|e| ProxyError::Backend(e.to_string()))?;
-                    Ok((resp, Route::Local, None))
+            Err(primary_err) => {
+                // IMP-9 multi-provider follow-up: try the fallback cloud provider
+                // before giving up to local. This handles a full primary-cloud
+                // outage (vs. transient errors, which the retry loop already covers).
+                if let Some(fallback) = self.cloud_fallback.as_deref() {
+                    eprintln!(
+                        "pasture: primary cloud failed ({primary_err}); trying fallback cloud"
+                    );
+                    match complete_with_retry(fallback, req, self.cloud_retry, CLOUD_RETRY_BASE_MS)
+                    {
+                        Ok(resp) => return Ok((resp, Route::Cloud, None)),
+                        Err(fb_err) => {
+                            eprintln!("pasture: fallback cloud also failed ({fb_err})");
+                        }
+                    }
                 }
-                None => Err(ProxyError::Backend(e.to_string())),
-            },
+                match self.local.as_deref() {
+                    Some(local) => {
+                        eprintln!(
+                            "pasture: cloud failed ({primary_err}); falling back to local"
+                        );
+                        let resp = local
+                            .complete(req)
+                            .map_err(|e| ProxyError::Backend(e.to_string()))?;
+                        Ok((resp, Route::Local, None))
+                    }
+                    None => Err(ProxyError::Backend(primary_err.to_string())),
+                }
+            }
         }
     }
 

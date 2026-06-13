@@ -333,7 +333,11 @@ IMP-8) **+ §3.2b `/v1/embeddings` (IMP-8 completion, ADR-034) + §3.2c `/v1/sta
   implementations, `handle_embeddings` in the proxy, `parse_embeddings_request` +
   `build_embeddings_response` + `fmt_float_array` helpers (ADR-034).
 
-**Deferred (tracked in COMPETITIVE.md / RESEARCH.md):**
-- `tool_choice` is not separately inspected (only `tools`/`functions` arrays).
-- Multi-provider cloud fallback chain (IMP-9 remainder); auth + rate-limit (IMP-15);
-  semantic cache (IMP-12); calibrated-uncertainty escalation (IMP-13).
+**Shipped since initial spec (tracked in COMPETITIVE.md / ARCHITECTURE.md):**
+- `tool_choice` is not separately inspected; only the presence of `tools`/`functions` arrays
+  matters for hard-signal routing (ADR-031, IMP-10). Full `tool_choice` parsing remains future work.
+- Multi-provider cloud fallback chain: `PASTURE_CLOUD_FALLBACK_PROVIDER` / `PASTURE_CLOUD_FALLBACK_MODEL`
+  configure a secondary cloud provider tried when the primary fails all retries (IMP-9, ADR-136).
+- Auth + rate-limit: `PASTURE_PROXY_TOKEN` + `PASTURE_RATE_LIMIT` (IMP-15, COMPETITIVE.md).
+- Semantic cache: `PASTURE_SEMANTIC_CACHE` via local embeddings (IMP-12, ADR-123).
+- Calibrated-uncertainty escalation: `calibrate --logprob` + mean-logprob cascade (IMP-13, ADR-124).

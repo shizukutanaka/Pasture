@@ -1069,3 +1069,14 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   multipliers lean high deliberately: for a budget guard, over-estimating output keeps the user
   safely under-cap, whereas under-estimating risks a surprise overage. Deterministic, label-free,
   zero new dependencies; 6 unit tests.
+- **ADR-136 Multi-provider cloud fallback chain (IMP-9 follow-up).**
+  The primary cloud backend (IMP-9, ADR-032) retries transient 5xx/timeout failures with
+  exponential backoff, then falls back to local on final failure. The remaining gap was an
+  outage of the *entire* primary provider: there was no way to try a second cloud provider
+  before giving up to local. `Proxy` gains a `cloud_fallback: Option<Box<dyn Backend>>` field
+  set via `with_cloud_fallback()`; `complete_cloud_with_fallback()` now tries the fallback
+  provider (with the same retry logic) after the primary exhausts its retries, before falling
+  back to local. Config: `PASTURE_CLOUD_FALLBACK_PROVIDER` (e.g. `anthropic` as fallback for an
+  OpenAI primary) and `PASTURE_CLOUD_FALLBACK_MODEL` (defaults to the primary model). The API
+  key for the fallback provider is its own env var (`PASTURE_ANTHROPIC_API_KEY` etc.) — no new
+  secret management. Zero new dependencies; 4 unit tests.

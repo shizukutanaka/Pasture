@@ -480,6 +480,31 @@ fn make_cloud_backend(config: &Config) -> Option<Box<dyn Backend>> {
     }
 }
 
+/// Build the secondary (fallback) cloud backend for multi-provider failover
+/// (IMP-9 follow-up). Returns `None` when `cloud_fallback_provider` is unset
+/// or the feature flag `cloud` is disabled.
+fn make_fallback_cloud_backend(config: &Config) -> Option<Box<dyn Backend>> {
+    if config.cloud_fallback_provider.is_empty() {
+        return None;
+    }
+    #[cfg(feature = "cloud")]
+    {
+        let provider = crate::cloud::Provider::from_name(&config.cloud_fallback_provider)?;
+        let model = if config.cloud_fallback_model.is_empty() {
+            &config.cloud_model
+        } else {
+            &config.cloud_fallback_model
+        };
+        let backend = crate::cloud::HttpsCloudBackend::from_env(provider, model)?;
+        Some(Box::new(backend))
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let _ = config;
+        None
+    }
+}
+
 fn cloud_key_hint(config: &Config) -> String {
     match crate::cloud::Provider::from_name(&config.cloud_provider) {
         Some(p) => p.env_key().to_string(),
@@ -1143,6 +1168,17 @@ fn run_config(config: &Config) -> i32 {
     if !config.otel_log.is_empty() {
         println!("  otel_log:          {}", config.otel_log);
     }
+    if !config.cloud_fallback_provider.is_empty() {
+        let fb_model = if config.cloud_fallback_model.is_empty() {
+            config.cloud_model.as_str()
+        } else {
+            config.cloud_fallback_model.as_str()
+        };
+        println!(
+            "  cloud_fallback:    {} / {}",
+            config.cloud_fallback_provider, fb_model
+        );
+    }
     println!("  cost_log:          {}", config.cost_log_path);
     println!("  donate_url:        {}", yn(config.donate_url.is_some()));
     println!("  lang:              {}", lang.code());
@@ -1368,7 +1404,8 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
             None
         } else {
             Some(config.otel_log.clone())
-        });
+        })
+        .with_cloud_fallback(make_fallback_cloud_backend(config));
     print!(
         "{}",
         crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])

@@ -112,6 +112,13 @@ pub struct Config {
     /// appends one JSONL span with GenAI semantic convention attributes.
     /// Empty = disabled (default). Set via `PASTURE_OTEL_LOG=<path>`.
     pub otel_log: String,
+    /// Fallback cloud provider tried when the primary cloud fails all retries
+    /// (IMP-9 multi-provider follow-up). Empty string = disabled (default).
+    /// Set via `PASTURE_CLOUD_FALLBACK_PROVIDER` (`openai` or `anthropic`).
+    pub cloud_fallback_provider: String,
+    /// Model to use on the fallback cloud provider. Empty = same as `cloud_model`.
+    /// Set via `PASTURE_CLOUD_FALLBACK_MODEL`.
+    pub cloud_fallback_model: String,
 }
 
 impl Default for Config {
@@ -160,6 +167,8 @@ impl Default for Config {
             cache_control: false,
             pseudonymize: false,
             otel_log: String::new(),
+            cloud_fallback_provider: String::new(),
+            cloud_fallback_model: String::new(),
         }
     }
 }
@@ -379,6 +388,12 @@ impl Config {
         if let Ok(v) = std::env::var("PASTURE_OTEL_LOG") {
             self.otel_log = v;
         }
+        if let Ok(v) = std::env::var("PASTURE_CLOUD_FALLBACK_PROVIDER") {
+            self.cloud_fallback_provider = v;
+        }
+        if let Ok(v) = std::env::var("PASTURE_CLOUD_FALLBACK_MODEL") {
+            self.cloud_fallback_model = v;
+        }
         self
     }
 
@@ -511,6 +526,8 @@ impl Config {
                 self.pseudonymize = matches!(val, "1" | "true" | "yes");
             }
             "otel_log" => self.otel_log = val.to_string(),
+            "cloud_fallback_provider" => self.cloud_fallback_provider = val.to_string(),
+            "cloud_fallback_model" => self.cloud_fallback_model = val.to_string(),
             _ => {}
         }
     }
