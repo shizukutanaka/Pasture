@@ -44,6 +44,10 @@ pub struct Span {
     pub route: &'static str,
     /// `gen_ai.response.finish_reason` (optional).
     pub finish_reason: Option<String>,
+    /// OTel span status: `"ok"` or `"error"` (ADR-143).
+    pub status: &'static str,
+    /// `pasture.error` attribute — present on error spans (ADR-143).
+    pub error_message: Option<String>,
 }
 
 impl Span {
@@ -64,6 +68,8 @@ impl Span {
             output_tokens: 0,
             route: "local",
             finish_reason: None,
+            status: "ok",
+            error_message: None,
         }
     }
 
@@ -83,18 +89,23 @@ impl Span {
             ),
             None => String::new(),
         };
+        let error_attr = match &self.error_message {
+            Some(e) => format!(",\"pasture.error\":\"{}\"", escape_string(e)),
+            None => String::new(),
+        };
         format!(
             "{{\"name\":\"gen_ai.chat\",\"trace_id\":\"{}\",\"span_id\":\"{}\",\
-             \"start_time_unix_nano\":{},\"end_time_unix_nano\":{},\"status\":\"ok\",\
+             \"start_time_unix_nano\":{},\"end_time_unix_nano\":{},\"status\":\"{}\",\
              \"attributes\":{{\"gen_ai.system\":\"{}\",\"gen_ai.operation.name\":\"chat\",\
              \"gen_ai.request.model\":\"{}\",\"gen_ai.response.model\":\"{}\",\
              \"gen_ai.usage.input_tokens\":{},\"gen_ai.usage.output_tokens\":{},\
-             \"pasture.route\":\"{}\"{}\
+             \"pasture.route\":\"{}\"{}{}\
              }}}}",
             self.trace_id,
             self.span_id,
             self.start_time_unix_nano,
             self.end_time_unix_nano,
+            self.status,
             escape_string(&self.system),
             escape_string(&self.request_model),
             escape_string(&self.response_model),
@@ -102,6 +113,7 @@ impl Span {
             self.output_tokens,
             escape_string(self.route),
             finish,
+            error_attr,
         )
     }
 
@@ -237,5 +249,31 @@ mod tests {
         let content = std::fs::read_to_string(p).unwrap();
         assert!(content.trim().ends_with('}'), "JSONL must end with }}");
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn test_error_span_has_status_error_and_pasture_error_attr() {
+        let mut span = Span::start("openai", "gpt-4o-mini");
+        span.status = "error";
+        span.error_message = Some("connection refused".to_string());
+        span.route = "cloud";
+        span.finish();
+        let line = span.to_jsonl();
+        assert!(line.contains("\"status\":\"error\""), "{line}");
+        assert!(
+            line.contains("\"pasture.error\":\"connection refused\""),
+            "{line}"
+        );
+        let v = crate::json::parse(&line).expect("error span must be valid JSON");
+        assert_eq!(v.get("status").and_then(|x| x.as_str()), Some("error"));
+    }
+
+    #[test]
+    fn test_ok_span_has_no_pasture_error_attr() {
+        let mut span = Span::start("openai", "m");
+        span.finish();
+        let line = span.to_jsonl();
+        assert!(line.contains("\"status\":\"ok\""), "{line}");
+        assert!(!line.contains("pasture.error"), "{line}");
     }
 }

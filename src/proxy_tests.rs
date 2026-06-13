@@ -3015,3 +3015,79 @@ fn test_unauthenticated_request_does_not_consume_rate_budget() {
         "the authenticated request should consume the bucket"
     );
 }
+
+// ── ADR-143 OTel error spans ────────────────────────────────────────────────
+
+#[test]
+fn test_buffered_error_emits_otel_error_span() {
+    // Regression: when the cloud backend fails, the OTel span must be written
+    // with status:"error" and a pasture.error attribute so operators can see
+    // backend failures in the trace log (not silently dropped).
+    let cost_log = tmp_log();
+    let otel = tmp_log();
+    let engine = RoutingEngine::new(0, false, true); // threshold=0 → cloud, no local
+    let proxy = Proxy::new(
+        engine,
+        None,
+        Some(Box::new(AlwaysFailBackend) as Box<dyn Backend>),
+        &cost_log,
+    )
+    .with_otel_log(Some(otel.clone()));
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let err = proxy.handle_chat(body);
+    assert!(err.is_err(), "cloud failure must return an error");
+    let content = std::fs::read_to_string(&otel).unwrap_or_default();
+    assert!(
+        content.contains("\"status\":\"error\""),
+        "error span must set status:error: {content:?}"
+    );
+    assert!(
+        content.contains("\"pasture.error\""),
+        "error span must include pasture.error attribute: {content:?}"
+    );
+    let line = content.lines().next().unwrap_or("");
+    assert!(
+        crate::json::parse(line).is_ok(),
+        "error span must be valid JSON: {line}"
+    );
+    let _ = std::fs::remove_file(&cost_log);
+    let _ = std::fs::remove_file(&otel);
+}
+
+#[test]
+fn test_streaming_error_emits_otel_error_span() {
+    // Regression: when the cloud backend fails during streaming, the OTel span
+    // must be written with status:"error" — not silently dropped because the
+    // success branch was never reached.
+    let cost_log = tmp_log();
+    let otel = tmp_log();
+    let engine = RoutingEngine::new(0, false, true); // threshold=0 → cloud, no local
+    let proxy = Proxy::new(
+        engine,
+        None,
+        Some(Box::new(AlwaysFailBackend) as Box<dyn Backend>),
+        &cost_log,
+    )
+    .with_otel_log(Some(otel.clone()));
+    let body = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    // SSE headers are sent before streaming, so HTTP status is always 200; the
+    // error is signalled inside the SSE body.
+    let (status, _sse) = roundtrip(proxy, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200, "SSE always opens with 200");
+    let content = std::fs::read_to_string(&otel).unwrap_or_default();
+    assert!(
+        content.contains("\"status\":\"error\""),
+        "streaming error must write error span: {content:?}"
+    );
+    assert!(
+        content.contains("\"pasture.error\""),
+        "streaming error span must include pasture.error attribute: {content:?}"
+    );
+    let line = content.lines().next().unwrap_or("");
+    assert!(
+        crate::json::parse(line).is_ok(),
+        "streaming error span must be valid JSON: {line}"
+    );
+    let _ = std::fs::remove_file(&cost_log);
+    let _ = std::fs::remove_file(&otel);
+}

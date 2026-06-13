@@ -1060,17 +1060,37 @@ impl Proxy {
         // Pick the completion strategy. Cascade (try local, escalate on low
         // confidence) is never used for sensitive content (privacy) or when
         // either backend is missing.
-        let (mut resp, route, logprob) = if self.cascade
+        let completion_result = if self.cascade
             && !sensitive
             && planned_route == Route::Local
             && self.cloud.is_some()
             && self.local.is_some()
         {
-            self.complete_cascade(req)?
+            self.complete_cascade(req)
         } else if planned_route == Route::Cloud {
-            self.complete_cloud_with_fallback(req)?
+            self.complete_cloud_with_fallback(req)
         } else {
-            self.complete_direct(req, planned_route)?
+            self.complete_direct(req, planned_route)
+        };
+        let (mut resp, route, logprob) = match completion_result {
+            Ok(v) => v,
+            Err(e) => {
+                // ADR-143: emit error span so backend failures are visible in
+                // the trace log, not silently dropped.
+                if let (Some(span), Some(log_path)) =
+                    (otel_span.as_mut(), self.otel_log.as_deref())
+                {
+                    span.status = "error";
+                    span.error_message = Some(e.to_string());
+                    span.route = planned_route.as_str();
+                    span.system = self.otel_system_for(planned_route);
+                    span.finish();
+                    if let Err(w) = span.append_to(log_path) {
+                        eprintln!("pasture: otel log write failed: {w}");
+                    }
+                }
+                return Err(e);
+            }
         };
 
         // Restore pseudonymized tokens in the response (IMP-19).
@@ -1961,6 +1981,20 @@ impl Proxy {
                 }
             }
             Err(e) => {
+                // ADR-143: emit error span so streaming backend failures are
+                // visible in the trace log rather than silently dropped.
+                if let (Some(span), Some(log_path)) =
+                    (otel_span.as_mut(), self.otel_log.as_deref())
+                {
+                    span.status = "error";
+                    span.error_message = Some(e.to_string());
+                    span.route = route_label;
+                    span.system = self.otel_system_for(route);
+                    span.finish();
+                    if let Err(w) = span.append_to(log_path) {
+                        eprintln!("pasture: otel log write failed: {w}");
+                    }
+                }
                 let err = sse_frame(&build_error_response(&e.to_string(), "upstream_error"));
                 sock.write_all(err.as_bytes())?;
             }

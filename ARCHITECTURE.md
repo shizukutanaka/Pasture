@@ -1170,3 +1170,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   both. The token bucket itself was already correct (continuous refill, capacity cap,
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
+
+- **ADR-143 OTel error spans (IMP-23 fix).**
+  Probing the `PASTURE_OTEL_LOG` observability story: "what does an operator see when a cloud call
+  fails?" — the answer was nothing. Both the buffered path (which uses `?` to propagate
+  `ProxyError::Backend`) and the streaming path (whose `Err(e)` arm wrote an SSE error frame)
+  dropped the in-flight `Span` silently. This means a sustained backend outage left the trace log
+  blank — the opposite of what OTel is for. Two changes: (1) `Span` gains a `status: &'static str`
+  field (default `"ok"`) and an `error_message: Option<String>` field; `to_jsonl()` uses
+  `self.status` instead of the hardcoded literal `"ok"`, and conditionally appends a
+  `"pasture.error"` attribute. (2) The buffered path converts the three-way `?` into an explicit
+  `match` so the error arm can fill and emit the span before returning `Err(e)`. (3) The streaming
+  path's `Err(e)` arm does the same before writing the SSE error frame. Zero new dependencies;
+  4 tests (error span status/attribute in `telemetry.rs`; buffered and streaming paths each emit
+  an error span on backend failure).

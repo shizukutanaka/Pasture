@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — OTel spans now emitted on backend failures (IMP-23, ADR-143)
+
+- `PASTURE_OTEL_LOG` wrote a span only on success: the buffered path propagated backend errors with
+  `?` and the streaming path's error arm wrote an SSE frame, both dropping the in-flight span. A
+  sustained cloud outage therefore left the trace log blank — the opposite of what tracing is for.
+  `Span` gains `status` (`"ok"`/`"error"`) and `error_message`; `to_jsonl()` emits the real status
+  plus a `pasture.error` attribute on failures. Both paths now fill and append an error span before
+  returning. 4 new tests. (ADR-143)
+
 ### Fixed — Authenticate before rate-limiting (IMP-15, ADR-142)
 
 - `check_gate` consumed a global rate-limit token *before* authenticating, so an unauthenticated
