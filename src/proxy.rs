@@ -359,6 +359,31 @@ impl Proxy {
         }
     }
 
+    /// Emit an OTel span for a cache hit (ADR-144). Without this, requests served
+    /// from the exact-match or semantic cache return before any span is started,
+    /// so the trace log shows zero cache traffic even though the schema documents
+    /// `pasture.route="cache"`. `gen_ai.system` is set to the route label (there is
+    /// no upstream provider for a cache hit). No-op when `PASTURE_OTEL_LOG` is unset.
+    fn emit_cache_hit_span(
+        &self,
+        span: &mut Option<crate::telemetry::Span>,
+        resp: &CompletionResponse,
+        route_label: &'static str,
+    ) {
+        if let (Some(span), Some(log_path)) = (span.as_mut(), self.otel_log.as_deref()) {
+            span.system = route_label.to_string();
+            span.response_model = resp.model.clone();
+            span.input_tokens = resp.prompt_tokens;
+            span.output_tokens = resp.completion_tokens;
+            span.route = route_label;
+            span.finish_reason = Some("stop".to_string());
+            span.finish();
+            if let Err(e) = span.append_to(log_path) {
+                eprintln!("pasture: otel log write failed: {e}");
+            }
+        }
+    }
+
     /// Set a secondary cloud backend for multi-provider fallback (IMP-9 follow-up).
     /// When the primary cloud provider fails all retries, this backend is tried
     /// before giving up to the local model. `None` keeps single-provider behaviour.
@@ -965,6 +990,14 @@ impl Proxy {
 
         let (decision, sensitive) = self.classify_and_decide(req)?;
 
+        // OTel span (IMP-23/ADR-144): start before the cache checks so a cache
+        // hit is traced too. Cache hits return early below, so the span must
+        // exist by now or the trace log would silently omit all cache traffic.
+        let mut otel_span = self
+            .otel_log
+            .as_deref()
+            .map(|_| crate::telemetry::Span::start("", &req.model));
+
         // Exact-match cache (never for sensitive content; I5).
         let cache_key = if !sensitive {
             Some(crate::cache::request_key(req))
@@ -974,6 +1007,7 @@ impl Proxy {
         if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
             if let Ok(mut guard) = cache.lock() {
                 if let Some(hit) = guard.get(key) {
+                    self.emit_cache_hit_span(&mut otel_span, &hit, "cache");
                     return Ok((hit, "cache", None));
                 }
             }
@@ -1004,6 +1038,7 @@ impl Proxy {
         {
             if let Ok(mut guard) = sem_mutex.lock() {
                 if let Some(hit) = guard.find_similar(emb) {
+                    self.emit_cache_hit_span(&mut otel_span, &hit, "semantic_cache");
                     return Ok((hit, "semantic_cache", None));
                 }
             }
@@ -1049,13 +1084,6 @@ impl Proxy {
             pseudo_mapping = None;
             req
         };
-
-        // OTel span (IMP-23): start before the completion call. system/route are
-        // set after completion, once the actual backend is known.
-        let mut otel_span = self
-            .otel_log
-            .as_deref()
-            .map(|_| crate::telemetry::Span::start("", &req.model));
 
         // Pick the completion strategy. Cascade (try local, escalate on low
         // confidence) is never used for sensitive content (privacy) or when

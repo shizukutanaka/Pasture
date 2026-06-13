@@ -1171,6 +1171,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-144 OTel spans for cache hits (IMP-23 fix).**
+  Following the error-span work, the next trace-log question: "the schema documents
+  `pasture.route="cache"` (telemetry.rs) — when is that span actually written?" Never. Both the
+  exact-match and semantic caches `return Ok((hit, "cache"/"semantic_cache", None))` *before* the
+  span was created, so an operator measuring cache hit-rate or latency through `PASTURE_OTEL_LOG`
+  saw zero cache traffic — the documented route value was unreachable. Fix: the span is now started
+  immediately after `classify_and_decide`, ahead of the cache lookups, and a new
+  `emit_cache_hit_span()` helper fills route/tokens/`gen_ai.system` (set to the route label, since a
+  cache hit has no upstream provider) and appends it before each early return. The duplicate
+  creation later in the backend path was removed. Zero new dependencies; 1 test (a cached request
+  emits a span with `pasture.route="cache"`, and both the miss and the hit are traced).
+
 - **ADR-143 OTel error spans (IMP-23 fix).**
   Probing the `PASTURE_OTEL_LOG` observability story: "what does an operator see when a cloud call
   fails?" — the answer was nothing. Both the buffered path (which uses `?` to propagate

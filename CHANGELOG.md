@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — OTel spans now emitted for cache hits (IMP-23, ADR-144)
+
+- The trace schema documents `pasture.route="cache"`, but cache hits returned before the span was
+  created, so `PASTURE_OTEL_LOG` showed zero cache traffic. The span is now started before the
+  cache lookups and a new `emit_cache_hit_span()` helper writes it on each early return, with
+  `gen_ai.system` set to the route label (no upstream provider for a cache hit). 1 new test. (ADR-144)
+
 ### Fixed — OTel spans now emitted on backend failures (IMP-23, ADR-143)
 
 - `PASTURE_OTEL_LOG` wrote a span only on success: the buffered path propagated backend errors with

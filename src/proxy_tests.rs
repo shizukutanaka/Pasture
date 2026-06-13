@@ -1784,6 +1784,42 @@ fn test_cache_hit_returns_cache_route() {
 }
 
 #[test]
+fn test_cache_hit_emits_otel_span() {
+    // ADR-144: a cache hit must produce an OTel span with pasture.route="cache".
+    // The telemetry schema documents the "cache" route, but cache hits used to
+    // return before the span was started, so the trace log showed zero cache
+    // traffic. The second (cached) request must add a span with route "cache".
+    let cost_log = tmp_log();
+    let otel = tmp_log();
+    let p = proxy_with(true, false, 100, &cost_log)
+        .with_cache(8)
+        .with_otel_log(Some(otel.clone()));
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let _ = p.handle_chat(body).unwrap(); // miss → local span
+    let _ = p.handle_chat(body).unwrap(); // hit → cache span
+    let content = std::fs::read_to_string(&otel).unwrap_or_default();
+    assert!(
+        content.contains("\"pasture.route\":\"cache\""),
+        "cache hit must emit a span with route=cache: {content:?}"
+    );
+    // Both spans present: the trace log has at least two lines (miss + hit).
+    assert!(
+        content.lines().filter(|l| l.contains("gen_ai.chat")).count() >= 2,
+        "both the miss and the cache hit must be traced: {content:?}"
+    );
+    let cache_line = content
+        .lines()
+        .find(|l| l.contains("\"pasture.route\":\"cache\""))
+        .unwrap_or("");
+    assert!(
+        crate::json::parse(cache_line).is_ok(),
+        "cache-hit span must be valid JSON: {cache_line}"
+    );
+    let _ = std::fs::remove_file(&cost_log);
+    let _ = std::fs::remove_file(&otel);
+}
+
+#[test]
 fn test_sensitive_not_cached() {
     let log = tmp_log();
     let p = proxy_with(true, false, 100, &log).with_cache(8);
