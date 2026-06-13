@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Streaming pseudonymization parity (IMP-19, ADR-137)
+
+- PII pseudonymization (`PASTURE_PSEUDONYMIZE=1`) was applied only on the buffered completion
+  path; **streaming** (`"stream":true`) cloud requests sent raw PII to the provider, silently
+  breaking the feature when combined with `PASTURE_ALLOW_SENSITIVE_CLOUD`. The streaming path
+  now masks PII before the request leaves the machine and restores tokens in the streamed
+  deltas. A new `pseudonymize::StreamRestorer` handles tokens split across SSE delta boundaries
+  (it never flushes a partial `<…` token and never drops a held tail). Zero new dependencies;
+  5 `StreamRestorer` unit tests + 2 proxy integration tests. (ADR-137)
+
 ### Added — Multi-provider cloud fallback chain (IMP-9 follow-up, ADR-136)
 
 - `PASTURE_CLOUD_FALLBACK_PROVIDER` (`openai` or `anthropic`) configures a secondary cloud

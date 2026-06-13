@@ -1755,6 +1755,28 @@ impl Proxy {
 
         write_sse_headers(sock, cors)?;
         let route_label = decision.route.as_str();
+
+        // Pseudonymization for streaming (IMP-19): mirror the buffered path —
+        // mask PII before the request reaches the cloud, and restore tokens in
+        // the streamed deltas. Without this, a streaming cloud request would
+        // leak raw PII even with PASTURE_PSEUDONYMIZE=1. The mapping is never
+        // logged (I5). Tokens split across deltas are handled by StreamRestorer.
+        let pseudo_req;
+        let mut restorer: Option<crate::pseudonymize::StreamRestorer> = None;
+        let req = if self.pseudonymize && decision.route == Route::Cloud {
+            let (msgs, mapping) = crate::pseudonymize::pseudonymize_messages(&req.messages);
+            if !mapping.is_empty() {
+                restorer = Some(crate::pseudonymize::StreamRestorer::new(mapping));
+            }
+            pseudo_req = CompletionRequest {
+                messages: msgs,
+                ..req.clone()
+            };
+            &pseudo_req
+        } else {
+            req
+        };
+
         // One id, model, and fingerprint shared by every chunk of this stream (OpenAI behaviour).
         let id = next_completion_id();
         let model = req.model.clone();
@@ -1764,11 +1786,20 @@ impl Proxy {
             if io_err.is_some() {
                 return;
             }
+            // Restore PII tokens incrementally; emit nothing if the restorer is
+            // still buffering a partial token at the delta boundary.
+            let piece = match restorer.as_mut() {
+                Some(r) => r.push(delta),
+                None => delta.to_string(),
+            };
+            if piece.is_empty() {
+                return;
+            }
             let frame = sse_frame(&build_openai_chunk(
                 &id,
                 &model,
                 &fp,
-                delta,
+                &piece,
                 route_label,
                 None,
             ));
@@ -1778,6 +1809,15 @@ impl Proxy {
         });
         if let Some(e) = io_err {
             return Err(e);
+        }
+        // Flush any buffered token tail held back across the final delta boundary.
+        if let Some(r) = restorer.as_mut() {
+            let tail = r.finish();
+            if !tail.is_empty() {
+                let frame =
+                    sse_frame(&build_openai_chunk(&id, &model, &fp, &tail, route_label, None));
+                sock.write_all(frame.as_bytes())?;
+            }
         }
         match resp {
             Ok(r) => {

@@ -105,7 +105,7 @@ Defaults are sensible; override via environment variables:
 | `PASTURE_SPIKE_FACTOR` | `50` | redirect a single request to local when it estimates more than N × the running average tokens (0 = disabled) |
 | `PASTURE_MAX_BODY_BYTES` | `16777216` | maximum request body size in bytes; bodies larger than this are rejected with 413 |
 | `PASTURE_CACHE_CONTROL` | _(off)_ | set to `1` to add `cache_control` hints on Anthropic system messages (prompt prefix caching); no-op for OpenAI |
-| `PASTURE_PSEUDONYMIZE` | _(off)_ | set to `1` to replace detected PII (email, IPv4, phone, API-key prefix) with stable opaque tokens in cloud-bound requests, then restore in the response; mapping never logged |
+| `PASTURE_PSEUDONYMIZE` | _(off)_ | set to `1` to replace detected PII (email, IPv4, phone, API-key prefix) with stable opaque tokens in cloud-bound requests, then restore in the response; applies to both buffered and streaming responses; mapping never logged |
 | `PASTURE_OTEL_LOG` | _(off)_ | path to a JSONL file for OpenTelemetry GenAI semantic convention trace records; appended per request; off when unset |
 | `PASTURE_CLOUD_FALLBACK_PROVIDER` | _(off)_ | secondary cloud provider tried when the primary fails all retries (`openai` or `anthropic`); off when unset |
 | `PASTURE_CLOUD_FALLBACK_MODEL` | _(same as primary)_ | model to use on the fallback provider; defaults to `PASTURE_CLOUD_MODEL` when empty |

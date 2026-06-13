@@ -2707,3 +2707,95 @@ fn test_cloud_fallback_none_still_falls_to_local() {
     assert_eq!(route, Route::Local);
     let _ = std::fs::remove_file(&log);
 }
+
+// ── IMP-19 streaming pseudonymization (Socratic-dialogue fix) ─────────────
+// Records the request content the backend actually receives, and echoes it
+// back as the completion so the response-side restore can be observed.
+struct RecordingEchoBackend {
+    seen: std::sync::Arc<std::sync::Mutex<String>>,
+}
+impl Backend for RecordingEchoBackend {
+    fn name(&self) -> &str {
+        "cloud"
+    }
+    fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
+        let text = req.routing_text();
+        *self.seen.lock().unwrap() = text.clone();
+        Ok(CompletionResponse {
+            content: text,
+            model: req.model.clone(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        })
+    }
+}
+
+#[test]
+fn test_streaming_masks_pii_before_cloud_and_restores() {
+    // Regression: a streaming cloud request with PASTURE_PSEUDONYMIZE must mask
+    // PII before it leaves the machine (request side) and restore it in the
+    // streamed deltas (response side) — matching the non-streaming path.
+    let log = tmp_log();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let engine = RoutingEngine::new(100, true, true).with_allow_sensitive_cloud(true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(RecordingEchoBackend { seen: seen.clone() })),
+        &log,
+    )
+    .with_pseudonymize(true);
+    // model "cloud" pins the cloud route; allow_sensitive_cloud lets the
+    // PII-bearing prompt reach it instead of being forced local.
+    let body = r#"{"model":"cloud","stream":true,"messages":[{"role":"user","content":"my email is alice@example.com please"}]}"#;
+    let (status, sse) = roundtrip(proxy, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+
+    // Request side: the backend must have received the masked token, never the
+    // real address.
+    let received = seen.lock().unwrap().clone();
+    assert!(
+        received.contains("<EMAIL_1>"),
+        "backend should receive masked token: {received}"
+    );
+    assert!(
+        !received.contains("alice@example.com"),
+        "raw PII must not reach the cloud backend: {received}"
+    );
+
+    // Response side: the streamed output must restore the original value and
+    // contain no leftover token.
+    assert!(
+        sse.contains("alice@example.com"),
+        "streamed response must restore PII: {sse}"
+    );
+    assert!(
+        !sse.contains("<EMAIL_1>"),
+        "no opaque token should remain in the streamed response: {sse}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_without_pseudonymize_sends_raw() {
+    // Control: with pseudonymize off, the request reaches the backend unchanged
+    // (confirms the masking above is attributable to the feature, not routing).
+    let log = tmp_log();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let engine = RoutingEngine::new(100, true, true).with_allow_sensitive_cloud(true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(RecordingEchoBackend { seen: seen.clone() })),
+        &log,
+    );
+    let body = r#"{"model":"cloud","stream":true,"messages":[{"role":"user","content":"my email is alice@example.com please"}]}"#;
+    let (status, _sse) = roundtrip(proxy, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    let received = seen.lock().unwrap().clone();
+    assert!(
+        received.contains("alice@example.com"),
+        "without pseudonymize the raw text is sent: {received}"
+    );
+    let _ = std::fs::remove_file(&log);
+}

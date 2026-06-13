@@ -1036,6 +1036,8 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   across messages in one request). The replacement mapping lives only in memory for the request
   lifetime and is never logged (privacy invariant I5). Uses the existing `privacy` module
   detectors — zero new pattern matching, zero new dependencies. 9 unit tests in the module.
+  *Initial scope covered the buffered (`/v1/chat/completions` non-stream) path only; the
+  streaming path was closed in ADR-137.*
 - **ADR-133 OTel GenAI trace log (IMP-23).**
   New module `src/telemetry.rs`: when `PASTURE_OTEL_LOG=<path>` is set, each completion
   appends one JSONL line in OpenTelemetry GenAI semantic convention format (OTel SemConv 1.28+:
@@ -1080,3 +1082,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   OpenAI primary) and `PASTURE_CLOUD_FALLBACK_MODEL` (defaults to the primary model). The API
   key for the fallback provider is its own env var (`PASTURE_ANTHROPIC_API_KEY` etc.) — no new
   secret management. Zero new dependencies; 4 unit tests.
+
+- **ADR-137 Streaming pseudonymization parity (IMP-19 fix).**
+  A Socratic review of IMP-19 (ADR-132) found that pseudonymization was wired into the
+  buffered completion path (`run_completion`) but **not** the streaming path
+  (`stream_chat_to_socket`). With `PASTURE_PSEUDONYMIZE=1` *and* `PASTURE_ALLOW_SENSITIVE_CLOUD`
+  set — the exact configuration IMP-19 exists to serve — a `"stream":true` cloud request sent
+  raw PII to the provider, silently breaking the feature's guarantee. The streaming path now
+  mirrors the buffered one: it masks `req.messages` before the request reaches the cloud
+  backend, and restores tokens in the streamed deltas. Restoration in a stream is non-trivial
+  because a token (`<EMAIL_1>`) can split across two SSE deltas; `pseudonymize::StreamRestorer`
+  buffers any trailing unterminated `<…` fragment and only emits it once the token completes or
+  the stream ends, guaranteeing a raw token is never flushed and no PII tail is dropped. A bare
+  `<` in ordinary output (e.g. `a < b`) is held until a `>` arrives or the stream finishes, then
+  flushed verbatim. Zero new dependencies; 5 `StreamRestorer` unit tests + 2 proxy integration
+  tests (one asserting the backend receives the masked token and the streamed output is
+  restored, one control asserting raw text flows when the feature is off).

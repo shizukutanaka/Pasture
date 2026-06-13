@@ -46,6 +46,50 @@ pub fn restore(text: &str, mapping: &[(String, String)]) -> String {
     out
 }
 
+/// Incrementally restores pseudonymized tokens in a streamed (SSE) response.
+///
+/// Tokens (`<EMAIL_1>`) can be split across two deltas — naively restoring each
+/// delta in isolation would miss the boundary case. The restorer buffers a
+/// trailing fragment that could be the start of a token (an unterminated `<…`)
+/// and only emits it once the token completes or the stream ends, guaranteeing
+/// no partial token is ever flushed un-restored.
+pub struct StreamRestorer {
+    mapping: Mapping,
+    pending: String,
+}
+
+impl StreamRestorer {
+    pub fn new(mapping: Mapping) -> Self {
+        Self {
+            mapping,
+            pending: String::new(),
+        }
+    }
+
+    /// Feed the next streamed delta; returns the portion that is now safe to
+    /// emit, with any complete tokens restored to their original values.
+    pub fn push(&mut self, delta: &str) -> String {
+        self.pending.push_str(delta);
+        // Hold back from the last '<' that has no closing '>' yet — it could be
+        // the prefix of a token still arriving (or a literal '<' that simply has
+        // no '>' yet; either way it flushes at finish()).
+        let split = match self.pending.rfind('<') {
+            Some(i) if !self.pending[i..].contains('>') => i,
+            _ => self.pending.len(),
+        };
+        let flushable = restore(&self.pending[..split], &self.mapping);
+        self.pending.drain(..split);
+        flushable
+    }
+
+    /// Flush any remaining buffered text once the stream has ended.
+    pub fn finish(&mut self) -> String {
+        let out = restore(&self.pending, &self.mapping);
+        self.pending.clear();
+        out
+    }
+}
+
 struct Ctx {
     mapping: Mapping,
     email_n: usize,
@@ -251,5 +295,65 @@ mod tests {
         let text = "hello world";
         let result = restore(text, &[]);
         assert_eq!(result, text);
+    }
+
+    fn email_mapping() -> Mapping {
+        vec![("alice@example.com".to_string(), "<EMAIL_1>".to_string())]
+    }
+
+    #[test]
+    fn test_stream_restorer_single_delta_complete_token() {
+        let mut r = StreamRestorer::new(email_mapping());
+        let out = r.push("contact <EMAIL_1> now");
+        let tail = r.finish();
+        assert_eq!(format!("{out}{tail}"), "contact alice@example.com now");
+    }
+
+    #[test]
+    fn test_stream_restorer_token_split_across_deltas() {
+        // The token <EMAIL_1> arrives in two pieces; it must still restore.
+        let mut r = StreamRestorer::new(email_mapping());
+        let a = r.push("see <EMA");
+        // Nothing past the dangling '<' may be emitted yet.
+        assert_eq!(a, "see ");
+        let b = r.push("IL_1> ok");
+        let tail = r.finish();
+        assert_eq!(
+            format!("{a}{b}{tail}"),
+            "see alice@example.com ok",
+            "split token must restore: a={a:?} b={b:?} tail={tail:?}"
+        );
+    }
+
+    #[test]
+    fn test_stream_restorer_literal_angle_bracket_flushes_at_end() {
+        // A bare '<' (e.g. code `a < b`) is held until the stream ends, then
+        // flushed verbatim — never lost, never mistaken for a token.
+        let mut r = StreamRestorer::new(email_mapping());
+        let a = r.push("if a < b");
+        let tail = r.finish();
+        assert_eq!(format!("{a}{tail}"), "if a < b");
+    }
+
+    #[test]
+    fn test_stream_restorer_passes_through_without_mapping() {
+        let mut r = StreamRestorer::new(Vec::new());
+        let a = r.push("plain text ");
+        let b = r.push("more text");
+        let tail = r.finish();
+        assert_eq!(format!("{a}{b}{tail}"), "plain text more text");
+    }
+
+    #[test]
+    fn test_stream_restorer_token_never_leaks_per_delta() {
+        // Feeding the token one byte at a time must never emit the raw token.
+        let mut r = StreamRestorer::new(email_mapping());
+        let mut out = String::new();
+        for ch in "x <EMAIL_1> y".chars() {
+            out.push_str(&r.push(&ch.to_string()));
+        }
+        out.push_str(&r.finish());
+        assert_eq!(out, "x alice@example.com y");
+        assert!(!out.contains("<EMAIL_1>"), "raw token must not survive: {out}");
     }
 }
