@@ -224,6 +224,10 @@ pub struct Proxy {
     /// retries (IMP-9 multi-provider follow-up). When set, a primary cloud failure
     /// attempts this backend before falling back to local. None = disabled.
     cloud_fallback: Option<Box<dyn Backend>>,
+    /// Incremental cache for `/metrics` and `/v1/stats` (IMP-32, ADR-151):
+    /// `(bytes_of_cost_log_consumed, running_summary)`. Each scrape folds only the
+    /// newly-appended complete lines instead of re-parsing the whole growing log.
+    metrics_cache: std::sync::Mutex<(u64, crate::cost::CostSummary)>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -289,6 +293,7 @@ impl Proxy {
             spike_factor: 50,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             cloud_fallback: None,
+            metrics_cache: std::sync::Mutex::new((0, crate::cost::summarize(&[]))),
         }
     }
 
@@ -1410,14 +1415,60 @@ impl Proxy {
         Ok(build_embeddings_response(&resp))
     }
 
+    /// Cost summary for the `/metrics` and `/v1/stats` endpoints, computed
+    /// incrementally (IMP-32, ADR-151). Each call folds only the cost-log lines
+    /// appended since the previous call into a cached running summary, instead of
+    /// re-reading and re-parsing the whole (unbounded-growing) log on every
+    /// Prometheus scrape. The result is byte-identical to `summarize(read_log())`.
+    /// A shrunk file (rotation/truncation) resets the cache and re-reads in full.
+    /// Only complete lines (ending in `\n`) are consumed, so a scrape that races a
+    /// half-written record simply folds it on the next call.
+    fn live_cost_summary(&self) -> Result<crate::cost::CostSummary, ProxyError> {
+        use std::io::{Seek, SeekFrom};
+        let mut guard = self
+            .metrics_cache
+            .lock()
+            .map_err(|_| ProxyError::Backend("metrics cache poisoned".to_string()))?;
+        let cur_len = match std::fs::metadata(&self.cost_log_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(ProxyError::Backend(e.to_string())),
+        };
+        // File shrank (rotated/truncated): the cached summary no longer corresponds
+        // to the file prefix, so reset and rebuild from the start.
+        if cur_len < guard.0 {
+            *guard = (0, crate::cost::summarize(&[]));
+        }
+        if cur_len > guard.0 {
+            if let Ok(mut f) = std::fs::File::open(&self.cost_log_path) {
+                if f.seek(SeekFrom::Start(guard.0)).is_ok() {
+                    let mut buf = Vec::new();
+                    if f.read_to_end(&mut buf).is_ok() {
+                        // Consume only up to the last newline; a trailing partial
+                        // line is left for the next call (re-read once complete).
+                        let consumed = buf.iter().rposition(|&b| b == b'\n').map(|i| i + 1);
+                        if let Some(end) = consumed {
+                            let text = String::from_utf8_lossy(&buf[..end]);
+                            for line in text.lines() {
+                                if let Some(rec) = crate::cost::parse_log_line(line) {
+                                    crate::cost::fold_record(&mut guard.1, &rec);
+                                }
+                            }
+                            guard.0 += end as u64;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(guard.1.clone())
+    }
+
     /// Handle `GET /v1/stats` (IMP-metrics): a live JSON view of the cost-log
     /// counters (route counts, rates, tokens, spend) without parsing JSONL by
     /// hand. Read-only over the PII-free cost log (I3); a missing log reads as
     /// all-zeros. Localhost-default, so no auth is implied (I5).
     pub fn handle_stats(&self) -> Result<String, ProxyError> {
-        let records = crate::cost::read_log(&self.cost_log_path)
-            .map_err(|e| ProxyError::Backend(e.to_string()))?;
-        let summary = crate::cost::summarize(&records);
+        let summary = self.live_cost_summary()?;
         // Live hit/miss counters + size/capacity from the in-memory caches.
         let (live_hits, live_misses, cache_size, cache_cap) = self
             .cache
@@ -1448,9 +1499,7 @@ impl Proxy {
     /// Exposes the same counters as `/v1/stats` but in the standard text format
     /// consumed by Prometheus scrape targets and Grafana agent.
     pub fn handle_metrics(&self) -> Result<String, ProxyError> {
-        let records = crate::cost::read_log(&self.cost_log_path)
-            .map_err(|e| ProxyError::Backend(e.to_string()))?;
-        let s = crate::cost::summarize(&records);
+        let s = self.live_cost_summary()?;
         let (live_hits, live_misses, cache_size, cache_cap) = self
             .cache
             .as_ref()

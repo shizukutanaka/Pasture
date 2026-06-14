@@ -233,9 +233,29 @@ pub fn logprob_summary(records: &[LoggedRecord]) -> Option<LogprobStats> {
     })
 }
 
+/// Fold one record into a running summary (route counts, tokens, spend). Shared
+/// by `summarize` (whole-slice) and the proxy's incremental metrics cache (IMP-32,
+/// ADR-151) so both produce identical aggregates.
+pub fn fold_record(s: &mut CostSummary, r: &LoggedRecord) {
+    s.total += 1;
+    match r.route.as_str() {
+        "local" => s.local += 1,
+        "cloud" => s.cloud += 1,
+        "cache" => s.cache += 1,
+        _ => {}
+    }
+    s.prompt_tokens += r.prompt_tokens;
+    s.completion_tokens += r.completion_tokens;
+    // Ignore non-finite costs (corrupt log line) so one bad record cannot
+    // turn the whole spend total into NaN/inf.
+    if r.cost_usd.is_finite() {
+        s.cloud_cost_usd += r.cost_usd;
+    }
+}
+
 pub fn summarize(records: &[LoggedRecord]) -> CostSummary {
     let mut s = CostSummary {
-        total: records.len() as u64,
+        total: 0,
         local: 0,
         cloud: 0,
         cache: 0,
@@ -244,19 +264,7 @@ pub fn summarize(records: &[LoggedRecord]) -> CostSummary {
         cloud_cost_usd: 0.0,
     };
     for r in records {
-        match r.route.as_str() {
-            "local" => s.local += 1,
-            "cloud" => s.cloud += 1,
-            "cache" => s.cache += 1,
-            _ => {}
-        }
-        s.prompt_tokens += r.prompt_tokens;
-        s.completion_tokens += r.completion_tokens;
-        // Ignore non-finite costs (corrupt log line) so one bad record cannot
-        // turn the whole spend total into NaN/inf.
-        if r.cost_usd.is_finite() {
-            s.cloud_cost_usd += r.cost_usd;
-        }
+        fold_record(&mut s, r);
     }
     s
 }

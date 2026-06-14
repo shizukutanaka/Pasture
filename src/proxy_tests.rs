@@ -747,6 +747,68 @@ fn test_handle_stats_counts_logged_requests() {
 }
 
 #[test]
+fn test_stats_incremental_matches_full_reread() {
+    // ADR-151: the incrementally-cached summary must equal a fresh full re-read
+    // after each append, across multiple scrapes (only new lines are folded).
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log);
+    let append = |route: &'static str, pt: u64, ct: u64| {
+        crate::cost::CostRecord::new(route, "m", pt, ct, 0.0)
+            .append_to(&log)
+            .unwrap();
+    };
+    append("local", 10, 5);
+    append("cloud", 20, 8);
+    let v1 = crate::json::parse(&p.handle_stats().unwrap()).unwrap();
+    assert_eq!(v1.get("total").and_then(|x| x.as_f64()), Some(2.0));
+    assert_eq!(v1.get("cloud").and_then(|x| x.as_f64()), Some(1.0));
+    // Append more, scrape again — must fold the new lines on top of the cache.
+    append("cache", 0, 0);
+    append("cloud", 1, 1);
+    let v2 = crate::json::parse(&p.handle_stats().unwrap()).unwrap();
+    // Compare every field to a fresh full re-read of the same log.
+    let full = crate::cost::summarize(&crate::cost::read_log(&log).unwrap()).to_json();
+    let vf = crate::json::parse(&full).unwrap();
+    for key in ["total", "local", "cloud", "cache", "prompt_tokens", "completion_tokens"] {
+        assert_eq!(
+            v2.get(key).and_then(|x| x.as_f64()),
+            vf.get(key).and_then(|x| x.as_f64()),
+            "incremental {key} must equal full re-read"
+        );
+    }
+    assert_eq!(v2.get("total").and_then(|x| x.as_f64()), Some(4.0));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_stats_resets_on_log_truncation() {
+    // ADR-151: if the cost log shrinks (rotation/truncation), the cache must reset
+    // and reflect only the new content rather than stale counts.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log);
+    for _ in 0..3 {
+        crate::cost::CostRecord::new("cloud", "m", 5, 5, 0.0)
+            .append_to(&log)
+            .unwrap();
+    }
+    let s1 = crate::json::parse(&p.handle_stats().unwrap()).unwrap();
+    assert_eq!(s1.get("total").and_then(|x| x.as_f64()), Some(3.0));
+    // Truncate the log and write a single new record.
+    std::fs::write(&log, "").unwrap();
+    crate::cost::CostRecord::new("local", "m", 1, 1, 0.0)
+        .append_to(&log)
+        .unwrap();
+    let s2 = crate::json::parse(&p.handle_stats().unwrap()).unwrap();
+    assert_eq!(
+        s2.get("total").and_then(|x| x.as_f64()),
+        Some(1.0),
+        "summary must reset after truncation"
+    );
+    assert_eq!(s2.get("local").and_then(|x| x.as_f64()), Some(1.0));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_parse_request_extracts_sampling() {
     let body = r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0.2,"max_tokens":100,"stop":["\n\n"],"seed":7}"#;
     let req = Proxy::parse_request(body).unwrap();

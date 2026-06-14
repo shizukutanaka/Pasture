@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Changed — `/metrics` and `/v1/stats` compute the cost summary incrementally (IMP-32, ADR-151)
+
+- Both endpoints re-read and re-parsed the entire (unbounded-growing) cost log on every request, so
+  a Prometheus scrape every few seconds became an O(log-size) operation. They now fold only the lines
+  appended since the previous call into a cached running summary; output is byte-identical to the full
+  re-read, and a truncated/rotated log resets the cache. The `pasture stats` CLI still reads in full.
+  2 new tests. (ADR-151)
+
 ### Added — Streaming requests now use the semantic cache and difficulty signal (IMP-12/IMP-14, ADR-150)
 
 - The semantic cache (IMP-12) and the embedding difficulty-escalation signal (IMP-14) previously

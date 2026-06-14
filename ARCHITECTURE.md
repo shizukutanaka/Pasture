@@ -1171,6 +1171,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-151 Incremental cost summary for `/metrics` and `/v1/stats` (IMP-32).**
+  Socratic probe of the observability endpoints' cost: "`/metrics` is built for Prometheus to scrape
+  every few seconds — what does each scrape do?" It called `read_log()` + `summarize()`, re-reading
+  and re-parsing the *entire* cost log every time. The cost log grows by one line per request and is
+  never rotated, so on a long-running server each scrape became an O(log-size) operation that grew
+  without bound — exactly the workload Prometheus hits hardest. The aggregation was made incremental:
+  a `Mutex<(bytes_consumed, CostSummary)>` cache folds only the lines appended since the previous
+  scrape (via the extracted `cost::fold_record`), seeking past the bytes already counted and
+  consuming only complete `\n`-terminated lines (a half-written record is folded on the next call).
+  A shrunk file (rotation/truncation) resets the cache and rebuilds. Output is byte-identical to the
+  full re-read (proven by a test comparing every field). The `pasture stats` CLI (a one-shot, not a
+  hot path) still reads the whole log. Zero new dependencies; 2 tests (incremental equals full
+  re-read across appends; truncation resets the cache).
+
 - **ADR-150 Streaming embedding parity: semantic cache + difficulty signal.**
   Completing the buffered/streaming parity arc: the buffered path computes a query embedding once
   and uses it for both the semantic cache (IMP-12) and the difficulty escalation signal (IMP-14),
