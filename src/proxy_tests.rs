@@ -2920,6 +2920,51 @@ impl Backend for RecordingEchoBackend {
 }
 
 #[test]
+fn test_streaming_applies_system_prompt() {
+    // ADR-149: a stream:true request must receive the configured system prompt,
+    // exactly like a buffered one — the streaming path previously skipped framing.
+    let log = tmp_log();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let engine = RoutingEngine::new(100, true, false); // short prompt → local
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(RecordingEchoBackend { seen: seen.clone() })),
+        None,
+        &log,
+    )
+    .with_system_prompt(Some("BE BRIEF AND PRECISE".to_string()));
+    let body = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, _sse) = roundtrip(proxy, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    let received = seen.lock().unwrap().clone();
+    assert!(
+        received.contains("BE BRIEF AND PRECISE"),
+        "streaming backend must receive the configured system prompt: {received}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_without_system_prompt_sends_only_user_text() {
+    // Control: with no system prompt configured, the streaming backend sees only
+    // the user text (confirms the framing above is attributable to the feature).
+    let log = tmp_log();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let engine = RoutingEngine::new(100, true, false);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(RecordingEchoBackend { seen: seen.clone() })),
+        None,
+        &log,
+    );
+    let body = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, _sse) = roundtrip(proxy, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    assert_eq!(seen.lock().unwrap().trim(), "hi", "no framing expected");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_streaming_masks_pii_before_cloud_and_restores() {
     // Regression: a streaming cloud request with PASTURE_PSEUDONYMIZE must mask
     // PII before it leaves the machine (request side) and restore it in the

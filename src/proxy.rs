@@ -867,6 +867,24 @@ impl Proxy {
         Ok((decision, sensitive))
     }
 
+    /// Apply the configured prompt framing to a request: the user-defined system
+    /// prompt first (outermost frame), then the optional date/OS context message.
+    /// Returns `None` when neither is configured, so the caller keeps the original
+    /// borrow without a clone. Shared by the buffered (`run_completion`) and
+    /// streaming (`stream_chat_to_socket`) paths so a `stream:true` request gets
+    /// the same system prompt and context as a buffered one (ADR-149).
+    fn frame_request(&self, req: &CompletionRequest) -> Option<CompletionRequest> {
+        let mut framed: Option<CompletionRequest> = None;
+        if let Some(sp) = &self.system_prompt {
+            framed = Some(prepend_system_prompt(req, sp));
+        }
+        if self.inject_context {
+            let base = framed.as_ref().unwrap_or(req);
+            framed = Some(inject_context_into(base));
+        }
+        framed
+    }
+
     fn backend_for(&self, route: Route) -> Result<&dyn Backend, ProxyError> {
         match route {
             Route::Local => self.local.as_deref(),
@@ -1012,22 +1030,9 @@ impl Proxy {
         &self,
         req: &CompletionRequest,
     ) -> Result<(CompletionResponse, &'static str, Option<f64>), ProxyError> {
-        // Apply user-defined system prompt first (outermost frame), then date/OS.
-        let with_sys;
-        let req = if let Some(sp) = &self.system_prompt {
-            with_sys = prepend_system_prompt(req, sp);
-            &with_sys
-        } else {
-            req
-        };
-        // Optionally prepend a system message so local models know the current date/OS.
-        let injected;
-        let req = if self.inject_context {
-            injected = inject_context_into(req);
-            &injected
-        } else {
-            req
-        };
+        // Apply the configured prompt framing (system prompt, then date/OS context).
+        let framed = self.frame_request(req);
+        let req = framed.as_ref().unwrap_or(req);
 
         let (decision, sensitive) = self.classify_and_decide(req)?;
 
@@ -1896,6 +1901,12 @@ impl Proxy {
                 eprintln!("pasture: injection_flag:{label} (flag mode, stream proceeds)");
             }
         }
+        // Apply the configured prompt framing (system prompt, then date/OS context)
+        // so a stream:true request behaves like a buffered one (ADR-149). Done after
+        // the injection guard (which scans the original request, as the buffered
+        // path does) and before classify_and_decide so framing also feeds routing.
+        let framed = self.frame_request(req);
+        let req = framed.as_ref().unwrap_or(req);
         let (decision, sensitive) = match self.classify_and_decide(req) {
             Ok(pair) => pair,
             Err(e) => {

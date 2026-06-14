@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Streaming requests now get the system prompt and context (ADR-149)
+
+- The streaming path skipped the configured `PASTURE_SYSTEM_PROMPT` and the date/OS context message
+  that the buffered path applies, so a `stream:true` request behaved differently and could even route
+  differently (framing feeds routing). Both paths now share a `frame_request()` helper, applied in
+  streaming after the injection guard and before routing. 2 new tests. (ADR-149)
+
 ### Fixed — IPv6 addresses now detected as sensitive (IMP-3, ADR-148)
 
 - The privacy classifier flagged IPv4 addresses but not IPv6, so a prompt containing an address like

@@ -1171,6 +1171,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-149 Prompt framing parity for streaming (system prompt + context).**
+  Another instance of the buffered-only-feature bug class: `run_completion` (buffered) prepended the
+  configured `PASTURE_SYSTEM_PROMPT` and the optional date/OS context message, but
+  `stream_chat_to_socket` did neither — so a `stream:true` request silently lost the user's system
+  prompt and grounding, and (because framing feeds `routing_text`) could even route differently than
+  the same request buffered. The two framing steps were extracted into a shared `frame_request()`
+  helper (system prompt first as the outer frame, then context; returns `None` when neither is
+  configured so the caller keeps the borrow without a clone). Both paths now call it — buffered
+  inside `run_completion`, streaming after the injection guard and before `classify_and_decide`,
+  matching the buffered order (guard scans the original request; framing then feeds routing and the
+  backend). Sharing one helper makes the two paths structurally unable to drift again. Zero new
+  dependencies; 2 tests (streaming backend receives the system prompt; control sees only user text).
+
 - **ADR-148 Detect IPv6 addresses as sensitive (IMP-3 fix).**
   Socratic probe of the privacy detector's coverage: "you flag IPv4 as sensitive and force it local —
   what about IPv6?" Nothing: `classify` only called `looks_like_ipv4` (exactly four dot-separated
