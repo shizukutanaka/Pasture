@@ -1171,6 +1171,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-148 Detect IPv6 addresses as sensitive (IMP-3 fix).**
+  Socratic probe of the privacy detector's coverage: "you flag IPv4 as sensitive and force it local —
+  what about IPv6?" Nothing: `classify` only called `looks_like_ipv4` (exactly four dot-separated
+  octets), so a prompt containing `2001:db8::1` was classified non-sensitive and could be sent to the
+  cloud. SPEC's stated bias is that a false negative (data leak) is unacceptable while a false
+  positive (stays local) is cheap, so the gap is on the wrong side. New `looks_like_ipv6()` parses a
+  punctuation-trimmed whitespace token with std's `Ipv6Addr` parser behind a `>= 2` colon pre-check
+  (so clock times like `10:30:45` and ranges like `a:b` never reach the parser, and any non-hex
+  character fails it — near-zero false positives). IPv6 joins IPv4 under the shared `"ip"` category
+  and the same force-local treatment. Zero new dependencies (std-only); 2 tests (valid IPv6 forms
+  incl. `::1`, bracketed `[…]`, and full 8-group detected; times/ranges/code/URLs not).
+
 - **ADR-147 Streaming exact-match cache parity (IMP-31b).**
   The session's dominant bug class is "feature added to the buffered path, missing on the streaming
   path." Socratic probe: "the exact-match cache serves buffered requests — what does a `stream:true`

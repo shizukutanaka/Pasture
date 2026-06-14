@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — IPv6 addresses now detected as sensitive (IMP-3, ADR-148)
+
+- The privacy classifier flagged IPv4 addresses but not IPv6, so a prompt containing an address like
+  `2001:db8::1` was classified non-sensitive and could be routed to the cloud. `looks_like_ipv6()`
+  now parses punctuation-trimmed tokens with std's `Ipv6Addr` behind a two-colon pre-check (so clock
+  times and code tokens are not false positives); IPv6 shares the `"ip"` category and force-local
+  treatment with IPv4. Std-only, no new deps. 2 new tests. (ADR-148)
+
 ### Added — Streaming requests now use the exact-match cache (IMP-31b, ADR-147)
 
 - The exact-match cache previously served only buffered requests; a `stream:true` request always

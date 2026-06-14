@@ -138,7 +138,7 @@ pub fn classify(text: &str) -> SensitivityReport {
     if text.split_whitespace().any(looks_like_email) {
         categories.push("email");
     }
-    if text.split_whitespace().any(looks_like_ipv4) {
+    if text.split_whitespace().any(|t| looks_like_ipv4(t) || looks_like_ipv6(t)) {
         categories.push("ip");
     }
     if contains_credit_card(text) {
@@ -256,6 +256,24 @@ pub fn looks_like_ipv4(token: &str) -> bool {
     parts.iter().all(|p| {
         !p.is_empty() && p.len() <= 3 && p.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
     })
+}
+
+/// Heuristic IPv6: a whitespace token that parses as a valid IPv6 address after
+/// trimming wrapping punctuation (e.g. the brackets in a `[2001:db8::1]` URL
+/// authority). Delegates the hard part to the std parser, so false positives on
+/// ordinary text or code are near-zero: the `>= 2` colon pre-check rejects times
+/// and ranges (`10:30`, `a:b`) before the parser ever sees them, and any token
+/// containing a non-hex, non-colon character fails to parse. IPv6 addresses
+/// identify a host exactly as IPv4 does, so they share the `"ip"` category and
+/// the same force-local treatment.
+pub fn looks_like_ipv6(token: &str) -> bool {
+    let t = token.trim_matches(|c: char| !(c.is_ascii_hexdigit() || c == ':'));
+    // Require at least two colons so a bare `h:m` time or `a:b` range never
+    // reaches the parser (a valid IPv6 address always has two or more).
+    if t.matches(':').count() < 2 {
+        return false;
+    }
+    t.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
 /// Heuristic phone number. Matches international `+` form (8..=15 digits) and
@@ -457,6 +475,37 @@ mod tests {
     fn test_ipv4_negative() {
         assert!(!looks_like_ipv4("999.1.1.1"));
         assert!(!looks_like_ipv4("1.2.3"));
+    }
+
+    #[test]
+    fn test_ipv6_detected() {
+        // ADR-148: IPv6 addresses identify a host like IPv4 and must route local.
+        assert!(looks_like_ipv6("2001:db8::1"));
+        assert!(looks_like_ipv6("fe80::1"));
+        assert!(looks_like_ipv6("::1"));
+        assert!(looks_like_ipv6(
+            "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
+        ));
+        // Wrapped in URL-authority brackets and trailing punctuation.
+        assert!(looks_like_ipv6("[2001:db8::1]"));
+        assert!(looks_like_ipv6("2001:db8::1,"));
+        // classify() must surface it under the shared "ip" category.
+        assert!(classify("server at 2001:db8::1 is down")
+            .categories
+            .contains(&"ip"));
+    }
+
+    #[test]
+    fn test_ipv6_negative_no_false_positives() {
+        // Times, ranges, and code tokens must not be mistaken for IPv6.
+        assert!(!looks_like_ipv6("10:30"));
+        assert!(!looks_like_ipv6("10:30:45")); // a clock time, not an address
+        assert!(!looks_like_ipv6("a:b"));
+        assert!(!looks_like_ipv6("std::vector"));
+        assert!(!looks_like_ipv6("https://example.com"));
+        assert!(!looks_like_ipv6("not-an-address"));
+        // A plain English sentence stays non-sensitive.
+        assert!(!classify("the meeting is at 10:30 today").is_sensitive());
     }
 
     #[test]
