@@ -1972,6 +1972,86 @@ fn test_streaming_cache_disabled_always_calls_backend() {
     let _ = std::fs::remove_file(&log);
 }
 
+// ── ADR-150 streaming embedding parity (semantic cache + difficulty) ─────────
+
+#[test]
+fn test_streaming_difficulty_signal_escalates() {
+    // ADR-150: the difficulty signal (IMP-14) must apply to streaming too. With
+    // MockBackend embeddings all parallel (cosine 1.0 to any centroid), a short
+    // prompt that would stay local escalates to cloud on the stream path.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 100, &log)
+        .with_hard_prompts(vec!["a prompt my local model fumbles".to_string()], 0.9);
+    let body = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, sse) = roundtrip(p, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    assert!(
+        sse.contains("\"x_pasture_route\":\"cloud\""),
+        "streaming difficulty signal must escalate to cloud: {sse}"
+    );
+    assert!(sse.contains("cloud-reply"), "{sse}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_served_from_semantic_cache() {
+    // ADR-150: a stream:true request must be served from the semantic cache. A
+    // buffered request warms it; MockBackend embeddings are all parallel, so a
+    // differently-worded streamed request hits at threshold 0.5.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_semantic_cache(8, 0.5);
+    let _ = p
+        .handle_chat(r#"{"model":"m","messages":[{"role":"user","content":"first prompt"}]}"#)
+        .unwrap();
+    let stream = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"different words entirely"}]}"#;
+    let (status, sse) = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    assert_eq!(status, 200);
+    assert!(
+        sse.contains("\"x_pasture_route\":\"semantic_cache\""),
+        "stream must be served from the semantic cache: {sse}"
+    );
+    assert!(sse.contains("local-reply"), "cached content replayed: {sse}");
+    assert!(sse.contains("data: [DONE]"), "{sse}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_miss_populates_semantic_cache() {
+    // ADR-150 write parity: a stream:true miss must store into the semantic cache
+    // so a later (buffered) request is served from it.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_semantic_cache(8, 0.5);
+    let stream = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"abc"}]}"#;
+    let (s1, _sse1) = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    assert_eq!(s1, 200);
+    let resp = p
+        .handle_chat(r#"{"model":"m","messages":[{"role":"user","content":"xyz"}]}"#)
+        .unwrap();
+    assert!(
+        resp.contains("\"x_pasture_route\":\"semantic_cache\""),
+        "buffered request must hit the stream-populated semantic cache: {resp}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_sensitive_skips_semantic_cache() {
+    // I5: a sensitive prompt must not be stored in the semantic cache by the
+    // stream path (no embedding is computed), so a later request stays a miss.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_semantic_cache(8, 0.5);
+    let stream = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"my password is hunter2"}]}"#;
+    let _ = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    let resp = p
+        .handle_chat(r#"{"model":"m","messages":[{"role":"user","content":"unrelated query text"}]}"#)
+        .unwrap();
+    assert!(
+        !resp.contains("\"x_pasture_route\":\"semantic_cache\""),
+        "sensitive stream must not populate the semantic cache: {resp}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 #[test]
 fn test_sensitive_not_cached() {
     let log = tmp_log();

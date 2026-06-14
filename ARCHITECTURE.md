@@ -1171,6 +1171,23 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-150 Streaming embedding parity: semantic cache + difficulty signal.**
+  Completing the buffered/streaming parity arc: the buffered path computes a query embedding once
+  and uses it for both the semantic cache (IMP-12) and the difficulty escalation signal (IMP-14),
+  but `stream_chat_to_socket` computed no embedding, so a `stream:true` request silently lost both —
+  identical prompts re-ran the backend and a near-known-hard prompt was never pre-escalated. The
+  embedding computation, semantic-cache lookup, and difficulty escalation were extracted into a
+  shared `embedding_step()` returning `EmbeddingStep::{SemanticHit, Proceed{route, embedding}}`; the
+  SSE cache-hit replay was extracted into `write_cached_stream()` (now used by both the exact-match
+  and semantic hit paths). `run_completion` was refactored onto the helper with byte-identical
+  behaviour (577 tests unchanged), and the streaming path now: starts the OTel span before the cache
+  checks, serves exact then semantic hits via the shared replay, applies the difficulty escalation
+  to the route before the budget guard, and stores the restored content into both caches on a miss.
+  Both paths share one code path, so they cannot drift. All embedding features remain opt-in and
+  sensitive content never reaches them (I5). Zero new dependencies; 4 tests (streaming difficulty
+  escalation; streamed semantic hit after buffered warm; streamed miss populates the semantic cache;
+  sensitive stream skips it).
+
 - **ADR-149 Prompt framing parity for streaming (system prompt + context).**
   Another instance of the buffered-only-feature bug class: `run_completion` (buffered) prepended the
   configured `PASTURE_SYSTEM_PROMPT` and the optional date/OS context message, but

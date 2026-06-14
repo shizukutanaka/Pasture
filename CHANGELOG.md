@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Streaming requests now use the semantic cache and difficulty signal (IMP-12/IMP-14, ADR-150)
+
+- The semantic cache (IMP-12) and the embedding difficulty-escalation signal (IMP-14) previously
+  applied only to buffered requests; a `stream:true` request computed no query embedding, so it
+  re-ran the backend on a semantic match and was never pre-escalated near a known-hard prompt. Both
+  paths now share an `embedding_step()` helper: streaming serves semantic hits as SSE, escalates the
+  route before the budget guard, and stores restored content into both caches on a miss. All
+  embedding features stay opt-in; sensitive content never reaches them (I5). 4 new tests. (ADR-150)
+
 ### Fixed — Streaming requests now get the system prompt and context (ADR-149)
 
 - The streaming path skipped the configured `PASTURE_SYSTEM_PROMPT` and the date/OS context message

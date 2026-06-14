@@ -229,6 +229,21 @@ pub struct Proxy {
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
 const CLOUD_RETRY_BASE_MS: u64 = 200;
 
+/// Outcome of the embedding-based routing step — the semantic cache (IMP-12) and
+/// the difficulty signal (IMP-14), shared by the buffered and streaming paths so
+/// they cannot drift (ADR-150).
+enum EmbeddingStep {
+    /// A semantic-cache hit: serve this response, skipping the backend.
+    SemanticHit(CompletionResponse),
+    /// Proceed to completion with this (possibly difficulty-escalated) route. The
+    /// query embedding, when computed, is returned so the caller can store the
+    /// completed response in the semantic cache on a miss.
+    Proceed {
+        route: Route,
+        embedding: Option<Vec<f64>>,
+    },
+}
+
 impl Proxy {
     pub fn new(
         engine: RoutingEngine,
@@ -885,6 +900,99 @@ impl Proxy {
         framed
     }
 
+    /// Compute the query embedding once and apply the semantic cache (IMP-12) and
+    /// difficulty signal (IMP-14). Returns `SemanticHit` to serve a cached answer,
+    /// or `Proceed` with the (possibly escalated) route and the embedding for a
+    /// later store-on-miss. Never computed for sensitive content (I5); embeddings
+    /// use the local backend and stay on the machine. On a semantic hit a cache
+    /// span is emitted into `otel_span` (ADR-144). Shared by the buffered and
+    /// streaming paths (ADR-150).
+    fn embedding_step(
+        &self,
+        req: &CompletionRequest,
+        route: Route,
+        sensitive: bool,
+        otel_span: &mut Option<crate::telemetry::Span>,
+    ) -> EmbeddingStep {
+        let want_difficulty =
+            !self.hard_prompts.is_empty() && route == Route::Local && self.cloud.is_some();
+        let query_embedding: Option<Vec<f64>> =
+            if !sensitive && (self.semantic_cache.is_some() || want_difficulty) {
+                self.local.as_deref().and_then(|local| {
+                    let text = semantic_embed_text(req);
+                    local
+                        .embeddings(&[text])
+                        .ok()
+                        .and_then(|r| r.vectors.into_iter().next())
+                })
+            } else {
+                None
+            };
+        if let (Some(emb), Some(sem_mutex)) =
+            (query_embedding.as_ref(), self.semantic_cache.as_ref())
+        {
+            if let Ok(mut guard) = sem_mutex.lock() {
+                if let Some(hit) = guard.find_similar(emb) {
+                    self.emit_cache_hit_span(otel_span, &hit, "semantic_cache");
+                    return EmbeddingStep::SemanticHit(hit);
+                }
+            }
+        }
+        let mut planned_route = route;
+        if want_difficulty {
+            if let Some(emb) = query_embedding.as_ref() {
+                if let Some(sim) = self.similar_to_hard(emb) {
+                    eprintln!("pasture: prompt similar to known-hard set (cos {sim:.2}) -> cloud");
+                    planned_route = Route::Cloud;
+                }
+            }
+        }
+        EmbeddingStep::Proceed {
+            route: planned_route,
+            embedding: query_embedding,
+        }
+    }
+
+    /// Replay a cached response to the socket as a complete SSE stream
+    /// (ADR-147/150): headers, the content as one delta, the stop chunk, an
+    /// optional usage chunk, then `[DONE]`. Records a free cost entry. The caller
+    /// emits the OTel cache-hit span. `route_label` is `"cache"` or
+    /// `"semantic_cache"`. The reported model is the cached response's model, as
+    /// the buffered cache path does.
+    fn write_cached_stream(
+        &self,
+        sock: &mut std::net::TcpStream,
+        cors: &str,
+        hit: &CompletionResponse,
+        route_label: &'static str,
+        include_usage: bool,
+    ) -> std::io::Result<()> {
+        write_sse_headers(sock, cors)?;
+        let id = next_completion_id();
+        let model = hit.model.clone();
+        let fp = fingerprint_for_model(&model);
+        if !hit.content.is_empty() {
+            let frame =
+                sse_frame(&build_openai_chunk(&id, &model, &fp, &hit.content, route_label, None));
+            sock.write_all(frame.as_bytes())?;
+        }
+        self.log_cost(route_label, hit, None);
+        let stop = sse_frame(&build_openai_chunk(&id, &model, &fp, "", route_label, Some("stop")));
+        sock.write_all(stop.as_bytes())?;
+        if include_usage {
+            let usage = sse_frame(&build_openai_usage_chunk(
+                &id,
+                &model,
+                &fp,
+                route_label,
+                hit.prompt_tokens,
+                hit.completion_tokens,
+            ));
+            sock.write_all(usage.as_bytes())?;
+        }
+        sock.write_all(b"data: [DONE]\n\n")
+    }
+
     fn backend_for(&self, route: Route) -> Result<&dyn Backend, ProxyError> {
         match route {
             Route::Local => self.local.as_deref(),
@@ -1059,51 +1167,14 @@ impl Proxy {
             }
         }
 
-        // Query embedding, computed at most once and shared by the semantic
-        // cache (IMP-12) and the difficulty signal (IMP-14). Uses the local
-        // backend's /v1/embeddings — privacy-first (embeddings stay on machine).
-        // Silently skipped when local is absent or the call fails (degrades to
-        // the deterministic path). Never computed for sensitive content (I5).
-        let want_difficulty = !self.hard_prompts.is_empty()
-            && decision.route == Route::Local
-            && self.cloud.is_some();
-        let query_embedding: Option<Vec<f64>> =
-            if !sensitive && (self.semantic_cache.is_some() || want_difficulty) {
-                self.local.as_deref().and_then(|local| {
-                    let text = semantic_embed_text(req);
-                    local
-                        .embeddings(&[text])
-                        .ok()
-                        .and_then(|r| r.vectors.into_iter().next())
-                })
-            } else {
-                None
+        // Semantic cache (IMP-12) + difficulty signal (IMP-14), via the shared
+        // embedding step (ADR-150). Returns a cached answer or the route to use
+        // (possibly escalated) plus the query embedding for store-on-miss.
+        let (planned_route, query_embedding) =
+            match self.embedding_step(req, decision.route, sensitive, &mut otel_span) {
+                EmbeddingStep::SemanticHit(hit) => return Ok((hit, "semantic_cache", None)),
+                EmbeddingStep::Proceed { route, embedding } => (route, embedding),
             };
-        if let (Some(emb), Some(sem_mutex)) =
-            (query_embedding.as_ref(), self.semantic_cache.as_ref())
-        {
-            if let Ok(mut guard) = sem_mutex.lock() {
-                if let Some(hit) = guard.find_similar(emb) {
-                    self.emit_cache_hit_span(&mut otel_span, &hit, "semantic_cache");
-                    return Ok((hit, "semantic_cache", None));
-                }
-            }
-        }
-
-        // Difficulty signal (IMP-14): a Local-routed prompt near a known-hard
-        // centroid escalates to the cloud before wasting a local attempt. Only
-        // ever flips Local → Cloud; sensitive content was excluded above.
-        let mut planned_route = decision.route;
-        if want_difficulty {
-            if let Some(emb) = query_embedding.as_ref() {
-                if let Some(sim) = self.similar_to_hard(emb) {
-                    eprintln!(
-                        "pasture: prompt similar to known-hard set (cos {sim:.2}) -> cloud"
-                    );
-                    planned_route = Route::Cloud;
-                }
-            }
-        }
 
         // Budget / spike guard (IMP-26): only applies when routing to cloud and
         // budget or spike detection is configured. Sensitive content was excluded
@@ -1919,12 +1990,19 @@ impl Proxy {
                 );
             }
         };
+        // OTel span (IMP-23): started before the cache checks so a cache hit is
+        // traced too (ADR-144). Shared by the exact/semantic hit paths and the
+        // backend completion below.
+        let mut otel_span = self
+            .otel_log
+            .as_deref()
+            .map(|_| crate::telemetry::Span::start("", &req.model));
+
         // Exact-match cache read (IMP-31b/ADR-147): mirror the buffered path so a
         // stream:true request is served from cache without a backend call. Checked
         // BEFORE the budget guard (a cache hit costs nothing, so it is served even
         // when over the cloud budget — matching the buffered ordering). Never for
-        // sensitive content (I5); keyed on the original request. The semantic cache
-        // stays buffered-only (it needs a query embedding the stream path skips).
+        // sensitive content (I5); keyed on the original request.
         let cache_key = if sensitive {
             None
         } else {
@@ -1933,44 +2011,31 @@ impl Proxy {
         if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
             let hit = cache.lock().ok().and_then(|mut g| g.get(key));
             if let Some(hit) = hit {
-                write_sse_headers(sock, cors)?;
-                let id = next_completion_id();
-                let model = req.model.clone();
-                let fp = fingerprint_for_model(&model);
-                if !hit.content.is_empty() {
-                    let frame = sse_frame(&build_openai_chunk(
-                        &id, &model, &fp, &hit.content, "cache", None,
-                    ));
-                    sock.write_all(frame.as_bytes())?;
-                }
-                // OTel cache-hit span (ADR-144) + cost record (free), as buffered.
-                let mut span = self
-                    .otel_log
-                    .as_deref()
-                    .map(|_| crate::telemetry::Span::start("", &model));
-                self.emit_cache_hit_span(&mut span, &hit, "cache");
-                self.log_cost("cache", &hit, None);
-                let stop =
-                    sse_frame(&build_openai_chunk(&id, &model, &fp, "", "cache", Some("stop")));
-                sock.write_all(stop.as_bytes())?;
-                if include_usage {
-                    let usage = sse_frame(&build_openai_usage_chunk(
-                        &id,
-                        &model,
-                        &fp,
-                        "cache",
-                        hit.prompt_tokens,
-                        hit.completion_tokens,
-                    ));
-                    sock.write_all(usage.as_bytes())?;
-                }
-                return sock.write_all(b"data: [DONE]\n\n");
+                self.emit_cache_hit_span(&mut otel_span, &hit, "cache");
+                return self.write_cached_stream(sock, cors, &hit, "cache", include_usage);
             }
         }
+        // Semantic cache (IMP-12) + difficulty signal (IMP-14) via the shared
+        // embedding step (ADR-150): parity with the buffered path. A semantic hit
+        // is replayed as SSE; otherwise the route may be escalated and the query
+        // embedding is kept to store the streamed answer on a miss.
+        let (decided_route, query_embedding) =
+            match self.embedding_step(req, decision.route, sensitive, &mut otel_span) {
+                EmbeddingStep::SemanticHit(hit) => {
+                    return self.write_cached_stream(
+                        sock,
+                        cors,
+                        &hit,
+                        "semantic_cache",
+                        include_usage,
+                    );
+                }
+                EmbeddingStep::Proceed { route, embedding } => (route, embedding),
+            };
         // Budget / spike guard (IMP-26): mirror the buffered path so a stream:true
         // request cannot bypass the daily cap or spike redirect. May downgrade to
         // local or, in "block" mode, reject before the stream starts.
-        let route = match self.apply_budget_guard(req, decision.route) {
+        let route = match self.apply_budget_guard(req, decided_route) {
             Ok(r) => r,
             Err(e) => {
                 return write_response(
@@ -2031,13 +2096,8 @@ impl Proxy {
         let id = next_completion_id();
         let model = req.model.clone();
         let fp = fingerprint_for_model(&model);
-        // OTel span (IMP-23): the streaming path emits a span too, so PASTURE_OTEL_LOG
-        // does not silently drop streaming traffic. Started before the backend call;
-        // system/route/usage are filled and appended on success below.
-        let mut otel_span = self
-            .otel_log
-            .as_deref()
-            .map(|_| crate::telemetry::Span::start("", &model));
+        // `otel_span` was started above (before the cache checks); it is filled with
+        // system/route/usage and appended on success below.
         let mut io_err: Option<std::io::Error> = None;
         let resp = backend.stream_complete(req, &mut |delta| {
             if io_err.is_some() {
@@ -2120,13 +2180,27 @@ impl Proxy {
                 // call. The backend returned the pseudonymized text; restore it
                 // before caching so the cache never holds `<EMAIL_n>` tokens, exactly
                 // as the buffered path does.
+                let restored_content = match cache_mapping.as_ref() {
+                    Some(m) => crate::pseudonymize::restore(&r.content, m),
+                    None => r.content.clone(),
+                };
                 if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
                     let mut to_cache = r.clone();
-                    if let Some(m) = cache_mapping.as_ref() {
-                        to_cache.content = crate::pseudonymize::restore(&r.content, m);
-                    }
+                    to_cache.content = restored_content.clone();
                     if let Ok(mut g) = cache.lock() {
                         g.put(key, to_cache);
+                    }
+                }
+                // Semantic-cache store on miss (IMP-12/ADR-150): parity with the
+                // buffered path. Keyed by the query embedding computed above; stores
+                // the restored content (never the `<EMAIL_n>` tokens).
+                if let (Some(emb), Some(sem_mutex)) =
+                    (query_embedding, self.semantic_cache.as_ref())
+                {
+                    let mut to_cache = r.clone();
+                    to_cache.content = restored_content;
+                    if let Ok(mut g) = sem_mutex.lock() {
+                        g.put(emb, to_cache);
                     }
                 }
             }
