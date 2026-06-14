@@ -1171,6 +1171,22 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-153 Account a streamed completion even when the client disconnects mid-stream.**
+  A new Socratic angle — failure-mode accounting: "the happy path logs cost, emits a span, and
+  caches; what happens to that accounting when the client disconnects mid-stream?" The streaming
+  path set `io_err` on a failed client write and then `return Err(io_err)` *before* the `match resp`
+  block — so `log_cost` (cost **and** daily-budget accrual), the OTel span, and the cache store were
+  all skipped, even though the backend reads the upstream to completion and returns a full `resp`
+  with real token usage. Consequences: a disconnected stream consumed cloud tokens that were never
+  cost-logged, never traced (invisible to `PASTURE_OTEL_LOG`), and never counted against the daily
+  budget — a budget-accounting evasion and an observability blind spot. The post-completion
+  accounting was extracted into a no-I/O `finalize_streamed()` (cost/budget, OTel span, exact +
+  semantic cache stores with restored content) and is now called unconditionally on `Ok(resp)`,
+  *before* the client-facing SSE frames. Only those closing frames (delta tail, stop, usage,
+  `[DONE]`) are skipped once the client is gone; the connection still closes with `Err(io_err)`.
+  Zero new dependencies; 2 tests (the helper logs cost, emits a span, and caches with no socket;
+  cloud tokens accrue to the budget through the helper).
+
 - **ADR-152 Authoritative loopback detection for the exposed-without-auth warning.**
   A new Socratic angle — interrogating a string heuristic with authoritative parsing. The startup
   security nudge ("listening on a non-localhost address without auth") decided "is this loopback?"

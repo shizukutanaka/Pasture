@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Streamed completions are accounted even when the client disconnects mid-stream (ADR-153)
+
+- The streaming path returned early on a failed client write, *before* cost logging, OTel span
+  emission, and cache storage — so a client that disconnected mid-stream consumed cloud tokens that
+  were never cost-logged, never traced, and never counted against the daily budget. The accounting
+  is now done (via a no-I/O `finalize_streamed`) before the client-facing frames, so it runs whether
+  or not the client is still connected; only the closing SSE frames are skipped. 2 new tests. (ADR-153)
+
 ### Fixed — Exposed-without-auth warning now uses authoritative loopback detection (ADR-152)
 
 - The startup security nudge decided "is this a localhost bind?" with string-prefix matching, which

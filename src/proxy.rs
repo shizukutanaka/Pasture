@@ -998,6 +998,57 @@ impl Proxy {
         sock.write_all(b"data: [DONE]\n\n")
     }
 
+    /// Account a completed streamed response (ADR-153): cost log + budget accrual,
+    /// OTel span, and cache stores (exact + semantic, restored content). Performs
+    /// no client I/O, so it runs whether or not the client is still connected — a
+    /// mid-stream disconnect must not lose the cost, budget, trace, or cache entry
+    /// for tokens the backend really consumed. Mirrors the buffered path's
+    /// post-completion accounting.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_streamed(
+        &self,
+        r: &CompletionResponse,
+        route: Route,
+        route_label: &'static str,
+        otel_span: &mut Option<crate::telemetry::Span>,
+        cache_key: Option<u64>,
+        query_embedding: Option<Vec<f64>>,
+        cache_mapping: Option<&crate::pseudonymize::Mapping>,
+    ) {
+        self.log_cost(route_label, r, None);
+        if let (Some(span), Some(log_path)) = (otel_span.as_mut(), self.otel_log.as_deref()) {
+            span.system = self.otel_system_for(route);
+            span.response_model = r.model.clone();
+            span.input_tokens = r.prompt_tokens;
+            span.output_tokens = r.completion_tokens;
+            span.route = route_label;
+            span.finish_reason = Some("stop".to_string());
+            span.finish();
+            if let Err(e) = span.append_to(log_path) {
+                eprintln!("pasture: otel log write failed: {e}");
+            }
+        }
+        // Cache the *restored* content (never the `<EMAIL_n>` tokens), as buffered.
+        let restored = match cache_mapping {
+            Some(m) => crate::pseudonymize::restore(&r.content, m),
+            None => r.content.clone(),
+        };
+        if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
+            let mut to_cache = r.clone();
+            to_cache.content = restored.clone();
+            if let Ok(mut g) = cache.lock() {
+                g.put(key, to_cache);
+            }
+        }
+        if let (Some(emb), Some(sem_mutex)) = (query_embedding, self.semantic_cache.as_ref()) {
+            let mut to_cache = r.clone();
+            to_cache.content = restored;
+            if let Ok(mut g) = sem_mutex.lock() {
+                g.put(emb, to_cache);
+            }
+        }
+    }
+
     fn backend_for(&self, route: Route) -> Result<&dyn Backend, ProxyError> {
         match route {
             Route::Local => self.local.as_deref(),
@@ -2173,83 +2224,56 @@ impl Proxy {
                 io_err = Some(e);
             }
         });
-        if let Some(e) = io_err {
-            return Err(e);
-        }
-        // Flush any buffered token tail held back across the final delta boundary.
-        if let Some(r) = restorer.as_mut() {
-            let tail = r.finish();
-            if !tail.is_empty() {
-                let frame =
-                    sse_frame(&build_openai_chunk(&id, &model, &fp, &tail, route_label, None));
-                sock.write_all(frame.as_bytes())?;
-            }
-        }
-        match resp {
+        // The backend stream has fully completed — it reads the upstream to the end
+        // even if the client went away mid-stream, so `resp` carries the real token
+        // usage. Account the work (cost/budget/trace/cache) BEFORE the remaining
+        // client writes, so a client that disconnects mid-stream is still logged,
+        // budget-accrued, traced, and cached (ADR-153). Only the client-facing SSE
+        // frames below are skipped once `io_err` is set.
+        match &resp {
             Ok(r) => {
-                self.log_cost(route_label, &r, None);
-                // Emit the OTel span (IMP-23) for this streamed completion.
-                if let (Some(span), Some(log_path)) =
-                    (otel_span.as_mut(), self.otel_log.as_deref())
-                {
-                    span.system = self.otel_system_for(route);
-                    span.response_model = r.model.clone();
-                    span.input_tokens = r.prompt_tokens;
-                    span.output_tokens = r.completion_tokens;
-                    span.route = route_label;
-                    span.finish_reason = Some("stop".to_string());
-                    span.finish();
-                    if let Err(e) = span.append_to(log_path) {
-                        eprintln!("pasture: otel log write failed: {e}");
-                    }
-                }
-                let stop = sse_frame(&build_openai_chunk(
-                    &id,
-                    &model,
-                    &fp,
-                    "",
+                self.finalize_streamed(
+                    r,
+                    route,
                     route_label,
-                    Some("stop"),
-                ));
-                sock.write_all(stop.as_bytes())?;
-                // Final usage chunk when the client asked for it (OpenAI feature).
-                if include_usage {
-                    let usage = sse_frame(&build_openai_usage_chunk(
-                        &id,
-                        &model,
-                        &fp,
-                        route_label,
-                        r.prompt_tokens,
-                        r.completion_tokens,
-                    ));
-                    sock.write_all(usage.as_bytes())?;
-                }
-                // Store on miss (IMP-31b/ADR-147): cache the *restored* content so a
-                // later request (buffered or streamed) is served without a backend
-                // call. The backend returned the pseudonymized text; restore it
-                // before caching so the cache never holds `<EMAIL_n>` tokens, exactly
-                // as the buffered path does.
-                let restored_content = match cache_mapping.as_ref() {
-                    Some(m) => crate::pseudonymize::restore(&r.content, m),
-                    None => r.content.clone(),
-                };
-                if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
-                    let mut to_cache = r.clone();
-                    to_cache.content = restored_content.clone();
-                    if let Ok(mut g) = cache.lock() {
-                        g.put(key, to_cache);
+                    &mut otel_span,
+                    cache_key,
+                    query_embedding,
+                    cache_mapping.as_ref(),
+                );
+                if io_err.is_none() {
+                    // Flush any buffered token tail held back across the final delta.
+                    if let Some(rr) = restorer.as_mut() {
+                        let tail = rr.finish();
+                        if !tail.is_empty() {
+                            let frame = sse_frame(&build_openai_chunk(
+                                &id, &model, &fp, &tail, route_label, None,
+                            ));
+                            if let Err(e) = sock.write_all(frame.as_bytes()) {
+                                io_err = Some(e);
+                            }
+                        }
                     }
-                }
-                // Semantic-cache store on miss (IMP-12/ADR-150): parity with the
-                // buffered path. Keyed by the query embedding computed above; stores
-                // the restored content (never the `<EMAIL_n>` tokens).
-                if let (Some(emb), Some(sem_mutex)) =
-                    (query_embedding, self.semantic_cache.as_ref())
-                {
-                    let mut to_cache = r.clone();
-                    to_cache.content = restored_content;
-                    if let Ok(mut g) = sem_mutex.lock() {
-                        g.put(emb, to_cache);
+                    if io_err.is_none() {
+                        let stop = sse_frame(&build_openai_chunk(
+                            &id, &model, &fp, "", route_label, Some("stop"),
+                        ));
+                        if let Err(e) = sock.write_all(stop.as_bytes()) {
+                            io_err = Some(e);
+                        }
+                    }
+                    if io_err.is_none() && include_usage {
+                        let usage = sse_frame(&build_openai_usage_chunk(
+                            &id,
+                            &model,
+                            &fp,
+                            route_label,
+                            r.prompt_tokens,
+                            r.completion_tokens,
+                        ));
+                        if let Err(e) = sock.write_all(usage.as_bytes()) {
+                            io_err = Some(e);
+                        }
                     }
                 }
             }
@@ -2268,9 +2292,16 @@ impl Proxy {
                         eprintln!("pasture: otel log write failed: {w}");
                     }
                 }
-                let err = sse_frame(&build_error_response(&e.to_string(), "upstream_error"));
-                sock.write_all(err.as_bytes())?;
+                if io_err.is_none() {
+                    let err = sse_frame(&build_error_response(&e.to_string(), "upstream_error"));
+                    if let Err(e2) = sock.write_all(err.as_bytes()) {
+                        io_err = Some(e2);
+                    }
+                }
             }
+        }
+        if let Some(e) = io_err {
+            return Err(e);
         }
         sock.write_all(b"data: [DONE]\n\n")
     }

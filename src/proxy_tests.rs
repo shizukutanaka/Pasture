@@ -2114,6 +2114,76 @@ fn test_streaming_sensitive_skips_semantic_cache() {
     let _ = std::fs::remove_file(&log);
 }
 
+// ── ADR-153 streamed completion accounted even on client disconnect ─────────
+
+#[test]
+fn test_finalize_streamed_accounts_without_client_io() {
+    // ADR-153: a streamed completion is cost-logged, traced, and cached purely by
+    // finalize_streamed — no socket involved. This is exactly the code that runs
+    // when a client disconnects mid-stream, so the backend's real work is still
+    // accounted (not silently dropped as it was before).
+    let cost_log = tmp_log();
+    let otel = tmp_log();
+    let p = proxy_with(true, false, 100, &cost_log)
+        .with_cache(8)
+        .with_otel_log(Some(otel.clone()));
+    let r = CompletionResponse {
+        content: "streamed answer".to_string(),
+        model: "m".to_string(),
+        prompt_tokens: 7,
+        completion_tokens: 11,
+    };
+    let mut span = p
+        .otel_log
+        .as_deref()
+        .map(|_| crate::telemetry::Span::start("", "m"));
+    let key = crate::cache::request_key(
+        &Proxy::parse_request(r#"{"model":"m","messages":[{"role":"user","content":"q"}]}"#)
+            .unwrap(),
+    );
+    p.finalize_streamed(&r, Route::Local, "local", &mut span, Some(key), None, None);
+    // Cost record written.
+    let recs = crate::cost::read_log(&cost_log).unwrap();
+    assert_eq!(recs.len(), 1, "completion must be cost-logged");
+    assert_eq!(recs[0].route, "local");
+    // OTel span emitted.
+    let otel_content = std::fs::read_to_string(&otel).unwrap_or_default();
+    assert!(
+        otel_content.contains("\"name\":\"gen_ai.chat\""),
+        "span must be emitted: {otel_content}"
+    );
+    // Cache populated.
+    let hit = p.cache.as_ref().unwrap().lock().unwrap().get(key);
+    assert_eq!(
+        hit.map(|h| h.content),
+        Some("streamed answer".to_string()),
+        "completion must be cached"
+    );
+    let _ = std::fs::remove_file(&cost_log);
+    let _ = std::fs::remove_file(&otel);
+}
+
+#[test]
+fn test_finalize_streamed_accrues_cloud_budget() {
+    // ADR-153: streamed cloud tokens accrue to the daily budget through this
+    // no-I/O path, so a mid-stream disconnect cannot consume cloud tokens that
+    // never count against the budget.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log);
+    let before = p.today_cloud_tokens.load(Ordering::Relaxed);
+    let r = CompletionResponse {
+        content: "x".to_string(),
+        model: "m".to_string(),
+        prompt_tokens: 100,
+        completion_tokens: 50,
+    };
+    let mut span = None;
+    p.finalize_streamed(&r, Route::Cloud, "cloud", &mut span, None, None, None);
+    let after = p.today_cloud_tokens.load(Ordering::Relaxed);
+    assert_eq!(after - before, 150, "cloud tokens must accrue to the budget");
+    let _ = std::fs::remove_file(&log);
+}
+
 #[test]
 fn test_sensitive_not_cached() {
     let log = tmp_log();
