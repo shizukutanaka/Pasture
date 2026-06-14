@@ -142,6 +142,14 @@ impl Ctx {
             let tok = self.token_for(inner, "IP");
             return Some(format!("{prefix}{tok}{suffix}"));
         }
+        if privacy::looks_like_ipv6(inner) {
+            // Same "IP" category as IPv4 — an address is an address (ADR-156).
+            // Keeps the pseudonymizer consistent with the sensitivity classifier,
+            // which flags IPv6 (ADR-148); otherwise an IPv6 address would reach the
+            // cloud raw under allow_sensitive_cloud + pseudonymize.
+            let tok = self.token_for(inner, "IP");
+            return Some(format!("{prefix}{tok}{suffix}"));
+        }
         if privacy::looks_like_phone(inner) {
             let tok = self.token_for(inner, "PHONE");
             return Some(format!("{prefix}{tok}{suffix}"));
@@ -228,6 +236,26 @@ mod tests {
         let (out, _) = pseudonymize_messages(&msgs);
         assert!(out[0].content.contains("<IP_1>"), "{}", out[0].content);
         assert!(!out[0].content.contains("192.168.1.100"));
+    }
+
+    #[test]
+    fn test_ipv6_is_pseudonymized_and_restored() {
+        // ADR-156: IPv6 is flagged sensitive by the classifier (ADR-148), so the
+        // pseudonymizer must mask it too — otherwise it would reach the cloud raw
+        // under allow_sensitive_cloud + pseudonymize. Round-trips back on restore.
+        let msgs = vec![msg("connect to 2001:db8::1 then retry")];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        assert!(out[0].content.contains("<IP_1>"), "{}", out[0].content);
+        assert!(
+            !out[0].content.contains("2001:db8::1"),
+            "raw IPv6 must not remain: {}",
+            out[0].content
+        );
+        let restored = restore(&out[0].content, &mapping);
+        assert!(
+            restored.contains("2001:db8::1"),
+            "IPv6 must restore: {restored}"
+        );
     }
 
     #[test]

@@ -1171,6 +1171,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-156 Pseudonymizer masks IPv6 too (IMP-19 / ADR-148 consistency).**
+  A new Socratic angle — cross-path privacy consistency: "every route that reaches the cloud should
+  apply the same PII protection; does it?" Tracing the cascade escalation showed it is safe (cascade
+  runs only on `!sensitive` prompts, and the pseudonymizable categories — email, IPv4, phone,
+  API-key — are all a subset of what `classify` marks sensitive, so a cascade prompt carries none of
+  them). But the same trace exposed a real gap on the *direct* path: ADR-148 added IPv6 to the
+  sensitivity classifier but not to the pseudonymizer, so with `PASTURE_ALLOW_SENSITIVE_CLOUD=1`
+  **and** `PASTURE_PSEUDONYMIZE=1` an IPv6 address was sent to the cloud *raw* — the user opted into
+  masking, yet IPv6 slipped through. `process_token` now checks `looks_like_ipv6` (same `IP_n` token
+  category as IPv4) right after the IPv4 check, so the pseudonymizer's coverage matches the
+  classifier's for the address categories. Zero new dependencies; 1 test (IPv6 masked to `<IP_1>`
+  and restored on the response).
+
 - **ADR-155 Daily budget resets only on a forward day change (IMP-26 temporal-edge fix).**
   A new Socratic angle — non-monotonic wall-clock time: `roll_budget_day_if_needed` reset the daily
   cloud-token counter whenever `stored != today`, but its own doc said "advanced past" (forward

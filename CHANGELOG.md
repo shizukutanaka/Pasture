@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Pseudonymizer now masks IPv6 addresses (IMP-19, ADR-156)
+
+- IPv6 became sensitive in ADR-148 but the pseudonymizer still masked only IPv4, so with
+  `PASTURE_ALLOW_SENSITIVE_CLOUD=1` + `PASTURE_PSEUDONYMIZE=1` an IPv6 address reached the cloud raw.
+  `process_token` now masks IPv6 (as the `IP` category) alongside IPv4, restoring it on the response.
+  1 new test. (ADR-156)
+
 ### Fixed — Daily budget resets only when the UTC day advances forward (IMP-26, ADR-155)
 
 - `roll_budget_day_if_needed` reset the daily token counter on any day change (`stored != today`), so
