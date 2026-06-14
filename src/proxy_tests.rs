@@ -1730,6 +1730,35 @@ fn test_difficulty_signal_escalates_similar_prompt() {
 }
 
 #[test]
+fn test_difficulty_signal_concurrent_calls_consistent() {
+    // ADR-154: similar_to_hard initialises the centroids once and computes the
+    // per-request cosine off-lock. Many threads hitting it simultaneously must all
+    // escalate consistently and none panic (centroids are shared via Arc).
+    use std::sync::Arc;
+    let log = tmp_log();
+    let p = Arc::new(
+        proxy_with(true, true, 100, &log)
+            .with_hard_prompts(vec!["a prompt my local model fumbles".to_string()], 0.9),
+    );
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let p = Arc::clone(&p);
+        handles.push(std::thread::spawn(move || {
+            let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+            p.handle_chat(body).unwrap()
+        }));
+    }
+    for h in handles {
+        let resp = h.join().expect("worker thread must not panic");
+        assert!(
+            resp.contains("\"x_pasture_route\":\"cloud\""),
+            "every concurrent request must escalate: {resp}"
+        );
+    }
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_difficulty_signal_below_threshold_stays_local() {
     // An unreachable threshold (cosine can never exceed 1.0) must never flip.
     let log = tmp_log();

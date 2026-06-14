@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Difficulty-signal centroid lock no longer serializes concurrent requests (IMP-14, ADR-154)
+
+- `similar_to_hard` held the `hard_centroids` mutex across the blocking `/embeddings` init call and
+  across the per-request cosine computation, so concurrent difficulty-signal requests were serialized
+  (and a slow/cold local backend stalled all of them during init). Centroids are now stored behind an
+  `Arc`: the lock is held only to clone the `Arc` (and to store once at init); the embedding call and
+  the cosine run off-lock. 1 new concurrency test. (ADR-154)
+
 ### Fixed — Streamed completions are accounted even when the client disconnects mid-stream (ADR-153)
 
 - The streaming path returned early on a failed client write, *before* cost logging, OTel span

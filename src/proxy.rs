@@ -184,7 +184,7 @@ pub struct Proxy {
     /// running at construction). `None` = not yet attempted; `Some(vec![])` after
     /// a failed embedding attempt — the signal stays disabled for the process
     /// lifetime rather than re-querying a broken backend on every request.
-    hard_centroids: std::sync::Mutex<Option<Vec<Vec<f64>>>>,
+    hard_centroids: std::sync::Mutex<Option<Arc<Vec<Vec<f64>>>>>,
     /// Prompt-injection guard mode (IMP-20). `"off"` = disabled; `"flag"` =
     /// detect and log + annotate the JSON response; `"block"` = reject with 400.
     injection_guard: String,
@@ -1168,24 +1168,44 @@ impl Proxy {
     /// up at construction); a failed attempt disables the signal for the process
     /// lifetime (logged once) instead of re-querying a broken backend per request.
     fn similar_to_hard(&self, query: &[f64]) -> Option<f64> {
-        let mut guard = self.hard_centroids.lock().ok()?;
-        if guard.is_none() {
-            let centroids = match self.local.as_deref() {
-                Some(local) => match local.embeddings(&self.hard_prompts) {
-                    Ok(r) => r.vectors,
-                    Err(e) => {
-                        eprintln!(
-                            "pasture: hard-prompt embedding failed ({e}); difficulty signal disabled"
-                        );
-                        Vec::new()
-                    }
-                },
-                None => Vec::new(),
-            };
-            *guard = Some(centroids);
+        // Fast path: already initialised. Clone the Arc and release the lock BEFORE
+        // the (CPU-bound) cosine computation, so concurrent difficulty-signal
+        // requests are not serialized on this mutex (ADR-154). The centroids are
+        // immutable after init, so the clone is a cheap refcount bump.
+        {
+            let guard = self.hard_centroids.lock().ok()?;
+            if let Some(c) = guard.as_ref() {
+                let c = Arc::clone(c);
+                drop(guard);
+                return crate::difficulty::similar_to_hard(query, &c, self.hard_threshold);
+            }
         }
-        let centroids = guard.as_ref().expect("initialised above");
-        crate::difficulty::similar_to_hard(query, centroids, self.hard_threshold)
+        // First use: embed the hard prompts WITHOUT holding the lock, so a slow or
+        // cold local backend cannot block every other concurrent request. A rare
+        // race may embed twice; the result is identical and idempotent, and the
+        // first stored value wins.
+        let computed = match self.local.as_deref() {
+            Some(local) => match local.embeddings(&self.hard_prompts) {
+                Ok(r) => r.vectors,
+                Err(e) => {
+                    eprintln!(
+                        "pasture: hard-prompt embedding failed ({e}); difficulty signal disabled"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let centroids = {
+            let mut guard = self.hard_centroids.lock().ok()?;
+            // Another thread may have initialised while we were embedding; keep the
+            // existing value rather than overwriting it.
+            if guard.is_none() {
+                *guard = Some(Arc::new(computed));
+            }
+            Arc::clone(guard.as_ref().expect("initialised above"))
+        };
+        crate::difficulty::similar_to_hard(query, &centroids, self.hard_threshold)
     }
 
     /// Run a completion for an already-parsed request (buffered), applying the

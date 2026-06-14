@@ -1171,6 +1171,21 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-154 Don't hold the centroid lock across I/O or the per-request cosine (IMP-14 concurrency).**
+  A new Socratic angle — concurrency on shared `&Proxy`: "the server runs a thread per connection;
+  what does the lazily-initialised difficulty signal do when many threads hit it at once?" Two
+  problems. (1) `similar_to_hard` made the blocking `local.embeddings()` network call *while holding*
+  the `hard_centroids` mutex, so the first difficulty-signal request serialized every other
+  concurrent one for the whole HTTP duration (a cold local backend could stall them for seconds).
+  (2) Worse in steady state — it computed the per-request cosine *under the same lock*, so all
+  difficulty-signal requests were permanently serialized on one mutex even though the centroids are
+  immutable after init. Fixed by storing the centroids behind an `Arc`: the fast path locks only to
+  clone the `Arc` (a refcount bump) and releases it before the cosine computation; first-use embeds
+  *outside* the lock (a rare race may embed twice — idempotent, first store wins) and locks only to
+  store. Lock hold time drops from "a network round-trip / a cosine over all centroids" to "an `Arc`
+  clone". Zero new dependencies; 1 test (8 threads escalate consistently with no panic) plus the
+  existing correctness tests unchanged.
+
 - **ADR-153 Account a streamed completion even when the client disconnects mid-stream.**
   A new Socratic angle — failure-mode accounting: "the happy path logs cost, emits a span, and
   caches; what happens to that accounting when the client disconnects mid-stream?" The streaming
