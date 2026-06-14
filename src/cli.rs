@@ -1280,6 +1280,33 @@ fn maybe_nudge(config: &Config) {
     }
 }
 
+/// True when a listen address binds only the loopback interface, so the proxy is
+/// reachable only from the same machine (ADR-152). Used to decide whether to warn
+/// about an exposed bind without auth. Uses the std parser rather than string
+/// prefixes: a prefix check both mis-warns on expanded loopback (`[0:0:…:1]`) and,
+/// worse, suppresses the warning for a *global* address that merely starts with a
+/// loopback-looking prefix (e.g. `::1:2:3:4`). An unspecified bind (`0.0.0.0`,
+/// `::`) is NOT loopback — it listens on every interface and must warn. A hostname
+/// that is not a numeric IP is treated as local only when it is literally
+/// `localhost`; any other name is assumed exposed (the safe default).
+fn listen_addr_is_loopback(addr: &str) -> bool {
+    use std::net::{IpAddr, SocketAddr};
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return sa.ip().is_loopback();
+    }
+    if let Ok(ip) = addr.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+    // Hostname form (`host` or `host:port`). Only a bare-IPv6 string contains a
+    // ':' in the host part, and those parse above, so a single trailing ':' here
+    // separates a hostname from its port.
+    let host = match addr.rfind(':') {
+        Some(i) if !addr[..i].contains(':') => &addr[..i],
+        _ => addr,
+    };
+    host.eq_ignore_ascii_case("localhost")
+}
+
 fn run_serve(config: &Config, addr: &str) -> i32 {
     let profile = HardwareProfile::detect();
     let cloud = make_cloud_backend(config);
@@ -1350,12 +1377,9 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
             }
         }
     };
-    // Security nudge: a non-localhost bind without auth is exposed to the network.
-    let localhost = addr.starts_with("127.")
-        || addr.starts_with("localhost")
-        || addr.starts_with("[::1]")
-        || addr.starts_with("::1");
-    if !localhost && config.auth_token.is_none() {
+    // Security nudge: a non-loopback bind without auth is exposed to the network.
+    // Authoritative loopback detection (ADR-152), not a string-prefix guess.
+    if !listen_addr_is_loopback(addr) && config.auth_token.is_none() {
         eprintln!(
             "pasture: WARNING — listening on {addr} (non-localhost) without auth; \
              set PASTURE_AUTH_TOKEN to require a bearer token"
@@ -1424,6 +1448,31 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
 mod tests {
     use super::*;
     use crate::hardware::GpuInfo;
+
+    #[test]
+    fn test_listen_addr_is_loopback_authoritative() {
+        // IPv4 loopback block and IPv6 ::1 (bracketed, with port) are local.
+        assert!(listen_addr_is_loopback("127.0.0.1:11435"));
+        assert!(listen_addr_is_loopback("127.5.6.7:80")); // all of 127/8
+        assert!(listen_addr_is_loopback("[::1]:11435"));
+        assert!(listen_addr_is_loopback("::1")); // bare, no port
+        assert!(listen_addr_is_loopback("localhost:11435"));
+        assert!(listen_addr_is_loopback("localhost"));
+        // Expanded IPv6 loopback must NOT be mis-flagged as exposed. The old
+        // string-prefix check returned false here (no "::1"/"[::1]" prefix match),
+        // wrongly warning that a loopback-only bind was network-exposed.
+        assert!(listen_addr_is_loopback("[0:0:0:0:0:0:0:1]:8080"));
+        // Exposed binds are not loopback → the warning must fire.
+        assert!(!listen_addr_is_loopback("0.0.0.0:11435")); // all IPv4 interfaces
+        assert!(!listen_addr_is_loopback("[::]:11435")); // all IPv6 interfaces
+        assert!(!listen_addr_is_loopback("192.168.1.5:11435")); // LAN
+        assert!(!listen_addr_is_loopback("myhost.lan:8080")); // hostname, not localhost
+        // Regression: a GLOBAL address that merely starts with the "::1" prefix
+        // must NOT be treated as loopback. The old heuristic's
+        // `starts_with("::1")` returned true for this and SUPPRESSED the
+        // exposed-without-auth warning; `::1:2:3:4` is `0:0:0:0:1:2:3:4`, global.
+        assert!(!listen_addr_is_loopback("::1:2:3:4"));
+    }
 
     #[test]
     fn test_parse_route_flag_cloud() {

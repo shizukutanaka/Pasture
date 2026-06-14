@@ -1171,6 +1171,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-152 Authoritative loopback detection for the exposed-without-auth warning.**
+  A new Socratic angle — interrogating a string heuristic with authoritative parsing. The startup
+  security nudge ("listening on a non-localhost address without auth") decided "is this loopback?"
+  with `addr.starts_with("127.") || …("localhost") || …("[::1]") || …("::1")`. Two defects: it
+  *false-warned* on a real loopback bind written in expanded form (`[0:0:0:0:0:0:0:1]:8080` matches
+  no prefix), and — the security-relevant direction — it *suppressed* the warning for a global
+  address that merely begins with a loopback-looking prefix (`::1:2:3:4` is `0:0:0:0:1:2:3:4`, yet
+  `starts_with("::1")` is true). A gate that decides whether to warn about network exposure must not
+  guess from string prefixes. `listen_addr_is_loopback()` now parses the address with `std::net`
+  (`SocketAddr`/`IpAddr`) and tests `ip().is_loopback()`; an unspecified bind (`0.0.0.0`, `::`) is
+  correctly treated as exposed, and a non-numeric host is loopback only when it is literally
+  `localhost`. Zero new dependencies (std-only); 1 test covering loopback/exposed/hostname forms and
+  both old-heuristic defects.
+
 - **ADR-151 Incremental cost summary for `/metrics` and `/v1/stats` (IMP-32).**
   Socratic probe of the observability endpoints' cost: "`/metrics` is built for Prometheus to scrape
   every few seconds — what does each scrape do?" It called `read_log()` + `summarize()`, re-reading

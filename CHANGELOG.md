@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Exposed-without-auth warning now uses authoritative loopback detection (ADR-152)
+
+- The startup security nudge decided "is this a localhost bind?" with string-prefix matching, which
+  both false-warned on expanded IPv6 loopback (`[0:0:0:0:0:0:0:1]`) and suppressed the warning for a
+  global address starting with a loopback-looking prefix (`::1:2:3:4`). It now parses the address
+  with `std::net` and tests `ip().is_loopback()`; unspecified binds (`0.0.0.0`, `::`) are correctly
+  treated as exposed. Std-only. 1 new test. (ADR-152)
+
 ### Changed — `/metrics` and `/v1/stats` compute the cost summary incrementally (IMP-32, ADR-151)
 
 - Both endpoints re-read and re-parsed the entire (unbounded-growing) cost log on every request, so
