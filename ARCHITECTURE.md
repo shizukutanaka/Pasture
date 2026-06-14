@@ -1171,6 +1171,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-155 Daily budget resets only on a forward day change (IMP-26 temporal-edge fix).**
+  A new Socratic angle — non-monotonic wall-clock time: `roll_budget_day_if_needed` reset the daily
+  cloud-token counter whenever `stored != today`, but its own doc said "advanced past" (forward
+  intent). A backward wall-clock step across UTC midnight — NTP correction, a VM resumed from an
+  older snapshot, a manual clock change — therefore satisfied `!=` and zeroed the counter, granting a
+  fresh daily cloud allowance and *under-enforcing* the cap (the unsafe direction). The condition is
+  now `today > stored`: the budget resets only when the day strictly advances. A clock that was
+  briefly ahead and corrected back keeps enforcing until real time catches up to the stored day (the
+  safe direction). The `compare_exchange` still ensures exactly one thread performs the reset. Zero
+  new dependencies; 1 test (a budget anchored to a future day stays blocked rather than resetting).
+
 - **ADR-154 Don't hold the centroid lock across I/O or the per-request cosine (IMP-14 concurrency).**
   A new Socratic angle — concurrency on shared `&Proxy`: "the server runs a thread per connection;
   what does the lazily-initialised difficulty signal do when many threads hit it at once?" Two

@@ -3462,6 +3462,32 @@ fn test_budget_same_day_still_blocks() {
     let _ = std::fs::remove_file(&log);
 }
 
+#[test]
+fn test_budget_backward_clock_does_not_reset() {
+    // ADR-155: a backward wall-clock step across UTC midnight must NOT zero the
+    // daily counter. Anchor budget_day to a FUTURE day (as if the clock had been
+    // ahead and was corrected back); an over-budget counter must stay blocked,
+    // not be granted a fresh allowance.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_budget(1, "block", 0, "/dev/null");
+    let future_day = (unix_now() / 86_400) + 5;
+    p.budget_day.store(future_day, Ordering::Relaxed);
+    p.today_cloud_tokens.store(100, Ordering::Relaxed); // over the budget of 1
+    let long = "word ".repeat(20);
+    let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let err = p.handle_chat(&body).unwrap_err();
+    assert!(
+        matches!(err, ProxyError::BudgetExceeded(_)),
+        "a backward clock must not reset the budget: {err:?}"
+    );
+    // The counter was not zeroed by a spurious rollover.
+    assert!(
+        p.today_cloud_tokens.load(Ordering::Relaxed) >= 100,
+        "backward clock must not reset the daily counter"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── IMP-15 auth precedes rate limiting (Socratic-dialogue fix) ─────────────
 #[test]
 fn test_unauthenticated_request_does_not_consume_rate_budget() {

@@ -5,6 +5,13 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Daily budget resets only when the UTC day advances forward (IMP-26, ADR-155)
+
+- `roll_budget_day_if_needed` reset the daily token counter on any day change (`stored != today`), so
+  a backward wall-clock step across midnight (NTP correction, VM snapshot restore, manual change)
+  wrongly zeroed the counter and granted a fresh cloud allowance. It now resets only when the day
+  strictly advances (`today > stored`), the safe direction for cap enforcement. 1 new test. (ADR-155)
+
 ### Fixed — Difficulty-signal centroid lock no longer serializes concurrent requests (IMP-14, ADR-154)
 
 - `similar_to_hard` held the `hard_centroids` mutex across the blocking `/embeddings` init call and

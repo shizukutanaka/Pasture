@@ -1065,7 +1065,13 @@ impl Proxy {
     fn roll_budget_day_if_needed(&self) {
         let today = unix_now() / 86_400;
         let stored = self.budget_day.load(Ordering::Relaxed);
-        if stored != today
+        // Reset only when the day strictly ADVANCES (ADR-155). A backward wall-clock
+        // step across UTC midnight — NTP correction, VM snapshot restore, manual
+        // change — must NOT zero the counter and hand out a fresh daily budget; that
+        // would under-enforce the cap. `today > stored` also means a clock that was
+        // briefly ahead and corrected back keeps enforcing until real time catches
+        // up (the safe direction).
+        if today > stored
             && self
                 .budget_day
                 .compare_exchange(stored, today, Ordering::Relaxed, Ordering::Relaxed)
