@@ -989,7 +989,7 @@ impl Proxy {
                 sse_frame(&build_openai_chunk(&id, &model, &fp, &hit.content, route_label, None));
             sock.write_all(frame.as_bytes())?;
         }
-        self.log_cost(route_label, hit, None);
+        self.log_cost(route_label, hit, None, 0);
         let stop = sse_frame(&build_openai_chunk(&id, &model, &fp, "", route_label, Some("stop")));
         sock.write_all(stop.as_bytes())?;
         if include_usage {
@@ -1024,8 +1024,9 @@ impl Proxy {
         cache_mapping: Option<&crate::pseudonymize::Mapping>,
         req_model: &str,
         req_sampling: u64,
+        reserved_tokens: u64,
     ) {
-        self.log_cost(route_label, r, None);
+        self.log_cost(route_label, r, None, reserved_tokens);
         if let (Some(span), Some(log_path)) = (otel_span.as_mut(), self.otel_log.as_deref()) {
             span.system = self.otel_system_for(route);
             span.response_model = r.model.clone();
@@ -1109,8 +1110,12 @@ impl Proxy {
         }
         // Daily budget: cumulative cloud tokens since UTC midnight.
         if self.budget_daily_tokens > 0 {
-            let used = self.today_cloud_tokens.load(Ordering::Relaxed);
-            if used >= self.budget_daily_tokens {
+            // Atomically reserve estimated tokens. If the counter was already at or
+            // above the budget before our add, roll back and reject. This closes the
+            // TOCTOU window between check and increment (ADR-163).
+            let prev = self.today_cloud_tokens.fetch_add(estimated_tokens, Ordering::Relaxed);
+            if prev >= self.budget_daily_tokens {
+                self.today_cloud_tokens.fetch_sub(estimated_tokens, Ordering::Relaxed);
                 return Some("daily cloud token budget exceeded");
             }
         }
@@ -1127,9 +1132,9 @@ impl Proxy {
         &self,
         req: &CompletionRequest,
         route: Route,
-    ) -> Result<Route, ProxyError> {
+    ) -> Result<(Route, u64), ProxyError> {
         if route != Route::Cloud || (self.budget_daily_tokens == 0 && self.spike_factor == 0) {
-            return Ok(route);
+            return Ok((route, 0));
         }
         // IMP-24: estimate input + predicted output tokens (cloud cost is driven
         // mostly by output, so input alone under-estimates spend).
@@ -1140,19 +1145,30 @@ impl Proxy {
             match self.budget_action.as_str() {
                 "block" => return Err(ProxyError::BudgetExceeded(reason.to_string())),
                 "warn" => {
+                    // Reservation was rolled back in check_budget_and_spike; proceed
+                    // over budget without a pre-reservation (warn-action path, ADR-163).
                     eprintln!("pasture: budget warning: {reason} (cloud request proceeds)");
+                    return Ok((route, 0));
                 }
                 _ => {
                     // "local-only" (default): silently redirect to local.
+                    // Reservation was rolled back in check_budget_and_spike (ADR-163).
                     eprintln!("pasture: {reason} -> routing local");
-                    return Ok(Route::Local);
+                    return Ok((Route::Local, 0));
                 }
             }
         }
-        Ok(route)
+        // Pre-reservation is in place: estimated tokens were added atomically.
+        Ok((route, estimated))
     }
 
-    fn log_cost(&self, route_label: &'static str, resp: &CompletionResponse, logprob: Option<f64>) {
+    fn log_cost(
+        &self,
+        route_label: &'static str,
+        resp: &CompletionResponse,
+        logprob: Option<f64>,
+        reserved_tokens: u64,
+    ) {
         // Record cost (local and cache are free). PII is never written (I5);
         // logprob is the local-answer confidence number, not content.
         let record = CostRecord::new(
@@ -1172,9 +1188,27 @@ impl Proxy {
             // completion accrues to the new day rather than a stale total.
             self.roll_budget_day_if_needed();
             let tokens = resp.prompt_tokens + resp.completion_tokens;
-            self.today_cloud_tokens.fetch_add(tokens, Ordering::Relaxed);
+            if reserved_tokens > 0 {
+                // Reconcile pre-reservation (estimated) with actual tokens used (ADR-163).
+                if tokens > reserved_tokens {
+                    self.today_cloud_tokens
+                        .fetch_add(tokens - reserved_tokens, Ordering::Relaxed);
+                } else if tokens < reserved_tokens {
+                    self.today_cloud_tokens
+                        .fetch_sub(reserved_tokens - tokens, Ordering::Relaxed);
+                }
+                // equal: no-op
+            } else {
+                // No pre-reservation (warn-action path or spike-only guard): add actual post-hoc.
+                self.today_cloud_tokens.fetch_add(tokens, Ordering::Relaxed);
+            }
             self.cloud_token_sum.fetch_add(tokens, Ordering::Relaxed);
             self.cloud_request_count.fetch_add(1, Ordering::Relaxed);
+        } else if reserved_tokens > 0 {
+            // Planned cloud route fell back to local; release the pre-reservation (ADR-163).
+            self.roll_budget_day_if_needed();
+            self.today_cloud_tokens
+                .fetch_sub(reserved_tokens, Ordering::Relaxed);
         }
     }
 
@@ -1229,7 +1263,7 @@ impl Proxy {
     fn run_completion(
         &self,
         req: &CompletionRequest,
-    ) -> Result<(CompletionResponse, &'static str, Option<f64>), ProxyError> {
+    ) -> Result<(CompletionResponse, &'static str, Option<f64>, u64), ProxyError> {
         // Apply the configured prompt framing (system prompt, then date/OS context).
         let framed = self.frame_request(req);
         let req = framed.as_ref().unwrap_or(req);
@@ -1254,7 +1288,7 @@ impl Proxy {
             if let Ok(mut guard) = cache.lock() {
                 if let Some(hit) = guard.get(key) {
                     self.emit_cache_hit_span(&mut otel_span, &hit, "cache");
-                    return Ok((hit, "cache", None));
+                    return Ok((hit, "cache", None, 0));
                 }
             }
         }
@@ -1264,7 +1298,7 @@ impl Proxy {
         // (possibly escalated) plus the query embedding for store-on-miss.
         let (planned_route, query_embedding) =
             match self.embedding_step(req, decision.route, sensitive, &mut otel_span) {
-                EmbeddingStep::SemanticHit(hit) => return Ok((hit, "semantic_cache", None)),
+                EmbeddingStep::SemanticHit(hit) => return Ok((hit, "semantic_cache", None, 0)),
                 EmbeddingStep::Proceed { route, embedding } => (route, embedding),
             };
 
@@ -1272,7 +1306,7 @@ impl Proxy {
         // budget or spike detection is configured. Sensitive content was excluded
         // from cloud routing above (privacy), so this check runs on non-sensitive
         // cloud-bound requests only. Shared with the streaming path.
-        let planned_route = self.apply_budget_guard(req, planned_route)?;
+        let (planned_route, budget_reserved_outer) = self.apply_budget_guard(req, planned_route)?;
 
         // Pseudonymization (IMP-19): replace PII with opaque tokens before
         // sending to the cloud. Only applied to cloud-bound, non-sensitive
@@ -1309,7 +1343,7 @@ impl Proxy {
         } else {
             self.complete_direct(req, planned_route)
         };
-        let (mut resp, route, logprob) = match completion_result {
+        let (mut resp, route, logprob, cascade_reserved) = match completion_result {
             Ok(v) => v,
             Err(e) => {
                 // ADR-143: emit error span so backend failures are visible in
@@ -1329,6 +1363,9 @@ impl Proxy {
                 return Err(e);
             }
         };
+        // One of budget_reserved_outer (from the outer apply_budget_guard) or
+        // cascade_reserved (from the inner cascade apply_budget_guard) is always 0.
+        let effective_reserved = cascade_reserved + budget_reserved_outer;
 
         // Restore pseudonymized tokens in the response (IMP-19).
         if let Some(ref mapping) = pseudo_mapping {
@@ -1367,7 +1404,7 @@ impl Proxy {
             }
         }
 
-        Ok((resp, route.as_str(), logprob))
+        Ok((resp, route.as_str(), logprob, effective_reserved))
     }
 
     /// Cascade strategy: answer locally, escalate to the cloud when the local
@@ -1377,7 +1414,7 @@ impl Proxy {
     fn complete_cascade(
         &self,
         req: &CompletionRequest,
-    ) -> Result<(CompletionResponse, Route, Option<f64>), ProxyError> {
+    ) -> Result<(CompletionResponse, Route, Option<f64>, u64), ProxyError> {
         let local = self.backend_for(Route::Local)?;
         let (local_resp, confidence) = local
             .complete_scored(req)
@@ -1396,11 +1433,18 @@ impl Proxy {
             // keeps its already-computed local answer — the same graceful degradation
             // it does on a cloud failure, so a budget cap never turns into a 429.
             match self.apply_budget_guard(req, Route::Cloud) {
-                Ok(Route::Cloud) => {
+                Ok((Route::Cloud, cascade_reserved)) => {
                     let cloud = self.backend_for(Route::Cloud)?;
                     match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
-                        Ok(cloud_resp) => return Ok((cloud_resp, Route::Cloud, confidence)),
+                        Ok(cloud_resp) => {
+                            return Ok((cloud_resp, Route::Cloud, confidence, cascade_reserved))
+                        }
                         Err(e) => {
+                            // Roll back the pre-reservation: cloud failed, no tokens were spent.
+                            if cascade_reserved > 0 {
+                                self.today_cloud_tokens
+                                    .fetch_sub(cascade_reserved, Ordering::Relaxed);
+                            }
                             eprintln!("pasture: cascade cloud failed ({e}); using local answer");
                         }
                     }
@@ -1412,7 +1456,7 @@ impl Proxy {
                 }
             }
         }
-        Ok((local_resp, Route::Local, confidence))
+        Ok((local_resp, Route::Local, confidence, 0))
     }
 
     /// Cloud strategy: retry transient failures, then fall back to local if
@@ -1420,10 +1464,10 @@ impl Proxy {
     fn complete_cloud_with_fallback(
         &self,
         req: &CompletionRequest,
-    ) -> Result<(CompletionResponse, Route, Option<f64>), ProxyError> {
+    ) -> Result<(CompletionResponse, Route, Option<f64>, u64), ProxyError> {
         let cloud = self.backend_for(Route::Cloud)?;
         match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
-            Ok(resp) => Ok((resp, Route::Cloud, None)),
+            Ok(resp) => Ok((resp, Route::Cloud, None, 0)),
             Err(primary_err) => {
                 // IMP-9 multi-provider follow-up: try the fallback cloud provider
                 // before giving up to local. This handles a full primary-cloud
@@ -1434,7 +1478,7 @@ impl Proxy {
                     );
                     match complete_with_retry(fallback, req, self.cloud_retry, CLOUD_RETRY_BASE_MS)
                     {
-                        Ok(resp) => return Ok((resp, Route::Cloud, None)),
+                        Ok(resp) => return Ok((resp, Route::Cloud, None, 0)),
                         Err(fb_err) => {
                             eprintln!("pasture: fallback cloud also failed ({fb_err})");
                         }
@@ -1448,7 +1492,7 @@ impl Proxy {
                         let resp = local
                             .complete(req)
                             .map_err(|e| ProxyError::Backend(e.to_string()))?;
-                        Ok((resp, Route::Local, None))
+                        Ok((resp, Route::Local, None, 0))
                     }
                     None => Err(ProxyError::Backend(primary_err.to_string())),
                 }
@@ -1462,7 +1506,7 @@ impl Proxy {
         &self,
         req: &CompletionRequest,
         route: Route,
-    ) -> Result<(CompletionResponse, Route, Option<f64>), ProxyError> {
+    ) -> Result<(CompletionResponse, Route, Option<f64>, u64), ProxyError> {
         let backend = self.backend_for(route)?;
         let fast_req = if route == Route::Local {
             self.fast_request(req)
@@ -1472,7 +1516,7 @@ impl Proxy {
         let resp = backend
             .complete(fast_req.as_ref().unwrap_or(req))
             .map_err(|e| ProxyError::Backend(e.to_string()))?;
-        Ok((resp, route, None))
+        Ok((resp, route, None, 0))
     }
 
     /// A copy of `req` retargeted at the configured fast model when the last
@@ -1690,8 +1734,8 @@ impl Proxy {
                 eprintln!("pasture: injection_flag:{label} (flag mode, legacy request proceeds)");
             }
         }
-        let (resp, label, logprob) = self.run_completion(&req)?;
-        self.log_cost(label, &resp, logprob);
+        let (resp, label, logprob, reserved) = self.run_completion(&req)?;
+        self.log_cost(label, &resp, logprob, reserved);
         Ok(build_legacy_completion_response(&resp, label))
     }
 
@@ -2091,8 +2135,8 @@ impl Proxy {
             None
         };
 
-        let (resp, label, logprob) = self.run_completion(req)?;
-        self.log_cost(label, &resp, logprob);
+        let (resp, label, logprob, reserved) = self.run_completion(req)?;
+        self.log_cost(label, &resp, logprob, reserved);
         Ok(build_openai_response_with_injection(&resp, label, injection_label.as_deref()))
     }
 
@@ -2189,7 +2233,7 @@ impl Proxy {
         // Budget / spike guard (IMP-26): mirror the buffered path so a stream:true
         // request cannot bypass the daily cap or spike redirect. May downgrade to
         // local or, in "block" mode, reject before the stream starts.
-        let route = match self.apply_budget_guard(req, decided_route) {
+        let (route, budget_reserved) = match self.apply_budget_guard(req, decided_route) {
             Ok(r) => r,
             Err(e) => {
                 return write_response(
@@ -2296,6 +2340,7 @@ impl Proxy {
                     cache_mapping.as_ref(),
                     &req.model,
                     crate::cache::sampling_key(&req.sampling),
+                    budget_reserved,
                 );
                 if io_err.is_none() {
                     // Flush any buffered token tail held back across the final delta.
@@ -2334,6 +2379,11 @@ impl Proxy {
                 }
             }
             Err(e) => {
+                // Roll back the budget pre-reservation: backend never completed a response (ADR-163).
+                if budget_reserved > 0 {
+                    self.today_cloud_tokens
+                        .fetch_sub(budget_reserved, Ordering::Relaxed);
+                }
                 // ADR-143: emit error span so streaming backend failures are
                 // visible in the trace log rather than silently dropped.
                 if let (Some(span), Some(log_path)) =

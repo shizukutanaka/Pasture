@@ -1171,6 +1171,29 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-163 Budget daily-cap TOCTOU — atomic pre-reservation in `check_budget_and_spike`.**
+  A new Socratic angle — concurrency in the budget check: "`check_budget_and_spike` reads
+  `today_cloud_tokens` with `load(Relaxed)`, compares against the daily budget, and *returns*.
+  `log_cost` does the actual `fetch_add` only after the cloud response arrives — an entire RTT later.
+  Two concurrent cloud requests can both read 'under budget' at t=0 and both proceed, overshooting
+  the cap by up to one request's worth of tokens." Fixed by replacing the `load`→`compare` sequence
+  in the daily-budget branch with an atomic pre-reservation: `fetch_add(estimated_tokens)` then check
+  the returned `prev` — if `prev >= budget`, `fetch_sub(estimated_tokens)` (rollback) and reject.
+  `log_cost` now *reconciles* the estimated→actual difference instead of doing a fresh add (it receives
+  `reserved_tokens: u64`); on reconciliation: add `actual − reserved` or subtract `reserved − actual`.
+  Three edge cases handled: (1) cloud-with-fallback-to-local — `log_cost` sees `route_label="local"`
+  with `reserved_tokens > 0` and rolls back via `fetch_sub`; (2) streaming backend error — the `Err`
+  arm of `match &resp` rolls back the pre-reservation before the OTel error span; (3) warn-action path
+  (proceed despite budget exceeded) — `check_budget_and_spike` returns `Some(reason)` (reservation
+  already rolled back), `apply_budget_guard` continues with `reserved=0`, and `log_cost` adds actual
+  tokens post-hoc as before. The cascade path (`complete_cascade`'s inner `apply_budget_guard`) also
+  rolls back on cloud failure before returning the local answer. `apply_budget_guard` return type
+  changes from `Result<Route, ProxyError>` to `Result<(Route, u64), ProxyError>`; `run_completion`
+  and `finalize_streamed` thread `reserved_tokens` through. New test:
+  `test_budget_pre_reservation_blocks_at_ceiling` — seeds counter AT the budget limit, fires a forced-
+  cloud request in "block" mode, and asserts the counter does not grow (rollback was effective).
+  Zero new dependencies.
+
 - **ADR-162 Atomic JSONL appends — one `write_all`, not `writeln!`.**
   A new Socratic angle — concurrency on the append-only logs (the thread-per-connection server appends
   to the cost log and the OTel span log from many threads at once): "is each record written as one

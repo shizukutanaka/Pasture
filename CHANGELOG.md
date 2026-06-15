@@ -5,6 +5,23 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Budget daily-cap TOCTOU: atomic pre-reservation in `check_budget_and_spike` (ADR-163)
+
+- `check_budget_and_spike` read `today_cloud_tokens` with `load(Relaxed)`, compared against the daily
+  budget, and returned.  `log_cost` performed the actual `fetch_add` only after the cloud backend
+  responded — an entire RTT later.  Two concurrent cloud requests could both read "under budget" and
+  both proceed, overshooting the cap by up to one request's worth of tokens.  The "block" action was
+  supposed to be a hard stop, but two simultaneous requests near the ceiling could both pass it.
+  Fixed by replacing the non-atomic `load`→`compare` with an atomic pre-reservation:
+  `fetch_add(estimated_tokens)` then check the returned `prev` value; if `prev ≥ budget`,
+  `fetch_sub(estimated_tokens)` (rollback) and reject.  `log_cost` now *reconciles* the pre-
+  reservation with the actual token count instead of doing a fresh add; it also rolls back the
+  reservation when a cloud request falls back to local.  The streaming error path rolls back the
+  reservation before writing the OTel error span.  The cascade's inner `apply_budget_guard` also
+  rolls back on cloud failure.  New test `test_budget_pre_reservation_blocks_at_ceiling` seeds the
+  counter at the ceiling, fires a forced-cloud request, and asserts the counter does not grow
+  (proving the rollback). (ADR-163)
+
 ### Fixed — Cost log and trace log appends are now atomic under concurrency (ADR-162)
 
 - `CostRecord::append_to` and `Span::append_to` used `writeln!`, which writes the record and the

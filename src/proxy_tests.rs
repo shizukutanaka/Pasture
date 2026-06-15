@@ -2207,7 +2207,7 @@ fn test_finalize_streamed_accounts_without_client_io() {
         &Proxy::parse_request(r#"{"model":"m","messages":[{"role":"user","content":"q"}]}"#)
             .unwrap(),
     );
-    p.finalize_streamed(&r, Route::Local, "local", &mut span, Some(key), None, None, "m", 0);
+    p.finalize_streamed(&r, Route::Local, "local", &mut span, Some(key), None, None, "m", 0, 0);
     // Cost record written.
     let recs = crate::cost::read_log(&cost_log).unwrap();
     assert_eq!(recs.len(), 1, "completion must be cost-logged");
@@ -2244,7 +2244,7 @@ fn test_finalize_streamed_accrues_cloud_budget() {
         completion_tokens: 50,
     };
     let mut span = None;
-    p.finalize_streamed(&r, Route::Cloud, "cloud", &mut span, None, None, None, "cloud-model", 0);
+    p.finalize_streamed(&r, Route::Cloud, "cloud", &mut span, None, None, None, "cloud-model", 0, 0);
     let after = p.today_cloud_tokens.load(Ordering::Relaxed);
     assert_eq!(after - before, 150, "cloud tokens must accrue to the budget");
     let _ = std::fs::remove_file(&log);
@@ -3110,7 +3110,7 @@ fn test_cloud_fallback_used_when_primary_fails() {
         Box::new(MockBackend::new("fallback", "fallback-reply")),
     ));
     let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
-    let (resp, route, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    let (resp, route, _, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
     assert_eq!(resp.content, "fallback-reply");
     assert_eq!(route, Route::Cloud);
     let _ = std::fs::remove_file(&log);
@@ -3130,7 +3130,7 @@ fn test_cloud_fallback_falls_to_local_when_both_fail() {
     .with_cloud_retry(0)
     .with_cloud_fallback(Some(Box::new(AlwaysFailBackend)));
     let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
-    let (resp, route, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    let (resp, route, _, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
     assert_eq!(resp.content, "local-reply");
     assert_eq!(route, Route::Local);
     let _ = std::fs::remove_file(&log);
@@ -3150,7 +3150,7 @@ fn test_cloud_fallback_not_used_when_primary_succeeds() {
     .with_cloud_retry(0)
     .with_cloud_fallback(Some(Box::new(AlwaysFailBackend)));
     let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
-    let (resp, route, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    let (resp, route, _, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
     assert_eq!(resp.content, "primary-reply");
     assert_eq!(route, Route::Cloud);
     let _ = std::fs::remove_file(&log);
@@ -3169,7 +3169,7 @@ fn test_cloud_fallback_none_still_falls_to_local() {
     )
     .with_cloud_retry(0);
     let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
-    let (resp, route, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    let (resp, route, _, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
     assert_eq!(resp.content, "local-reply");
     assert_eq!(route, Route::Local);
     let _ = std::fs::remove_file(&log);
@@ -3521,6 +3521,38 @@ fn test_budget_backward_clock_does_not_reset() {
     assert!(
         p.today_cloud_tokens.load(Ordering::Relaxed) >= 100,
         "backward clock must not reset the daily counter"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+// ── ADR-163 budget TOCTOU atomic pre-reservation ─────────────────────────────
+
+#[test]
+fn test_budget_pre_reservation_blocks_at_ceiling() {
+    // ADR-163: check_budget_and_spike pre-reserves tokens atomically.
+    // Seed the counter AT the daily budget; any subsequent cloud request must
+    // be blocked (action="block") without adding more tokens to the counter —
+    // the rollback in check_budget_and_spike must be effective.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_budget(100, "block", 0, "/dev/null");
+    let today = unix_now() / 86_400;
+    p.budget_day.store(today, Ordering::Relaxed);
+    // Pre-seed counter exactly at the budget ceiling.
+    p.today_cloud_tokens.store(100, Ordering::Relaxed);
+
+    // model:"cloud" forces Route::Cloud so the budget guard fires (not local short-circuit).
+    let body = r#"{"model":"cloud","messages":[{"role":"user","content":"hi"}]}"#;
+    // fetch_add(estimated) → prev(100) >= budget(100) → fetch_sub → BudgetExceeded.
+    let result = p.handle_chat(body);
+    assert!(
+        matches!(result, Err(ProxyError::BudgetExceeded(_))),
+        "at-ceiling cloud request must be blocked: {result:?}"
+    );
+    // Counter must not have grown (rollback was effective).
+    let counter = p.today_cloud_tokens.load(Ordering::Relaxed);
+    assert_eq!(
+        counter, 100,
+        "counter must not grow when pre-reservation is rolled back: {counter}"
     );
     let _ = std::fs::remove_file(&log);
 }
