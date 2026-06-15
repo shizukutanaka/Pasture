@@ -1109,6 +1109,21 @@ impl Proxy {
         );
     }
 
+    /// Live view of the daily cloud-token budget for `/metrics` and `/v1/stats`
+    /// (ADR-165): `(used_today, daily_limit)`. Rolls the day first so the gauge
+    /// reads 0 on a fresh UTC day even before any request arrives, matching what
+    /// the enforcer (`check_budget_and_spike`) would see. `used` reflects the
+    /// enforcement counter — including in-flight pre-reservations (ADR-163) — so a
+    /// scrape shows exactly the value that gates the next request. A `limit` of 0
+    /// means the daily budget is disabled (no cap). Token counts only; no PII (I3).
+    fn budget_snapshot(&self) -> (u64, u64) {
+        self.roll_budget_day_if_needed();
+        (
+            self.today_cloud_tokens.load(Ordering::Relaxed),
+            self.budget_daily_tokens,
+        )
+    }
+
     /// Budget + spike check (IMP-26). Returns `Some(reason)` when the cloud route
     /// should be overridden or blocked; `None` when the request may proceed normally.
     /// Called only when the routing engine has decided Cloud.
@@ -1649,6 +1664,7 @@ impl Proxy {
             .and_then(|m| m.lock().ok())
             .map(|g| (g.hits(), g.misses(), g.len(), g.cap()))
             .unwrap_or((0, 0, 0, 0));
+        let (budget_used, budget_limit) = self.budget_snapshot();
         Ok(build_stats_response(
             &summary,
             live_hits,
@@ -1659,6 +1675,8 @@ impl Proxy {
             sem_misses,
             sem_size,
             sem_cap,
+            budget_used,
+            budget_limit,
         ))
     }
 
@@ -1679,6 +1697,7 @@ impl Proxy {
             .and_then(|m| m.lock().ok())
             .map(|g| (g.hits(), g.misses(), g.len(), g.cap()))
             .unwrap_or((0, 0, 0, 0));
+        let (budget_used, budget_limit) = self.budget_snapshot();
         Ok(build_metrics_response(
             &s,
             live_hits,
@@ -1689,6 +1708,8 @@ impl Proxy {
             sem_misses,
             sem_size,
             sem_cap,
+            budget_used,
+            budget_limit,
         ))
     }
 
@@ -2626,6 +2647,7 @@ pub fn build_model_response(models: &[String], id: &str) -> Option<String> {
 /// Build the `GET /v1/stats` JSON body (IMP-metrics): live counters from the
 /// cost log. All values are PII-free aggregates (I3). Rates are rounded to 4 dp.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn build_stats_response(
     s: &crate::cost::CostSummary,
     cache_hits: u64,
@@ -2636,6 +2658,8 @@ pub fn build_stats_response(
     sem_misses: u64,
     sem_size: usize,
     sem_cap: usize,
+    budget_used: u64,
+    budget_limit: u64,
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
     format!(
@@ -2644,7 +2668,8 @@ pub fn build_stats_response(
 \"cloud_cost_usd\":{},\"cache_hits\":{cache_hits},\"cache_misses\":{cache_misses},\
 \"cache_size\":{cache_size},\"cache_capacity\":{cache_cap},\
 \"semantic_cache_hits\":{sem_hits},\"semantic_cache_misses\":{sem_misses},\
-\"semantic_cache_size\":{sem_size},\"semantic_cache_capacity\":{sem_cap}}}",
+\"semantic_cache_size\":{sem_size},\"semantic_cache_capacity\":{sem_cap},\
+\"budget_daily_tokens_used\":{budget_used},\"budget_daily_tokens_limit\":{budget_limit}}}",
         s.total,
         s.local,
         s.cloud,
@@ -2762,6 +2787,7 @@ pub fn build_openai_response_with_injection(
 /// metric lines. Counter names follow Prometheus naming conventions (total suffix
 /// on counters, no suffix on gauges).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn build_metrics_response(
     s: &crate::cost::CostSummary,
     cache_hits: u64,
@@ -2772,6 +2798,8 @@ pub fn build_metrics_response(
     sem_misses: u64,
     sem_size: usize,
     sem_cap: usize,
+    budget_used: u64,
+    budget_limit: u64,
 ) -> String {
     // Prometheus text exposition format v0.0.4.
     // Braces in label selectors are literal Prometheus syntax — not format args.
@@ -2813,7 +2841,13 @@ pasture_semantic_cache_misses_total {sem_misses}\n\
 pasture_semantic_cache_entries {sem_size}\n\
 # HELP pasture_semantic_cache_capacity Maximum entries the semantic cache holds (0=disabled)\n\
 # TYPE pasture_semantic_cache_capacity gauge\n\
-pasture_semantic_cache_capacity {sem_cap}\n",
+pasture_semantic_cache_capacity {sem_cap}\n\
+# HELP pasture_budget_daily_tokens_used Cloud tokens used today against the daily budget (includes in-flight reservations)\n\
+# TYPE pasture_budget_daily_tokens_used gauge\n\
+pasture_budget_daily_tokens_used {budget_used}\n\
+# HELP pasture_budget_daily_tokens_limit Daily cloud token budget (0=unlimited)\n\
+# TYPE pasture_budget_daily_tokens_limit gauge\n\
+pasture_budget_daily_tokens_limit {budget_limit}\n",
         local = s.local,
         cloud = s.cloud,
         cache = s.cache,

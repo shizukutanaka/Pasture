@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Daily token budget is observable on `/metrics` and `/v1/stats` (ADR-165)
+
+- The daily cloud-token budget (IMP-26) was enforced but invisible: the metrics endpoints reported
+  all-time cost-log totals, never today's consumption against the cap.  An operator who set
+  `PASTURE_BUDGET_DAILY_TOKENS` had no gauge to anticipate the budget running out — requests would just
+  start silently routing local (or 429ing).  Added `pasture_budget_daily_tokens_used` and
+  `pasture_budget_daily_tokens_limit` gauges to the Prometheus `/metrics` output and the matching
+  `budget_daily_tokens_used` / `budget_daily_tokens_limit` fields to the `/v1/stats` JSON.  The snapshot
+  rolls the UTC day first, so a scrape on a new day reads 0 rather than yesterday's stale total, and it
+  reflects the same enforcement counter (including in-flight reservations) that gates the next request.
+  Token counts only — no PII; both endpoints stay behind the existing auth gate.  4 tests. (ADR-165)
+
 ### Fixed — Budget token release saturates at 0 across a UTC day rollover (ADR-164)
 
 - ADR-163 introduced five `fetch_sub` calls on `today_cloud_tokens` to roll back or reconcile a budget

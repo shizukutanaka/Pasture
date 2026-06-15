@@ -702,7 +702,7 @@ fn test_build_stats_response_shape() {
         completion_tokens: 50,
         cloud_cost_usd: 0.0123,
     };
-    let json = build_stats_response(&s, 7, 3, 5, 128, 0, 0, 0, 0);
+    let json = build_stats_response(&s, 7, 3, 5, 128, 0, 0, 0, 0, 1500, 1_000_000);
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
     assert_eq!(v.get("cloud").and_then(|x| x.as_f64()), Some(1.0));
@@ -718,6 +718,15 @@ fn test_build_stats_response_shape() {
     assert_eq!(
         v.get("cache_capacity").and_then(|x| x.as_f64()),
         Some(128.0)
+    );
+    // ADR-165: daily-budget gauge is exposed in the stats JSON.
+    assert_eq!(
+        v.get("budget_daily_tokens_used").and_then(|x| x.as_f64()),
+        Some(1500.0)
+    );
+    assert_eq!(
+        v.get("budget_daily_tokens_limit").and_then(|x| x.as_f64()),
+        Some(1_000_000.0)
     );
 }
 
@@ -1234,7 +1243,7 @@ fn test_metrics_response_shape() {
         completion_tokens: 100,
         cloud_cost_usd: 0.005,
     };
-    let body = build_metrics_response(&s, 3, 8, 5, 50, 0, 0, 0, 0);
+    let body = build_metrics_response(&s, 3, 8, 5, 50, 0, 0, 0, 0, 4200, 1_000_000);
     assert!(
         body.contains("pasture_requests_total{route=\"local\"} 7"),
         "{body}"
@@ -1248,6 +1257,16 @@ fn test_metrics_response_shape() {
     assert!(body.contains("pasture_cache_capacity 50"), "{body}");
     assert!(body.contains("# TYPE pasture_requests_total counter"), "{body}");
     assert!(body.contains("# TYPE pasture_cache_entries gauge"), "{body}");
+    // ADR-165: daily-budget gauges in Prometheus text format.
+    assert!(body.contains("pasture_budget_daily_tokens_used 4200"), "{body}");
+    assert!(
+        body.contains("pasture_budget_daily_tokens_limit 1000000"),
+        "{body}"
+    );
+    assert!(
+        body.contains("# TYPE pasture_budget_daily_tokens_used gauge"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -3610,6 +3629,56 @@ fn test_budget_local_fallback_release_does_not_underflow() {
     p.log_cost("local", &r, None, 300);
     let counter = p.today_cloud_tokens.load(Ordering::Relaxed);
     assert_eq!(counter, 0, "local-fallback release must clamp at 0: {counter}");
+    let _ = std::fs::remove_file(&log);
+}
+
+// ── ADR-165 daily-budget gauge is observable via /v1/stats and /metrics ───────
+
+#[test]
+fn test_stats_exposes_live_daily_budget() {
+    // ADR-165: a daily budget is enforced but was previously unobservable. The
+    // stats endpoint must report tokens used today and the configured limit so an
+    // operator can see how close they are to the cap.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_budget(1_000_000, "local-only", 0, "/dev/null");
+    let today = unix_now() / 86_400;
+    p.budget_day.store(today, Ordering::Relaxed);
+    p.today_cloud_tokens.store(250_000, Ordering::Relaxed);
+
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(
+        v.get("budget_daily_tokens_used").and_then(|x| x.as_f64()),
+        Some(250_000.0),
+        "stats must report today's used tokens: {json}"
+    );
+    assert_eq!(
+        v.get("budget_daily_tokens_limit").and_then(|x| x.as_f64()),
+        Some(1_000_000.0),
+        "stats must report the configured limit: {json}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_budget_gauge_reads_zero_on_new_day() {
+    // ADR-165: the gauge rolls the day before reporting, so a scrape on a fresh
+    // UTC day reads 0 even before any request arrives — it must not surface
+    // yesterday's stale total.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_budget(1_000_000, "local-only", 0, "/dev/null");
+    // Anchor the counter to YESTERDAY with a non-zero total.
+    let yesterday = unix_now() / 86_400 - 1;
+    p.budget_day.store(yesterday, Ordering::Relaxed);
+    p.today_cloud_tokens.store(900_000, Ordering::Relaxed);
+
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(
+        v.get("budget_daily_tokens_used").and_then(|x| x.as_f64()),
+        Some(0.0),
+        "a new-day scrape must read 0, not yesterday's total: {json}"
+    );
     let _ = std::fs::remove_file(&log);
 }
 

@@ -1171,6 +1171,24 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-165 The daily token budget is observable — `/metrics` + `/v1/stats` expose used-vs-limit.**
+  A Socratic angle on the budget feature as a whole: "Pasture *enforces* a daily cloud-token budget
+  (IMP-26), but is that enforcement *observable*? If an operator sets `PASTURE_BUDGET_DAILY_TOKENS`,
+  how do they see how close they are to the cap?" They could not. `/metrics` and `/v1/stats` reported
+  cost-log-derived totals (all-time route counts, tokens, spend) but never `today_cloud_tokens` or the
+  configured limit — so the first sign of an exhausted budget was requests *silently* routing local
+  (or 429ing in block mode), with no gauge to anticipate it and no way to capacity-plan. A control you
+  cannot observe is a control you cannot trust. Fixed by adding a `budget_snapshot()` helper —
+  `(used_today, daily_limit)` — that calls `roll_budget_day_if_needed` first so a scrape on a fresh UTC
+  day reads 0 rather than yesterday's stale total, and reads the same enforcement counter
+  (`today_cloud_tokens`, including in-flight ADR-163 reservations) that gates the next request.
+  `build_metrics_response` gains two Prometheus gauges (`pasture_budget_daily_tokens_used`,
+  `pasture_budget_daily_tokens_limit`, the latter 0 when unlimited) and `build_stats_response` the
+  matching JSON fields; `handle_metrics`/`handle_stats` thread the snapshot through. Token counts only —
+  no PII (I3) — and both endpoints remain behind the same auth gate as before. Four tests: the two
+  builder unit tests assert the new fields; an end-to-end stats test pre-seeds the counter and checks
+  it surfaces; a new-day test asserts the gauge reads 0 (not yesterday's total). Zero new dependencies.
+
 - **ADR-164 Budget release saturates at 0 across a UTC day rollover — no `fetch_sub` underflow.**
   Turning the same Socratic lens on what ADR-163 *introduced*: "ADR-163 added five `fetch_sub` calls
   on `today_cloud_tokens` to roll back or reconcile a pre-reservation. What does a subtraction do when
