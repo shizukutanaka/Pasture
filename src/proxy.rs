@@ -1387,11 +1387,28 @@ impl Proxy {
             confidence,
             self.cascade_logprob_threshold,
         ) {
-            let cloud = self.backend_for(Route::Cloud)?;
-            match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
-                Ok(cloud_resp) => return Ok((cloud_resp, Route::Cloud, confidence)),
-                Err(e) => {
-                    eprintln!("pasture: cascade cloud failed ({e}); using local answer");
+            // Apply the same budget/spike guard the direct cloud path uses before
+            // spending cloud tokens (ADR-161). The cascade is reached only when the
+            // request was routed Local, so apply_budget_guard was a no-op upstream
+            // (it ignores non-Cloud routes); without this an escalation would bypass
+            // the daily cap and spike redirect entirely. When the guard declines the
+            // cloud (over budget → Local redirect, or "block" → Err), the cascade
+            // keeps its already-computed local answer — the same graceful degradation
+            // it does on a cloud failure, so a budget cap never turns into a 429.
+            match self.apply_budget_guard(req, Route::Cloud) {
+                Ok(Route::Cloud) => {
+                    let cloud = self.backend_for(Route::Cloud)?;
+                    match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
+                        Ok(cloud_resp) => return Ok((cloud_resp, Route::Cloud, confidence)),
+                        Err(e) => {
+                            eprintln!("pasture: cascade cloud failed ({e}); using local answer");
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "pasture: cascade escalation suppressed by budget/spike guard; using local answer"
+                    );
                 }
             }
         }

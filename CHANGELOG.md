@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Cascade escalations now respect the daily budget / spike guard (ADR-161)
+
+- The cascade runs only when a request is routed Local, where `apply_budget_guard` is a no-op, so a
+  low-confidence escalation to the cloud bypassed the daily token cap and spike redirect entirely — in
+  `"block"` mode the budget never blocked a cascade.  `complete_cascade` now applies the guard before
+  escalating; when the cloud is declined (over budget or `"block"`) it keeps its local answer, the same
+  graceful degradation it does on a cloud failure (never a 429).  2 new tests. (ADR-161)
+
 ### Fixed — `PASTURE_CACHE_TTL` now bounds the semantic cache too (ADR-160)
 
 - `with_cache_ttl` applied the TTL only to the exact-match cache; `SemanticCache` had no TTL, so with

@@ -1171,6 +1171,21 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-161 Cascade escalations respect the daily budget / spike guard.**
+  A new Socratic angle — budget-enforcement completeness: "every path that spends cloud tokens should
+  pass the budget/spike guard; do they all?" Tracing the routes exposed a hole. The cascade is eligible
+  only when the request was routed **Local** (`planned_route == Route::Local`), but `apply_budget_guard`
+  is a no-op for non-Cloud routes — it returns early. So when `complete_cascade` escalated a
+  low-confidence local answer to the cloud (calling `complete_with_retry` directly), it bypassed the
+  daily token cap *and* the spike redirect entirely: in `"block"` mode the budget never blocked a
+  cascade, and a cascade with a huge prompt evaded spike detection. Same evasion class as ADR-155
+  (under-enforcing a budget control is the unsafe direction). Fixed by calling `apply_budget_guard(req,
+  Route::Cloud)` inside `complete_cascade` before escalating: only `Ok(Route::Cloud)` proceeds to the
+  cloud; an over-budget `Local` redirect or a `"block"` `Err` makes the cascade keep its
+  already-computed local answer — the same graceful degradation it does on a cloud failure, so a budget
+  cap never turns a cascade into a 429. Zero new dependencies; 2 new tests (over-budget cascade stays
+  local; `"block"` mode returns the local answer, not a 429).
+
 - **ADR-160 `PASTURE_CACHE_TTL` bounds staleness for the semantic cache too (extends ADR-158/159).**
   The third drift found by the same cache-consistency lens: "`with_cache_ttl` applies `set_max_age` to
   the exact-match cache — does the semantic cache honour the operator's TTL?" It did not — `SemanticCache`

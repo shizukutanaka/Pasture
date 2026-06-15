@@ -1934,6 +1934,43 @@ fn test_cascade_keeps_confident_local() {
 }
 
 #[test]
+fn test_cascade_escalation_respects_budget() {
+    // ADR-161: a cascade escalation must honour the daily budget guard, not
+    // bypass it. The cascade runs only when the request was routed Local, so the
+    // upstream apply_budget_guard was a no-op; without the in-cascade guard a
+    // low-confidence escalation would spend cloud tokens over the daily cap.
+    let log = tmp_log();
+    let p = cascade_proxy("I don't know", "the answer is 42", &log)
+        .with_budget(1, "local-only", 0, "/dev/null");
+    p.today_cloud_tokens.store(100, Ordering::Relaxed); // over cap (budget_day == today)
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hard"}]}"#;
+    let resp = p.handle_chat(body).unwrap();
+    assert!(
+        resp.contains("\"x_pasture_route\":\"local\""),
+        "over-budget cascade must not escalate to cloud: {resp}"
+    );
+    assert!(resp.contains("I don't know"), "must keep the local answer: {resp}");
+    assert!(!resp.contains("the answer is 42"), "cloud answer must not be served: {resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cascade_escalation_over_budget_block_returns_local_not_429() {
+    // ADR-161: even in "block" mode, an over-budget cascade returns its local
+    // answer (graceful degradation), never a 429 — cascade always has a valid
+    // local response, mirroring its cloud-failure fallback.
+    let log = tmp_log();
+    let p = cascade_proxy("I don't know", "cloud answer", &log)
+        .with_budget(1, "block", 0, "/dev/null");
+    p.today_cloud_tokens.store(100, Ordering::Relaxed);
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hard"}]}"#;
+    let resp = p.handle_chat(body).expect("cascade must not 429 over budget");
+    assert!(resp.contains("\"x_pasture_route\":\"local\""), "{resp}");
+    assert!(resp.contains("I don't know"), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_cache_hit_returns_cache_route() {
     let log = tmp_log();
     let p = proxy_with(true, false, 100, &log).with_cache(8);
