@@ -118,9 +118,14 @@ impl Span {
     }
 
     /// Append this span to the given JSONL log file, creating it if needed.
+    ///
+    /// Written with a single `write_all` (line + `\n`) rather than `writeln!`, which
+    /// would issue two syscalls that can interleave with a concurrent thread's append
+    /// and corrupt the JSONL (ADR-162). Spans are emitted from multiple request
+    /// threads, so this matters here as it does for the cost log.
     pub fn append_to(&self, path: &str) -> std::io::Result<()> {
         let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(f, "{}", self.to_jsonl())
+        f.write_all(format!("{}\n", self.to_jsonl()).as_bytes())
     }
 }
 

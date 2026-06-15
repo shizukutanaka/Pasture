@@ -1171,6 +1171,21 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-162 Atomic JSONL appends — one `write_all`, not `writeln!`.**
+  A new Socratic angle — concurrency on the append-only logs (the thread-per-connection server appends
+  to the cost log and the OTel span log from many threads at once): "is each record written as one
+  atomic unit?" It was not. `CostRecord::append_to` and `Span::append_to` used `writeln!(f, "{}", …)`,
+  which issues *two* syscalls — one for the content, one for the `\n`. `O_APPEND` makes each individual
+  `write` atomic but says nothing about a *pair* of them, so two threads could interleave as
+  `content_A`, `content_B`, `\n`, `\n` — concatenating two records on one physical line. `read_log`
+  parses with `filter_map`, so that corrupted line is silently dropped, losing *both* records from the
+  cost/budget accounting and the trace log. (The access log already avoided this by building the line
+  with its newline and doing one `write_all`.) Fixed by building `format!("{}\n", …)` and writing it
+  with a single `write_all` in both append paths — one `write` syscall, atomic under `O_APPEND` for the
+  small (<4 KiB) lines involved. A new concurrency test (8 threads × 64 appends) asserts every physical
+  line parses and no record is lost; it fails reliably against the old `writeln!` and passes with the
+  fix. Zero new dependencies.
+
 - **ADR-161 Cascade escalations respect the daily budget / spike guard.**
   A new Socratic angle — budget-enforcement completeness: "every path that spends cloud tokens should
   pass the budget/spike guard; do they all?" Tracing the routes exposed a hole. The cascade is eligible

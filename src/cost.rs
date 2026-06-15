@@ -64,9 +64,17 @@ impl CostRecord {
     }
 
     /// Append this record to the given log file, creating it if needed.
+    ///
+    /// The line (including its trailing newline) is built first and written with a
+    /// single `write_all`, not `writeln!` — `writeln!` issues a separate syscall for
+    /// the content and the `\n`, which under the thread-per-connection server can
+    /// interleave with another thread's append (O_APPEND makes each *write* atomic,
+    /// but not a pair of them), concatenating two records on one line and corrupting
+    /// the JSONL. One write keeps each record on its own line (ADR-162); mirrors
+    /// `append_access_log`.
     pub fn append_to(&self, path: &str) -> std::io::Result<()> {
         let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(f, "{}", self.to_jsonl())
+        f.write_all(format!("{}\n", self.to_jsonl()).as_bytes())
     }
 }
 
@@ -329,6 +337,53 @@ mod tests {
             logprob: None,
         };
         assert!(r.to_jsonl().contains("\"cost_usd\":0.0125"));
+    }
+
+    #[test]
+    fn test_concurrent_appends_keep_one_record_per_line() {
+        // ADR-162: append_to must write each record as exactly one line even under
+        // concurrent appends from many threads (the thread-per-connection server).
+        // writeln! issued the content and the '\n' as two syscalls, which could
+        // interleave and concatenate two records on one line; read_log's filter_map
+        // would then silently drop both. A single write_all keeps each record intact.
+        let path = format!(
+            "{}/pasture_cost_concurrent_{}_{}.jsonl",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            now_secs(),
+        );
+        let _ = std::fs::remove_file(&path);
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 64;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        CostRecord::new("cloud", "m", 1, 1, 0.001)
+                            .append_to(&p)
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let total = THREADS * PER_THREAD;
+        // Every physical line must parse (no concatenated/torn records) and the
+        // count must equal the number of appends (none lost to corruption).
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), total, "every append must be its own line");
+        for line in &lines {
+            assert!(
+                parse_log_line(line).is_some(),
+                "every line must be a parseable record: {line:?}"
+            );
+        }
+        assert_eq!(read_log(&path).unwrap().len(), total, "no record lost");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

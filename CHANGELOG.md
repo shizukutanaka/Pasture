@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Cost log and trace log appends are now atomic under concurrency (ADR-162)
+
+- `CostRecord::append_to` and `Span::append_to` used `writeln!`, which writes the record and the
+  trailing newline as two separate syscalls.  Under the thread-per-connection server, concurrent
+  appends could interleave and concatenate two records on one line; `read_log`'s `filter_map` then
+  silently dropped both, losing them from cost/budget accounting and the trace log.  Both paths now
+  build the line with its newline and do a single `write_all` (atomic under `O_APPEND`), matching the
+  access log.  New 8-thread concurrency test (fails against the old `writeln!`). (ADR-162)
+
 ### Fixed — Cascade escalations now respect the daily budget / spike guard (ADR-161)
 
 - The cascade runs only when a request is routed Local, where `apply_budget_guard` is a no-op, so a
