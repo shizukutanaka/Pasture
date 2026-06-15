@@ -703,7 +703,12 @@ fn send_json_post(
 ) -> Result<TcpStream, BackendError> {
     let addr = format!("{host}:{port}");
     let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| BackendError::Transport(format!("connect {addr}: {e}")))?;
+        .map_err(|e| {
+            // Log the full address for the operator; omit it from the client-
+            // facing message to avoid leaking internal network topology (ADR-157).
+            eprintln!("pasture: local backend connect {addr}: {e}");
+            BackendError::Transport(format!("local backend unreachable ({e})"))
+        })?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| BackendError::Transport(e.to_string()))?;

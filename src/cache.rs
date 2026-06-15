@@ -37,8 +37,13 @@ pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
 /// the response paired with the vector whose cosine similarity to the query
 /// meets or exceeds `threshold`. On a tie the most-similar entry wins.
 /// Sensitive prompts are never stored — the caller enforces that invariant.
+///
+/// Each entry also carries the requested model name (ADR-158): two requests
+/// for different models with semantically similar content must not share a
+/// cached response, because different models produce different outputs. The
+/// exact-match cache already keys on `req.model`; the semantic cache must too.
 pub struct SemanticCache {
-    entries: VecDeque<(Vec<f64>, CompletionResponse)>,
+    entries: VecDeque<(Vec<f64>, String, CompletionResponse)>,
     cap: usize,
     /// Minimum cosine similarity for a hit (e.g. 0.92).
     threshold: f64,
@@ -81,12 +86,17 @@ impl SemanticCache {
         self.misses.load(Ordering::Relaxed)
     }
 
-    /// Find the best-matching cached response (cosine ≥ threshold).
+    /// Find the best-matching cached response (cosine ≥ threshold, same model).
     /// Returns a clone of the response. Updates hit/miss counters.
-    pub fn find_similar(&mut self, query: &[f64]) -> Option<CompletionResponse> {
+    /// `model` is the client-requested model — entries for other models are skipped
+    /// (ADR-158: different models produce different outputs, must not cross-serve).
+    pub fn find_similar(&mut self, query: &[f64], model: &str) -> Option<CompletionResponse> {
         let mut best_score = self.threshold - f64::EPSILON;
         let mut best: Option<&CompletionResponse> = None;
-        for (emb, resp) in &self.entries {
+        for (emb, m, resp) in &self.entries {
+            if m != model {
+                continue;
+            }
             let score = cosine_similarity(query, emb);
             if score > best_score {
                 best_score = score;
@@ -106,11 +116,12 @@ impl SemanticCache {
     }
 
     /// Store an embedding → response pair, evicting the oldest when over capacity.
-    pub fn put(&mut self, embedding: Vec<f64>, resp: CompletionResponse) {
+    /// `model` is the client-requested model, stored to prevent cross-model hits (ADR-158).
+    pub fn put(&mut self, embedding: Vec<f64>, model: String, resp: CompletionResponse) {
         if self.cap == 0 {
             return;
         }
-        self.entries.push_back((embedding, resp));
+        self.entries.push_back((embedding, model, resp));
         while self.entries.len() > self.cap {
             self.entries.pop_front();
         }
@@ -495,9 +506,9 @@ mod tests {
     fn test_semantic_cache_hit_above_threshold() {
         let mut c = SemanticCache::new(4, 0.9);
         let v = vec![1.0_f64, 0.0, 0.0];
-        c.put(v.clone(), resp("answer"));
-        // Identical query → cosine = 1.0 ≥ 0.9
-        let hit = c.find_similar(&v);
+        c.put(v.clone(), "gpt-4o".to_string(), resp("answer"));
+        // Identical query, same model → cosine = 1.0 ≥ 0.9
+        let hit = c.find_similar(&v, "gpt-4o");
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().content, "answer");
         assert_eq!(c.hits(), 1);
@@ -507,9 +518,9 @@ mod tests {
     #[test]
     fn test_semantic_cache_miss_below_threshold() {
         let mut c = SemanticCache::new(4, 0.95);
-        c.put(vec![1.0, 0.0], resp("a"));
+        c.put(vec![1.0, 0.0], "m".to_string(), resp("a"));
         // Orthogonal vector → cosine = 0 < 0.95
-        let hit = c.find_similar(&[0.0, 1.0]);
+        let hit = c.find_similar(&[0.0, 1.0], "m");
         assert!(hit.is_none());
         assert_eq!(c.misses(), 1);
     }
@@ -521,9 +532,9 @@ mod tests {
         let v_close = vec![0.99f64, 0.14142f64]; // cos ~ 0.99
         let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
         let v_far = vec![inv_sqrt2, inv_sqrt2]; // cos ~ 0.707
-        c.put(v_far.clone(), resp("far"));
-        c.put(v_close.clone(), resp("close"));
-        let hit = c.find_similar(&[1.0, 0.0]);
+        c.put(v_far.clone(), "m".to_string(), resp("far"));
+        c.put(v_close.clone(), "m".to_string(), resp("close"));
+        let hit = c.find_similar(&[1.0, 0.0], "m");
         // Should return the closest match ("close")
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().content, "close");
@@ -533,12 +544,12 @@ mod tests {
     fn test_semantic_cache_fifo_eviction() {
         let mut c = SemanticCache::new(2, 0.9);
         let v = vec![1.0f64, 0.0];
-        c.put(vec![1.0, 0.0], resp("first"));
-        c.put(vec![0.0, 1.0], resp("second"));
-        c.put(vec![0.5, 0.5], resp("third")); // evicts "first"
+        c.put(vec![1.0, 0.0], "m".to_string(), resp("first"));
+        c.put(vec![0.0, 1.0], "m".to_string(), resp("second"));
+        c.put(vec![0.5, 0.5], "m".to_string(), resp("third")); // evicts "first"
         assert_eq!(c.len(), 2);
         // "first" entry ([1,0]) was evicted; an identical query returns one of the remaining
-        let hit = c.find_similar(&v);
+        let hit = c.find_similar(&v, "m");
         // After eviction, [1,0] is gone; [0,1] and [0.5,0.5] remain.
         // cos([1,0],[0,1])=0, cos([1,0],[0.5,0.5])≈0.707 — both below threshold 0.9
         assert!(hit.is_none(), "evicted entry must not be found");
@@ -547,8 +558,29 @@ mod tests {
     #[test]
     fn test_semantic_cache_cap_zero_stores_nothing() {
         let mut c = SemanticCache::new(0, 0.9);
-        c.put(vec![1.0, 0.0], resp("x"));
+        c.put(vec![1.0, 0.0], "m".to_string(), resp("x"));
         assert!(c.is_empty());
-        assert!(c.find_similar(&[1.0, 0.0]).is_none());
+        assert!(c.find_similar(&[1.0, 0.0], "m").is_none());
+    }
+
+    #[test]
+    fn test_semantic_cache_different_model_is_miss() {
+        // ADR-158: semantically identical content for different models must NOT
+        // cross-serve — different models produce different outputs.
+        let mut c = SemanticCache::new(4, 0.9);
+        let v = vec![1.0_f64, 0.0];
+        c.put(v.clone(), "llama3".to_string(), resp("local answer"));
+        // Same embedding, different model → must be a miss.
+        let hit = c.find_similar(&v, "gpt-4o");
+        assert!(
+            hit.is_none(),
+            "cross-model semantic hit must not occur: {:?}",
+            hit.map(|h| h.content)
+        );
+        assert_eq!(c.misses(), 1);
+        // Same model → must be a hit.
+        let hit2 = c.find_similar(&v, "llama3");
+        assert!(hit2.is_some());
+        assert_eq!(hit2.unwrap().content, "local answer");
     }
 }

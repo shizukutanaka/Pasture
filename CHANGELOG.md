@@ -5,6 +5,22 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Semantic cache is now keyed by requested model (ADR-158)
+
+- `SemanticCache` stored `(embedding, response)` with no model identity.  Two requests for the same
+  prompt but different model names produce the same embedding, so the second could get a cache hit
+  returning the first model's response — wrong model, wrong answer.  Each entry now carries the
+  requested model; `find_similar` skips entries for other models.  1 new test. (ADR-158)
+
+### Security — Internal backend addresses stripped from client-facing error messages (ADR-157)
+
+- On a backend transport failure the chain `BackendError::Transport(format!("connect {addr}: {e}"))` →
+  `ProxyError::Backend(…)` → `build_error_response(…)` sent the internal host:port (e.g.,
+  `127.0.0.1:11434`) in the JSON error body to any client.  On network-exposed deployments
+  (`PASTURE_LISTEN_ADDR=0.0.0.0`) this leaks internal topology.  The address is now logged to
+  `stderr` for the operator and a sanitized `"local/cloud backend unreachable (…)"` is returned to
+  clients; the OS error kind (connection refused, timed out) is preserved. (ADR-157)
+
 ### Fixed — Pseudonymizer now masks IPv6 addresses (IMP-19, ADR-156)
 
 - IPv6 became sensitive in ADR-148 but the pseudonymizer still masked only IPv4, so with

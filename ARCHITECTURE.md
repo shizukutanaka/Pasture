@@ -1171,6 +1171,30 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-158 Semantic cache keyed by requested model (ADR-158).**
+  A new Socratic angle — cache correctness across models: "the exact-match cache keys on `req.model`;
+  does the semantic cache?" It does not. `SemanticCache::put` stored `(embedding, CompletionResponse)`
+  with no model identity, and `find_similar` matched on cosine alone. Two requests for the same
+  prompt but different models — e.g., `llama3` for one and `gpt-4o` for another — produce the same
+  embedding (same local embeddings backend, same text), so the second request got a cache hit serving
+  the first model's response. `SemanticCache` entries now carry the requested model string; `put` takes
+  a `model: String` and `find_similar` skips entries whose model differs from the query model. Zero new
+  dependencies; 1 new test (`test_semantic_cache_different_model_is_miss`).
+
+- **ADR-157 Sanitize internal backend addresses in client-facing error messages.**
+  A new Socratic angle — information disclosure: "on a backend transport failure, what does the
+  client's HTTP error body contain?" The chain was `BackendError::Transport(format!("connect
+  {addr}: {e}"))` → `BackendError::Display` → `ProxyError::Backend(e.to_string())` →
+  `build_error_response(e.message(), …)` → JSON sent to the client. On a network-exposed deployment
+  (`PASTURE_LISTEN_ADDR=0.0.0.0`) the client's `"message"` field therefore contained the internal
+  host:port — e.g., `"transport error: connect 127.0.0.1:11434: connection refused"` leaking the
+  Ollama endpoint to any client, and the cloud TLS path similarly exposed the cloud hostname. Fixed by
+  `eprintln!`-ing the full message (with address) for the operator and returning a sanitized variant
+  (`"local backend unreachable ({os error})"` / `"cloud backend unreachable ({os error})"`) to the
+  `BackendError`. The OS error kind (connection refused, timed out) is kept because it is useful to the
+  user; only the internal address is stripped. Zero new dependencies; no new tests needed (the
+  architecture is the invariant: the server test suite passes with the sanitized message).
+
 - **ADR-156 Pseudonymizer masks IPv6 too (IMP-19 / ADR-148 consistency).**
   A new Socratic angle — cross-path privacy consistency: "every route that reaches the cloud should
   apply the same PII protection; does it?" Tracing the cascade escalation showed it is safe (cascade

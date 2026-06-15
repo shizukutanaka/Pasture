@@ -598,7 +598,12 @@ mod transport {
         let connector = native_tls::TlsConnector::new()
             .map_err(|e| BackendError::Transport(format!("tls init: {e}")))?;
         let tcp = TcpStream::connect((host, 443))
-            .map_err(|e| BackendError::Transport(format!("connect {host}: {e}")))?;
+            .map_err(|e| {
+                // Log the full hostname for the operator; sanitize the client-
+                // facing message to avoid leaking internal topology (ADR-157).
+                eprintln!("pasture: cloud backend connect {host}: {e}");
+                BackendError::Transport(format!("cloud backend unreachable ({e})"))
+            })?;
         let mut stream = connector
             .connect(host, tcp)
             .map_err(|e| BackendError::Transport(format!("tls handshake: {e}")))?;
