@@ -1162,6 +1162,12 @@ fn run_config(config: &Config) -> i32 {
             println!("  spike_factor:      {}", config.spike_factor);
         }
     }
+    if config.cloud_price_per_1m != (0.0, 0.0) {
+        println!(
+            "  cloud_price/1M:    ${:.2} in / ${:.2} out",
+            config.cloud_price_per_1m.0, config.cloud_price_per_1m.1
+        );
+    }
     println!("  max_body_bytes:    {}", config.max_body_bytes);
     println!("  cache_control:     {}", config.cache_control);
     println!("  pseudonymize:      {}", config.pseudonymize);
@@ -1425,6 +1431,7 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
             config.spike_factor,
             &config.cost_log_path,
         )
+        .with_cloud_price(config.cloud_price_per_1m.0, config.cloud_price_per_1m.1)
         .with_max_body_bytes(config.max_body_bytes)
         .with_pseudonymize(config.pseudonymize)
         .with_otel_log(if config.otel_log.is_empty() {

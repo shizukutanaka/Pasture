@@ -103,6 +103,7 @@ Defaults are sensible; override via environment variables:
 | `PASTURE_BUDGET_DAILY_TOKENS` | `0` | daily cloud token budget (prompt + completion combined, UTC day); 0 = disabled |
 | `PASTURE_BUDGET_ACTION` | `local-only` | action when daily budget is exceeded: `local-only` (silently redirect to local), `warn` (log + proceed), `block` (return 429) |
 | `PASTURE_SPIKE_FACTOR` | `50` | redirect a single request to local when it estimates more than N × the running average tokens (0 = disabled) |
+| `PASTURE_CLOUD_PRICE_PER_1M` | _(off)_ | cloud price in USD per 1M tokens as `<input>,<output>` (e.g. `2.50,10.00`); makes `cloud_cost_usd` / `pasture_cloud_cost_usd_total` report real dollars instead of 0 |
 | `PASTURE_MAX_BODY_BYTES` | `16777216` | maximum request body size in bytes; bodies larger than this are rejected with 413 |
 | `PASTURE_CACHE_CONTROL` | _(off)_ | set to `1` to add `cache_control` hints on Anthropic system messages (prompt prefix caching); no-op for OpenAI |
 | `PASTURE_PSEUDONYMIZE` | _(off)_ | set to `1` to replace detected PII (email, IPv4, phone, API-key prefix) with stable opaque tokens in cloud-bound requests, then restore in the response; applies to both buffered and streaming responses; mapping never logged |

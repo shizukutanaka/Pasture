@@ -95,6 +95,12 @@ pub struct Config {
     /// to local (regardless of budget). 0 = spike detection disabled.
     /// Set via `PASTURE_SPIKE_FACTOR`. Default 50.
     pub spike_factor: u64,
+    /// Cloud price in USD per 1M tokens as `(input, output)` (ADR-166). Lets the
+    /// cost log and the `/metrics` + `/v1/stats` spend gauges report real dollars
+    /// for cloud completions instead of a structural 0. `(0.0, 0.0)` (default)
+    /// disables pricing. Set via `PASTURE_CLOUD_PRICE_PER_1M="<input>,<output>"`
+    /// (e.g. `"2.50,10.00"`).
+    pub cloud_price_per_1m: (f64, f64),
     /// Maximum body bytes accepted per request (IMP-21). Requests larger than
     /// this are rejected with 413. Default 16 MiB. Set via `PASTURE_MAX_BODY_BYTES`.
     pub max_body_bytes: usize,
@@ -163,6 +169,7 @@ impl Default for Config {
             budget_daily_tokens: 0,
             budget_action: "local-only".to_string(),
             spike_factor: 50,
+            cloud_price_per_1m: (0.0, 0.0),
             max_body_bytes: 16 * 1024 * 1024,
             cache_control: false,
             pseudonymize: false,
@@ -368,6 +375,11 @@ impl Config {
                 self.spike_factor = n;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_CLOUD_PRICE_PER_1M") {
+            if let Some(price) = parse_price_pair(&v) {
+                self.cloud_price_per_1m = price;
+            }
+        }
         if let Ok(v) = std::env::var("PASTURE_MAX_BODY_BYTES") {
             if let Ok(n) = v.parse::<usize>() {
                 self.max_body_bytes = n;
@@ -514,6 +526,11 @@ impl Config {
                     self.spike_factor = n;
                 }
             }
+            "cloud_price_per_1m" => {
+                if let Some(price) = parse_price_pair(val) {
+                    self.cloud_price_per_1m = price;
+                }
+            }
             "max_body_bytes" => {
                 if let Ok(n) = val.parse::<usize>() {
                     self.max_body_bytes = n;
@@ -530,6 +547,21 @@ impl Config {
             "cloud_fallback_model" => self.cloud_fallback_model = val.to_string(),
             _ => {}
         }
+    }
+}
+
+/// Parse a `"<input>,<output>"` cloud price (USD per 1M tokens) into `(input,
+/// output)` (ADR-166). Returns `None` unless both parts parse to finite,
+/// non-negative floats, so a malformed value leaves the default `(0.0, 0.0)`
+/// rather than silently disabling or corrupting pricing.
+pub(crate) fn parse_price_pair(val: &str) -> Option<(f64, f64)> {
+    let (a, b) = val.split_once(',')?;
+    let input = a.trim().parse::<f64>().ok()?;
+    let output = b.trim().parse::<f64>().ok()?;
+    if input.is_finite() && output.is_finite() && input >= 0.0 && output >= 0.0 {
+        Some((input, output))
+    } else {
+        None
     }
 }
 
@@ -556,6 +588,29 @@ mod tests {
     #[test]
     fn test_default_listen_addr() {
         assert_eq!(Config::default().listen_addr, "127.0.0.1:8645");
+    }
+
+    #[test]
+    fn test_parse_price_pair_valid() {
+        assert_eq!(parse_price_pair("2.50,10.00"), Some((2.50, 10.00)));
+        assert_eq!(parse_price_pair(" 0.15 , 0.6 "), Some((0.15, 0.6)));
+        assert_eq!(parse_price_pair("0,0"), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn test_parse_price_pair_rejects_malformed() {
+        // ADR-166: malformed values are rejected so the default (0,0) survives.
+        assert_eq!(parse_price_pair("2.50"), None); // missing second field
+        assert_eq!(parse_price_pair("abc,10"), None); // non-numeric
+        assert_eq!(parse_price_pair("-1,10"), None); // negative
+        assert_eq!(parse_price_pair("inf,10"), None); // non-finite
+        assert_eq!(parse_price_pair(""), None);
+    }
+
+    #[test]
+    fn test_config_parses_cloud_price_key() {
+        let cfg = Config::from_str_with_defaults("cloud_price_per_1m = 3.00,15.00\n");
+        assert_eq!(cfg.cloud_price_per_1m, (3.00, 15.00));
     }
 
     #[test]

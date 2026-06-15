@@ -3682,6 +3682,89 @@ fn test_budget_gauge_reads_zero_on_new_day() {
     let _ = std::fs::remove_file(&log);
 }
 
+// ── ADR-166 cloud pricing makes the cost metric real ─────────────────────────
+
+#[test]
+fn test_cloud_cost_logged_from_pricing() {
+    // ADR-166: with pricing configured, a cloud completion logs a real cost_usd
+    // instead of a structural 0. $2.50/1M input + $10.00/1M output; a response
+    // with 1000 prompt + 500 completion tokens costs
+    // 1000/1e6*2.50 + 500/1e6*10.00 = 0.0025 + 0.0050 = 0.0075.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_cloud_price(2.50, 10.00);
+    let r = CompletionResponse {
+        content: "x".to_string(),
+        model: "cloud-model".to_string(),
+        prompt_tokens: 1000,
+        completion_tokens: 500,
+    };
+    p.log_cost("cloud", &r, None, 0);
+    let recs = crate::cost::read_log(&log).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert!(
+        (recs[0].cost_usd - 0.0075).abs() < 1e-9,
+        "cloud cost must be priced: {}",
+        recs[0].cost_usd
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_local_and_cache_cost_zero_even_with_pricing() {
+    // ADR-166: pricing applies only to the cloud route. Local and cache are free,
+    // so their cost_usd stays 0 even when cloud pricing is configured.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_cloud_price(2.50, 10.00);
+    let r = CompletionResponse {
+        content: "x".to_string(),
+        model: "m".to_string(),
+        prompt_tokens: 1000,
+        completion_tokens: 500,
+    };
+    p.log_cost("local", &r, None, 0);
+    p.log_cost("cache", &r, None, 0);
+    let recs = crate::cost::read_log(&log).unwrap();
+    assert_eq!(recs.len(), 2);
+    assert!(recs.iter().all(|r| r.cost_usd == 0.0), "local/cache must be free");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_price_clamps_negative_and_nonfinite() {
+    // ADR-166: a negative or non-finite price is clamped to 0 so a misconfiguration
+    // cannot produce a negative or NaN spend total.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_cloud_price(-5.0, f64::NAN);
+    let r = CompletionResponse {
+        content: "x".to_string(),
+        model: "cloud-model".to_string(),
+        prompt_tokens: 1000,
+        completion_tokens: 500,
+    };
+    p.log_cost("cloud", &r, None, 0);
+    let recs = crate::cost::read_log(&log).unwrap();
+    assert_eq!(recs[0].cost_usd, 0.0, "bad prices must clamp to 0");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_no_pricing_keeps_cost_zero() {
+    // ADR-166: without pricing (default), cloud cost stays 0 — honestly, because
+    // no price is configured, not because the metric is broken.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log);
+    let r = CompletionResponse {
+        content: "x".to_string(),
+        model: "cloud-model".to_string(),
+        prompt_tokens: 1000,
+        completion_tokens: 500,
+    };
+    p.log_cost("cloud", &r, None, 0);
+    let recs = crate::cost::read_log(&log).unwrap();
+    assert_eq!(recs[0].cost_usd, 0.0);
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── IMP-15 auth precedes rate limiting (Socratic-dialogue fix) ─────────────
 #[test]
 fn test_unauthenticated_request_does_not_consume_rate_budget() {

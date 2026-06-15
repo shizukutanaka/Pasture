@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Optional cloud pricing makes `cloud_cost_usd` a real number (ADR-166)
+
+- `log_cost` hardcoded `cost_usd = 0.0` and no pricing existed anywhere, so the `cloud_cost_usd` field
+  in `/v1/stats`, the `pasture_cloud_cost_usd_total` Prometheus counter, and the `pasture stats` "cloud
+  spend" line were *structurally always $0.0000* — a cost metric that can only read zero, which actively
+  misleads.  Added optional cloud pricing via `PASTURE_CLOUD_PRICE_PER_1M="<input>,<output>"` (USD per 1M
+  prompt / completion tokens, e.g. `2.50,10.00`; also a `cloud_price_per_1m` config-file key).  Cloud
+  completions now log a real `cost_usd = prompt/1e6 × input + completion/1e6 × output`; local and cache
+  stay free.  Malformed, negative, or non-finite prices are rejected/clamped to 0, so the default
+  (unset) keeps cost at 0 honestly.  Consistent with the BYOK, no-stale-hardcoded-pricing philosophy.
+  7 tests.  (ADR-166)
+
 ### Added — Daily token budget is observable on `/metrics` and `/v1/stats` (ADR-165)
 
 - The daily cloud-token budget (IMP-26) was enforced but invisible: the metrics endpoints reported

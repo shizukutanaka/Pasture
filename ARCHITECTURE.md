@@ -1171,6 +1171,23 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-166 The `cloud_cost_usd` metric is real — optional per-1M cloud pricing, not a structural 0.**
+  Following ADR-165's observability thread to its sibling metric: "`/metrics`, `/v1/stats`, and the
+  `pasture stats` CLI all report `cloud_cost_usd` / `pasture_cloud_cost_usd_total` / 'cloud spend' — but
+  `log_cost` hardcodes `cost_usd = 0.0`, and no pricing exists anywhere in the codebase. So that number
+  is *structurally always $0.0000*." A cost metric that can only read zero is worse than absent: an
+  operator watching 'cloud spend: $0.00' concludes they are spending nothing. Fixed by adding **optional**
+  cloud pricing, consistent with the BYOK / zero-hardcoded-config philosophy (no baked-in price table to
+  go stale): `PASTURE_CLOUD_PRICE_PER_1M="<input>,<output>"` (USD per 1M prompt / completion tokens, e.g.
+  `"2.50,10.00"`), parsed by `parse_price_pair` (rejects malformed / negative / non-finite, leaving the
+  `(0.0, 0.0)` default). `Proxy::with_cloud_price` clamps bad values to 0; `cloud_cost_usd(prompt,
+  completion)` computes `prompt/1e6 × in + completion/1e6 × out`; `log_cost` uses it for the cloud route
+  only (local and cache stay free). With pricing set, the existing cost log, spend gauges, and CLI line
+  become meaningful; unset, the cost is honestly 0 because no price is configured — not because the metric
+  is broken. Seven tests (4 proxy: priced cloud cost, local/cache free, negative/NaN clamp, default-zero;
+  3 config: valid parse, malformed rejection, file-config key). Token counts only — no PII (I3). Zero new
+  dependencies.
+
 - **ADR-165 The daily token budget is observable — `/metrics` + `/v1/stats` expose used-vs-limit.**
   A Socratic angle on the budget feature as a whole: "Pasture *enforces* a daily cloud-token budget
   (IMP-26), but is that enforcement *observable*? If an operator sets `PASTURE_BUDGET_DAILY_TOKENS`,

@@ -209,6 +209,12 @@ pub struct Proxy {
     /// `spike_factor × running-average` tokens overrides the cloud route to local.
     /// 0 = spike detection disabled.
     spike_factor: u64,
+    /// Cloud price in USD per 1M tokens as `(input, output)` (ADR-166). Used to
+    /// compute the real `cost_usd` for cloud completions in the cost log and the
+    /// `/metrics` + `/v1/stats` spend gauges. `(0.0, 0.0)` (default) means no
+    /// pricing is configured and the cost stays 0 — honestly, rather than a
+    /// metric that silently always reads zero.
+    cloud_price_per_1m: (f64, f64),
     /// Maximum request body bytes (IMP-21). Default 16 MiB. Set via
     /// `PASTURE_MAX_BODY_BYTES`. Bodies larger than this yield 413.
     max_body_bytes: usize,
@@ -291,6 +297,7 @@ impl Proxy {
             budget_daily_tokens: 0,
             budget_action: "local-only".to_string(),
             spike_factor: 50,
+            cloud_price_per_1m: (0.0, 0.0),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             cloud_fallback: None,
             metrics_cache: std::sync::Mutex::new((0, crate::cost::summarize(&[]))),
@@ -324,6 +331,27 @@ impl Proxy {
             self.budget_day = AtomicU64::new(unix_now() / 86_400);
         }
         self
+    }
+
+    /// Set cloud pricing in USD per 1M tokens as `(input, output)` (ADR-166).
+    /// Cloud completions then log a real `cost_usd` (prompt × input + completion ×
+    /// output, per million tokens), making the cost log and the `/metrics` +
+    /// `/v1/stats` spend gauges meaningful. `(0.0, 0.0)` leaves cost at 0. Negative
+    /// or non-finite prices are clamped to 0 so a misconfiguration cannot produce a
+    /// negative or NaN spend total.
+    pub fn with_cloud_price(mut self, input_per_1m: f64, output_per_1m: f64) -> Self {
+        let clamp = |x: f64| if x.is_finite() && x > 0.0 { x } else { 0.0 };
+        self.cloud_price_per_1m = (clamp(input_per_1m), clamp(output_per_1m));
+        self
+    }
+
+    /// USD cost of a cloud completion from its token counts and configured pricing
+    /// (ADR-166). Zero when no pricing is set. Only cloud routes incur a cost;
+    /// local and cache are free.
+    fn cloud_cost_usd(&self, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+        let (in_price, out_price) = self.cloud_price_per_1m;
+        (prompt_tokens as f64 / 1_000_000.0) * in_price
+            + (completion_tokens as f64 / 1_000_000.0) * out_price
     }
 
     /// Set the maximum request body size in bytes (IMP-21). Bodies larger than
@@ -1201,14 +1229,20 @@ impl Proxy {
         logprob: Option<f64>,
         reserved_tokens: u64,
     ) {
-        // Record cost (local and cache are free). PII is never written (I5);
-        // logprob is the local-answer confidence number, not content.
+        // Record cost. Local and cache are free; cloud is priced from the
+        // configured per-1M rates (ADR-166) — 0.0 when no pricing is set. PII is
+        // never written (I5); logprob is the local-answer confidence, not content.
+        let cost_usd = if route_label == "cloud" {
+            self.cloud_cost_usd(resp.prompt_tokens, resp.completion_tokens)
+        } else {
+            0.0
+        };
         let record = CostRecord::new(
             route_label,
             &resp.model,
             resp.prompt_tokens,
             resp.completion_tokens,
-            0.0,
+            cost_usd,
         )
         .with_logprob(logprob);
         if let Err(e) = record.append_to(&self.cost_log_path) {
