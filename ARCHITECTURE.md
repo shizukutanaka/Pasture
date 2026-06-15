@@ -1171,6 +1171,22 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-159 Semantic cache keyed by sampling parameters too (extends ADR-158).**
+  The same Socratic angle as ADR-158, one dimension over: "the exact-match cache keys on the sampling
+  parameters — `request_key`'s own comment says *'a `temperature:0` response is never served to a
+  `temperature:1` request'* — does the semantic cache?" After ADR-158 it keyed on model but still
+  ignored sampling entirely (`semantic_embed_text` embeds only message text). So the fuzzy cache could
+  serve a cached `temperature:0` (deterministic) answer to a `temperature:1.8` (high-randomness)
+  request, or a `max_tokens:10` cached answer to a full-length request — exactly the cross-serve the
+  exact-match cache deliberately prevents. Fixed by storing a `sampling_key` (a `u64` over the same
+  output-affecting fields `request_key` hashes — temperature, top_p, max_tokens, seed, penalties, stop,
+  response_format) in each semantic entry; `find_similar` skips entries whose sampling signature
+  differs. The hashing logic is now a single `hash_sampling` helper shared by `request_key` and
+  `sampling_key`, so both caches have one source of truth for "which knobs change the answer." The
+  prompt is still matched fuzzily (cosine); model and sampling are matched exactly. Zero new
+  dependencies; 2 new tests (`test_semantic_cache_different_sampling_is_miss`,
+  `test_sampling_key_distinguishes_temperature`).
+
 - **ADR-158 Semantic cache keyed by requested model (ADR-158).**
   A new Socratic angle — cache correctness across models: "the exact-match cache keys on `req.model`;
   does the semantic cache?" It does not. `SemanticCache::put` stored `(embedding, CompletionResponse)`

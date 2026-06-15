@@ -937,7 +937,8 @@ impl Proxy {
             (query_embedding.as_ref(), self.semantic_cache.as_ref())
         {
             if let Ok(mut guard) = sem_mutex.lock() {
-                if let Some(hit) = guard.find_similar(emb, &req.model) {
+                let samp = crate::cache::sampling_key(&req.sampling);
+                if let Some(hit) = guard.find_similar(emb, &req.model, samp) {
                     self.emit_cache_hit_span(otel_span, &hit, "semantic_cache");
                     return EmbeddingStep::SemanticHit(hit);
                 }
@@ -1015,6 +1016,7 @@ impl Proxy {
         query_embedding: Option<Vec<f64>>,
         cache_mapping: Option<&crate::pseudonymize::Mapping>,
         req_model: &str,
+        req_sampling: u64,
     ) {
         self.log_cost(route_label, r, None);
         if let (Some(span), Some(log_path)) = (otel_span.as_mut(), self.otel_log.as_deref()) {
@@ -1045,7 +1047,7 @@ impl Proxy {
             let mut to_cache = r.clone();
             to_cache.content = restored;
             if let Ok(mut g) = sem_mutex.lock() {
-                g.put(emb, req_model.to_string(), to_cache);
+                g.put(emb, req_model.to_string(), req_sampling, to_cache);
             }
         }
     }
@@ -1353,7 +1355,8 @@ impl Proxy {
             (query_embedding, self.semantic_cache.as_ref())
         {
             if let Ok(mut guard) = sem_mutex.lock() {
-                guard.put(emb, req.model.clone(), resp.clone());
+                let samp = crate::cache::sampling_key(&req.sampling);
+                guard.put(emb, req.model.clone(), samp, resp.clone());
             }
         }
 
@@ -2268,6 +2271,7 @@ impl Proxy {
                     query_embedding,
                     cache_mapping.as_ref(),
                     &req.model,
+                    crate::cache::sampling_key(&req.sampling),
                 );
                 if io_err.is_none() {
                     // Flush any buffered token tail held back across the final delta.

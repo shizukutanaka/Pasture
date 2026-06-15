@@ -2170,7 +2170,7 @@ fn test_finalize_streamed_accounts_without_client_io() {
         &Proxy::parse_request(r#"{"model":"m","messages":[{"role":"user","content":"q"}]}"#)
             .unwrap(),
     );
-    p.finalize_streamed(&r, Route::Local, "local", &mut span, Some(key), None, None, "m");
+    p.finalize_streamed(&r, Route::Local, "local", &mut span, Some(key), None, None, "m", 0);
     // Cost record written.
     let recs = crate::cost::read_log(&cost_log).unwrap();
     assert_eq!(recs.len(), 1, "completion must be cost-logged");
@@ -2207,7 +2207,7 @@ fn test_finalize_streamed_accrues_cloud_budget() {
         completion_tokens: 50,
     };
     let mut span = None;
-    p.finalize_streamed(&r, Route::Cloud, "cloud", &mut span, None, None, None, "cloud-model");
+    p.finalize_streamed(&r, Route::Cloud, "cloud", &mut span, None, None, None, "cloud-model", 0);
     let after = p.today_cloud_tokens.load(Ordering::Relaxed);
     assert_eq!(after - before, 150, "cloud tokens must accrue to the budget");
     let _ = std::fs::remove_file(&log);

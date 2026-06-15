@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Semantic cache is now keyed by sampling parameters (ADR-159)
+
+- After ADR-158 the semantic cache keyed on model but still ignored sampling parameters, so it could
+  serve a cached `temperature:0` (deterministic) answer to a `temperature:1.8` request — the exact
+  cross-serve the exact-match cache deliberately prevents.  Each entry now stores a `sampling_key`
+  (over temperature, top_p, max_tokens, seed, penalties, stop, response_format); `find_similar` skips
+  entries whose sampling signature differs.  `hash_sampling` is shared by `request_key` and
+  `sampling_key` so both caches agree on which knobs matter.  2 new tests. (ADR-159)
+
 ### Fixed — Semantic cache is now keyed by requested model (ADR-158)
 
 - `SemanticCache` stored `(embedding, response)` with no model identity.  Two requests for the same

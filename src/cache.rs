@@ -38,12 +38,15 @@ pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
 /// meets or exceeds `threshold`. On a tie the most-similar entry wins.
 /// Sensitive prompts are never stored — the caller enforces that invariant.
 ///
-/// Each entry also carries the requested model name (ADR-158): two requests
-/// for different models with semantically similar content must not share a
-/// cached response, because different models produce different outputs. The
-/// exact-match cache already keys on `req.model`; the semantic cache must too.
+/// Each entry also carries the requested model name (ADR-158) and a sampling
+/// signature (ADR-159): two requests with semantically similar content must not
+/// share a cached response when they target different models, or differ in
+/// output-affecting sampling parameters (temperature, top_p, max_tokens, seed,
+/// penalties, stop, response_format). The exact-match cache already keys on
+/// model + sampling via `request_key`; the semantic cache matches the prompt
+/// fuzzily (cosine) but model and sampling exactly.
 pub struct SemanticCache {
-    entries: VecDeque<(Vec<f64>, String, CompletionResponse)>,
+    entries: VecDeque<(Vec<f64>, String, u64, CompletionResponse)>,
     cap: usize,
     /// Minimum cosine similarity for a hit (e.g. 0.92).
     threshold: f64,
@@ -86,15 +89,21 @@ impl SemanticCache {
         self.misses.load(Ordering::Relaxed)
     }
 
-    /// Find the best-matching cached response (cosine ≥ threshold, same model).
-    /// Returns a clone of the response. Updates hit/miss counters.
-    /// `model` is the client-requested model — entries for other models are skipped
-    /// (ADR-158: different models produce different outputs, must not cross-serve).
-    pub fn find_similar(&mut self, query: &[f64], model: &str) -> Option<CompletionResponse> {
+    /// Find the best-matching cached response (cosine ≥ threshold, same model and
+    /// sampling). Returns a clone of the response. Updates hit/miss counters.
+    /// Entries for other models (ADR-158) or with a different sampling signature
+    /// (ADR-159) are skipped — different models and different output-affecting
+    /// sampling produce different outputs, so they must not cross-serve.
+    pub fn find_similar(
+        &mut self,
+        query: &[f64],
+        model: &str,
+        sampling: u64,
+    ) -> Option<CompletionResponse> {
         let mut best_score = self.threshold - f64::EPSILON;
         let mut best: Option<&CompletionResponse> = None;
-        for (emb, m, resp) in &self.entries {
-            if m != model {
+        for (emb, m, samp, resp) in &self.entries {
+            if m != model || *samp != sampling {
                 continue;
             }
             let score = cosine_similarity(query, emb);
@@ -116,12 +125,13 @@ impl SemanticCache {
     }
 
     /// Store an embedding → response pair, evicting the oldest when over capacity.
-    /// `model` is the client-requested model, stored to prevent cross-model hits (ADR-158).
-    pub fn put(&mut self, embedding: Vec<f64>, model: String, resp: CompletionResponse) {
+    /// `model` (ADR-158) and `sampling` (ADR-159, from `sampling_key`) are stored
+    /// to prevent cross-model and cross-sampling hits.
+    pub fn put(&mut self, embedding: Vec<f64>, model: String, sampling: u64, resp: CompletionResponse) {
         if self.cap == 0 {
             return;
         }
-        self.entries.push_back((embedding, model, resp));
+        self.entries.push_back((embedding, model, sampling, resp));
         while self.entries.len() > self.cap {
             self.entries.pop_front();
         }
@@ -142,7 +152,15 @@ pub fn request_key(req: &CompletionRequest) -> u64 {
         // Internal whitespace is left intact (code/formatting matters there).
         m.content.trim().hash(&mut h);
     }
-    let s = &req.sampling;
+    hash_sampling(&mut h, &req.sampling);
+    h.finish()
+}
+
+/// Fold the sampling parameters into `h`. Shared by `request_key` (exact-match
+/// cache) and `sampling_key` (semantic cache) so both caches treat the same set
+/// of output-affecting parameters as significant — there is one source of truth
+/// for "which knobs change the answer".
+fn hash_sampling(h: &mut DefaultHasher, s: &crate::backend::SamplingParams) {
     // f64 has no Hash; hash the bit pattern (None as a fixed sentinel).
     let hash_opt_f64 = |h: &mut DefaultHasher, x: Option<f64>| match x {
         Some(v) => {
@@ -151,19 +169,30 @@ pub fn request_key(req: &CompletionRequest) -> u64 {
         }
         None => 0u8.hash(h),
     };
-    hash_opt_f64(&mut h, s.temperature);
-    hash_opt_f64(&mut h, s.top_p);
-    s.max_tokens.hash(&mut h);
-    s.seed.hash(&mut h);
-    hash_opt_f64(&mut h, s.presence_penalty);
-    hash_opt_f64(&mut h, s.frequency_penalty);
+    hash_opt_f64(h, s.temperature);
+    hash_opt_f64(h, s.top_p);
+    s.max_tokens.hash(h);
+    s.seed.hash(h);
+    hash_opt_f64(h, s.presence_penalty);
+    hash_opt_f64(h, s.frequency_penalty);
     for stop in &s.stop {
-        stop.hash(&mut h);
+        stop.hash(h);
     }
     // response_format (a JSON value) has no Hash; hash its canonical string.
     if let Some(rf) = &s.response_format {
-        rf.to_json_string().hash(&mut h);
+        rf.to_json_string().hash(h);
     }
+}
+
+/// Stable signature of just the sampling parameters (ADR-159). The semantic
+/// cache stores this alongside each entry so a `temperature:0` (deterministic)
+/// answer is never served to a `temperature:1.8` (high-randomness) request —
+/// the same invariant `request_key` enforces for the exact-match cache, applied
+/// to the fuzzy cache. The prompt is matched by cosine; model and sampling are
+/// matched exactly.
+pub fn sampling_key(s: &crate::backend::SamplingParams) -> u64 {
+    let mut h = DefaultHasher::new();
+    hash_sampling(&mut h, s);
     h.finish()
 }
 
@@ -506,9 +535,9 @@ mod tests {
     fn test_semantic_cache_hit_above_threshold() {
         let mut c = SemanticCache::new(4, 0.9);
         let v = vec![1.0_f64, 0.0, 0.0];
-        c.put(v.clone(), "gpt-4o".to_string(), resp("answer"));
-        // Identical query, same model → cosine = 1.0 ≥ 0.9
-        let hit = c.find_similar(&v, "gpt-4o");
+        c.put(v.clone(), "gpt-4o".to_string(), 0, resp("answer"));
+        // Identical query, same model + sampling → cosine = 1.0 ≥ 0.9
+        let hit = c.find_similar(&v, "gpt-4o", 0);
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().content, "answer");
         assert_eq!(c.hits(), 1);
@@ -518,9 +547,9 @@ mod tests {
     #[test]
     fn test_semantic_cache_miss_below_threshold() {
         let mut c = SemanticCache::new(4, 0.95);
-        c.put(vec![1.0, 0.0], "m".to_string(), resp("a"));
+        c.put(vec![1.0, 0.0], "m".to_string(), 0, resp("a"));
         // Orthogonal vector → cosine = 0 < 0.95
-        let hit = c.find_similar(&[0.0, 1.0], "m");
+        let hit = c.find_similar(&[0.0, 1.0], "m", 0);
         assert!(hit.is_none());
         assert_eq!(c.misses(), 1);
     }
@@ -532,9 +561,9 @@ mod tests {
         let v_close = vec![0.99f64, 0.14142f64]; // cos ~ 0.99
         let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
         let v_far = vec![inv_sqrt2, inv_sqrt2]; // cos ~ 0.707
-        c.put(v_far.clone(), "m".to_string(), resp("far"));
-        c.put(v_close.clone(), "m".to_string(), resp("close"));
-        let hit = c.find_similar(&[1.0, 0.0], "m");
+        c.put(v_far.clone(), "m".to_string(), 0, resp("far"));
+        c.put(v_close.clone(), "m".to_string(), 0, resp("close"));
+        let hit = c.find_similar(&[1.0, 0.0], "m", 0);
         // Should return the closest match ("close")
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().content, "close");
@@ -544,12 +573,12 @@ mod tests {
     fn test_semantic_cache_fifo_eviction() {
         let mut c = SemanticCache::new(2, 0.9);
         let v = vec![1.0f64, 0.0];
-        c.put(vec![1.0, 0.0], "m".to_string(), resp("first"));
-        c.put(vec![0.0, 1.0], "m".to_string(), resp("second"));
-        c.put(vec![0.5, 0.5], "m".to_string(), resp("third")); // evicts "first"
+        c.put(vec![1.0, 0.0], "m".to_string(), 0, resp("first"));
+        c.put(vec![0.0, 1.0], "m".to_string(), 0, resp("second"));
+        c.put(vec![0.5, 0.5], "m".to_string(), 0, resp("third")); // evicts "first"
         assert_eq!(c.len(), 2);
         // "first" entry ([1,0]) was evicted; an identical query returns one of the remaining
-        let hit = c.find_similar(&v, "m");
+        let hit = c.find_similar(&v, "m", 0);
         // After eviction, [1,0] is gone; [0,1] and [0.5,0.5] remain.
         // cos([1,0],[0,1])=0, cos([1,0],[0.5,0.5])≈0.707 — both below threshold 0.9
         assert!(hit.is_none(), "evicted entry must not be found");
@@ -558,9 +587,9 @@ mod tests {
     #[test]
     fn test_semantic_cache_cap_zero_stores_nothing() {
         let mut c = SemanticCache::new(0, 0.9);
-        c.put(vec![1.0, 0.0], "m".to_string(), resp("x"));
+        c.put(vec![1.0, 0.0], "m".to_string(), 0, resp("x"));
         assert!(c.is_empty());
-        assert!(c.find_similar(&[1.0, 0.0], "m").is_none());
+        assert!(c.find_similar(&[1.0, 0.0], "m", 0).is_none());
     }
 
     #[test]
@@ -569,9 +598,9 @@ mod tests {
         // cross-serve — different models produce different outputs.
         let mut c = SemanticCache::new(4, 0.9);
         let v = vec![1.0_f64, 0.0];
-        c.put(v.clone(), "llama3".to_string(), resp("local answer"));
+        c.put(v.clone(), "llama3".to_string(), 0, resp("local answer"));
         // Same embedding, different model → must be a miss.
-        let hit = c.find_similar(&v, "gpt-4o");
+        let hit = c.find_similar(&v, "gpt-4o", 0);
         assert!(
             hit.is_none(),
             "cross-model semantic hit must not occur: {:?}",
@@ -579,8 +608,41 @@ mod tests {
         );
         assert_eq!(c.misses(), 1);
         // Same model → must be a hit.
-        let hit2 = c.find_similar(&v, "llama3");
+        let hit2 = c.find_similar(&v, "llama3", 0);
         assert!(hit2.is_some());
         assert_eq!(hit2.unwrap().content, "local answer");
+    }
+
+    #[test]
+    fn test_semantic_cache_different_sampling_is_miss() {
+        // ADR-159: semantically identical content with different output-affecting
+        // sampling (e.g. temperature) must NOT cross-serve — the exact-match cache
+        // already enforces this; the semantic cache must too.
+        let mut c = SemanticCache::new(4, 0.9);
+        let v = vec![1.0_f64, 0.0];
+        // Stored under sampling signature 111 (e.g. temperature:0, deterministic).
+        c.put(v.clone(), "m".to_string(), 111, resp("deterministic answer"));
+        // Same embedding + model but a different sampling signature → miss.
+        let hit = c.find_similar(&v, "m", 222);
+        assert!(
+            hit.is_none(),
+            "cross-sampling semantic hit must not occur: {:?}",
+            hit.map(|h| h.content)
+        );
+        assert_eq!(c.misses(), 1);
+        // Same sampling signature → hit.
+        let hit2 = c.find_similar(&v, "m", 111);
+        assert!(hit2.is_some());
+        assert_eq!(hit2.unwrap().content, "deterministic answer");
+    }
+
+    #[test]
+    fn test_sampling_key_distinguishes_temperature() {
+        use crate::backend::SamplingParams;
+        let t0 = SamplingParams { temperature: Some(0.0), ..Default::default() };
+        let t1 = SamplingParams { temperature: Some(1.0), ..Default::default() };
+        let t0b = SamplingParams { temperature: Some(0.0), ..Default::default() };
+        assert_ne!(sampling_key(&t0), sampling_key(&t1), "temp 0 vs 1 must differ");
+        assert_eq!(sampling_key(&t0), sampling_key(&t0b), "same params must match");
     }
 }
