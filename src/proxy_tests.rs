@@ -3557,6 +3557,62 @@ fn test_budget_pre_reservation_blocks_at_ceiling() {
     let _ = std::fs::remove_file(&log);
 }
 
+// ── ADR-164 budget release saturates at 0 across a UTC day rollover ───────────
+
+#[test]
+fn test_budget_reconcile_does_not_underflow_across_day_rollover() {
+    // ADR-164: a request pre-reserves estimated tokens, then the UTC day rolls
+    // over (roll_budget_day_if_needed resets the counter to 0) before log_cost
+    // reconciles. The reconciliation subtracts (reserved - actual); a plain
+    // fetch_sub would underflow to ~u64::MAX, dwarfing any budget and silently
+    // blocking the cloud route for the rest of the new day. The saturating
+    // release must clamp at 0 instead.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_budget(1000, "local-only", 0, "/dev/null");
+    let today = unix_now() / 86_400;
+    p.budget_day.store(today, Ordering::Relaxed);
+    // Simulate the post-rollover state: the new day's counter is 0.
+    p.today_cloud_tokens.store(0, Ordering::Relaxed);
+    // Cloud response whose actual tokens (10) are far below the 500-token reservation.
+    let r = CompletionResponse {
+        content: "x".to_string(),
+        model: "m".to_string(),
+        prompt_tokens: 4,
+        completion_tokens: 6,
+    };
+    // reserved=500, actual=10 → reconcile subtracts 490 from a counter of 0.
+    p.log_cost("cloud", &r, None, 500);
+    let counter = p.today_cloud_tokens.load(Ordering::Relaxed);
+    assert_eq!(
+        counter, 0,
+        "saturating release must clamp at 0, not underflow: {counter}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_budget_local_fallback_release_does_not_underflow() {
+    // ADR-164: the fallback-to-local release path (route_label="local" with a
+    // non-zero reservation) must also saturate. A day rollover that zeroes the
+    // counter between reservation and release would otherwise wrap it.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_budget(1000, "local-only", 0, "/dev/null");
+    let today = unix_now() / 86_400;
+    p.budget_day.store(today, Ordering::Relaxed);
+    p.today_cloud_tokens.store(0, Ordering::Relaxed);
+    let r = CompletionResponse {
+        content: "x".to_string(),
+        model: "m".to_string(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+    };
+    // Planned cloud (reserved=300) fell back to local; release 300 from a 0 counter.
+    p.log_cost("local", &r, None, 300);
+    let counter = p.today_cloud_tokens.load(Ordering::Relaxed);
+    assert_eq!(counter, 0, "local-fallback release must clamp at 0: {counter}");
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── IMP-15 auth precedes rate limiting (Socratic-dialogue fix) ─────────────
 #[test]
 fn test_unauthenticated_request_does_not_consume_rate_budget() {

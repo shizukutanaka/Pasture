@@ -5,6 +5,20 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Budget token release saturates at 0 across a UTC day rollover (ADR-164)
+
+- ADR-163 introduced five `fetch_sub` calls on `today_cloud_tokens` to roll back or reconcile a budget
+  pre-reservation.  When a request straddles UTC midnight — the cloud RTT outlasts the day, and
+  `roll_budget_day_if_needed` resets the counter to 0 — the subtraction `fetch_sub(reserved − actual)`
+  underflows, wrapping `0` to ~`u64::MAX`.  The wrapped counter dwarfs any budget, so every cloud
+  request for the rest of the new day is blocked or redirected to local: one midnight-straddling
+  request silently disables the cloud route until the next midnight.  The bare rollback paths (cascade
+  cloud failure, streaming backend error) have the same exposure via a concurrent day roll.  Fixed with
+  a single `release_cloud_tokens` helper (a `fetch_update` CAS loop using `saturating_sub`) replacing
+  all five sites, clamping the counter at 0.  Two new tests reproduce the post-rollover state (counter
+  0, reservation > actual) on the reconcile and local-fallback paths; both fail against `wrapping_sub`.
+  (ADR-164)
+
 ### Fixed — Budget daily-cap TOCTOU: atomic pre-reservation in `check_budget_and_spike` (ADR-163)
 
 - `check_budget_and_spike` read `today_cloud_tokens` with `load(Relaxed)`, compared against the daily

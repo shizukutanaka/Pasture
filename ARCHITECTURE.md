@@ -1171,6 +1171,27 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-164 Budget release saturates at 0 across a UTC day rollover — no `fetch_sub` underflow.**
+  Turning the same Socratic lens on what ADR-163 *introduced*: "ADR-163 added five `fetch_sub` calls
+  on `today_cloud_tokens` to roll back or reconcile a pre-reservation. What does a subtraction do when
+  another thread has reset that counter to 0 at UTC midnight, in the window between the reservation and
+  its release?" It underflows. A request that reserves `estimated` tokens near 23:59:59 spends the
+  cloud RTT (seconds for an LLM call) crossing midnight; `log_cost` then calls
+  `roll_budget_day_if_needed`, which `store`s the counter to 0 for the new day, and the reconciliation
+  `fetch_sub(reserved − actual)` wraps `0` to ~`u64::MAX`. The same holds for the bare rollback paths
+  (cascade cloud failure, streaming backend error, the reservation rollback itself), where a
+  *concurrent* request can roll the day. A wrapped counter (~1.8×10¹⁹) dwarfs any budget, so for the
+  rest of the new day every cloud request sees `prev ≥ budget` and is blocked or redirected to local —
+  a single midnight-straddling request silently disables the cloud route until the *next* midnight.
+  This is the same under-/over-enforcement-of-a-control failure class as ADR-155/ADR-161, now in the
+  release direction. Fixed with a single `release_cloud_tokens(n)` helper — a `fetch_update` CAS loop
+  applying `saturating_sub` — that replaces all five `fetch_sub` sites, clamping the counter at 0. The
+  reconciliation block is rewritten as a `match` on `tokens.cmp(&reserved_tokens)` (clippy
+  `comparison_chain`). Two new tests drive `log_cost` with a 0 counter and a reservation larger than
+  the actual tokens (the post-rollover state) on both the cloud-reconcile and local-fallback paths,
+  asserting the counter clamps at 0; both fail against a `wrapping_sub` and pass with the fix. Zero new
+  dependencies.
+
 - **ADR-163 Budget daily-cap TOCTOU — atomic pre-reservation in `check_budget_and_spike`.**
   A new Socratic angle — concurrency in the budget check: "`check_budget_and_spike` reads
   `today_cloud_tokens` with `load(Relaxed)`, compares against the daily budget, and *returns*.

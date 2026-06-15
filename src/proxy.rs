@@ -1092,6 +1092,23 @@ impl Proxy {
         }
     }
 
+    /// Release `n` tokens back to the daily counter, saturating at 0 (ADR-164).
+    ///
+    /// Every budget pre-reservation (ADR-163) is rolled back or reconciled with a
+    /// subtraction. A plain `fetch_sub` underflows — wrapping to ~`u64::MAX` — when
+    /// `roll_budget_day_if_needed` has reset `today_cloud_tokens` to 0 between the
+    /// reservation and its release. That happens whenever a request straddles UTC
+    /// midnight (cloud RTTs are seconds) or a concurrent request rolls the day. The
+    /// wrapped counter would then dwarf any budget and silently block the cloud
+    /// route for the rest of the new day. A saturating CAS loop clamps at 0 instead.
+    fn release_cloud_tokens(&self, n: u64) {
+        let _ = self.today_cloud_tokens.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some(cur.saturating_sub(n)),
+        );
+    }
+
     /// Budget + spike check (IMP-26). Returns `Some(reason)` when the cloud route
     /// should be overridden or blocked; `None` when the request may proceed normally.
     /// Called only when the routing engine has decided Cloud.
@@ -1115,7 +1132,7 @@ impl Proxy {
             // TOCTOU window between check and increment (ADR-163).
             let prev = self.today_cloud_tokens.fetch_add(estimated_tokens, Ordering::Relaxed);
             if prev >= self.budget_daily_tokens {
-                self.today_cloud_tokens.fetch_sub(estimated_tokens, Ordering::Relaxed);
+                self.release_cloud_tokens(estimated_tokens);
                 return Some("daily cloud token budget exceeded");
             }
         }
@@ -1190,14 +1207,17 @@ impl Proxy {
             let tokens = resp.prompt_tokens + resp.completion_tokens;
             if reserved_tokens > 0 {
                 // Reconcile pre-reservation (estimated) with actual tokens used (ADR-163).
-                if tokens > reserved_tokens {
-                    self.today_cloud_tokens
-                        .fetch_add(tokens - reserved_tokens, Ordering::Relaxed);
-                } else if tokens < reserved_tokens {
-                    self.today_cloud_tokens
-                        .fetch_sub(reserved_tokens - tokens, Ordering::Relaxed);
-                }
-                // equal: no-op
+                // The release path saturates at 0 across a UTC day rollover (ADR-164).
+                match tokens.cmp(&reserved_tokens) {
+                    std::cmp::Ordering::Greater => self
+                        .today_cloud_tokens
+                        .fetch_add(tokens - reserved_tokens, Ordering::Relaxed),
+                    std::cmp::Ordering::Less => {
+                        self.release_cloud_tokens(reserved_tokens - tokens);
+                        0 // fetch_add returns the previous value; match arms must agree
+                    }
+                    std::cmp::Ordering::Equal => 0, // exact estimate: no adjustment
+                };
             } else {
                 // No pre-reservation (warn-action path or spike-only guard): add actual post-hoc.
                 self.today_cloud_tokens.fetch_add(tokens, Ordering::Relaxed);
@@ -1207,8 +1227,7 @@ impl Proxy {
         } else if reserved_tokens > 0 {
             // Planned cloud route fell back to local; release the pre-reservation (ADR-163).
             self.roll_budget_day_if_needed();
-            self.today_cloud_tokens
-                .fetch_sub(reserved_tokens, Ordering::Relaxed);
+            self.release_cloud_tokens(reserved_tokens);
         }
     }
 
@@ -1442,8 +1461,7 @@ impl Proxy {
                         Err(e) => {
                             // Roll back the pre-reservation: cloud failed, no tokens were spent.
                             if cascade_reserved > 0 {
-                                self.today_cloud_tokens
-                                    .fetch_sub(cascade_reserved, Ordering::Relaxed);
+                                self.release_cloud_tokens(cascade_reserved);
                             }
                             eprintln!("pasture: cascade cloud failed ({e}); using local answer");
                         }
@@ -2381,8 +2399,7 @@ impl Proxy {
             Err(e) => {
                 // Roll back the budget pre-reservation: backend never completed a response (ADR-163).
                 if budget_reserved > 0 {
-                    self.today_cloud_tokens
-                        .fetch_sub(budget_reserved, Ordering::Relaxed);
+                    self.release_cloud_tokens(budget_reserved);
                 }
                 // ADR-143: emit error span so streaming backend failures are
                 // visible in the trace log rather than silently dropped.
