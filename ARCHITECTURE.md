@@ -1171,6 +1171,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-160 `PASTURE_CACHE_TTL` bounds staleness for the semantic cache too (extends ADR-158/159).**
+  The third drift found by the same cache-consistency lens: "`with_cache_ttl` applies `set_max_age` to
+  the exact-match cache — does the semantic cache honour the operator's TTL?" It did not — `SemanticCache`
+  had no TTL field at all, so with `PASTURE_CACHE_TTL=3600` an exact-match hit expired after an hour but
+  a *semantic* hit could return an answer arbitrarily old (until FIFO eviction). For time-sensitive
+  prompts (prices, "latest version", current events) that silently violated the configured staleness
+  bound. Fixed by giving `SemanticCache` the same `max_age: Option<Duration>` and per-entry `Instant`
+  as `ResponseCache`; `find_similar` drops expired entries first (an expired entry is a miss and frees
+  its slot, mirroring `ResponseCache::get`), and `with_cache_ttl` now applies the TTL to both caches.
+  The entry is now a named `SemanticEntry` struct rather than a growing tuple. The builder order in
+  `cli.rs` was adjusted (`with_semantic_cache` before `with_cache_ttl`) so the semantic cache exists
+  when the TTL is applied. Zero new dependencies; 2 new tests (expired entry is a miss and removed;
+  no-TTL entry survives).
+
 - **ADR-159 Semantic cache keyed by sampling parameters too (extends ADR-158).**
   The same Socratic angle as ADR-158, one dimension over: "the exact-match cache keys on the sampling
   parameters — `request_key`'s own comment says *'a `temperature:0` response is never served to a

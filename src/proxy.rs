@@ -664,6 +664,13 @@ impl Proxy {
                     guard.set_max_age(ttl_secs);
                 }
             }
+            // Apply the same TTL to the semantic cache (ADR-160) so PASTURE_CACHE_TTL
+            // bounds staleness for both caches, not just the exact-match one.
+            if let Some(ref sem_mutex) = self.semantic_cache {
+                if let Ok(mut guard) = sem_mutex.lock() {
+                    guard.set_max_age(ttl_secs);
+                }
+            }
         }
         self
     }

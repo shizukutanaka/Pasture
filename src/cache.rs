@@ -45,11 +45,26 @@ pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
 /// penalties, stop, response_format). The exact-match cache already keys on
 /// model + sampling via `request_key`; the semantic cache matches the prompt
 /// fuzzily (cosine) but model and sampling exactly.
+///
+/// Like `ResponseCache`, entries optionally expire after `max_age` (ADR-160) so
+/// `PASTURE_CACHE_TTL` bounds staleness for *both* caches, not just the
+/// exact-match one — otherwise a semantic hit could return an answer older than
+/// the operator's configured TTL.
+struct SemanticEntry {
+    embedding: Vec<f64>,
+    model: String,
+    sampling: u64,
+    inserted: Instant,
+    resp: CompletionResponse,
+}
+
 pub struct SemanticCache {
-    entries: VecDeque<(Vec<f64>, String, u64, CompletionResponse)>,
+    entries: VecDeque<SemanticEntry>,
     cap: usize,
     /// Minimum cosine similarity for a hit (e.g. 0.92).
     threshold: f64,
+    /// Maximum age of a cached entry. None = no TTL (FIFO eviction only).
+    max_age: Option<Duration>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -60,9 +75,22 @@ impl SemanticCache {
             entries: VecDeque::new(),
             cap,
             threshold,
+            max_age: None,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    /// Set a maximum age for cached entries (ADR-160). Entries older than `secs`
+    /// are treated as misses and removed on the next `find_similar`. `secs == 0`
+    /// disables TTL. Mirrors `ResponseCache::set_max_age` so one `PASTURE_CACHE_TTL`
+    /// bounds staleness for both caches.
+    pub fn set_max_age(&mut self, secs: u64) {
+        self.max_age = if secs > 0 {
+            Some(Duration::from_secs(secs))
+        } else {
+            None
+        };
     }
 
     pub fn len(&self) -> usize {
@@ -81,6 +109,11 @@ impl SemanticCache {
         self.threshold
     }
 
+    /// Configured TTL in seconds (0 = no TTL).
+    pub fn max_age_secs(&self) -> u64 {
+        self.max_age.map(|d| d.as_secs()).unwrap_or(0)
+    }
+
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
     }
@@ -93,23 +126,28 @@ impl SemanticCache {
     /// sampling). Returns a clone of the response. Updates hit/miss counters.
     /// Entries for other models (ADR-158) or with a different sampling signature
     /// (ADR-159) are skipped — different models and different output-affecting
-    /// sampling produce different outputs, so they must not cross-serve.
+    /// sampling produce different outputs, so they must not cross-serve. Entries
+    /// older than `max_age` (ADR-160) are removed first, so an expired entry is a
+    /// miss and frees its slot, matching `ResponseCache::get`.
     pub fn find_similar(
         &mut self,
         query: &[f64],
         model: &str,
         sampling: u64,
     ) -> Option<CompletionResponse> {
+        if let Some(max_age) = self.max_age {
+            self.entries.retain(|e| e.inserted.elapsed() <= max_age);
+        }
         let mut best_score = self.threshold - f64::EPSILON;
         let mut best: Option<&CompletionResponse> = None;
-        for (emb, m, samp, resp) in &self.entries {
-            if m != model || *samp != sampling {
+        for e in &self.entries {
+            if e.model != model || e.sampling != sampling {
                 continue;
             }
-            let score = cosine_similarity(query, emb);
+            let score = cosine_similarity(query, &e.embedding);
             if score > best_score {
                 best_score = score;
-                best = Some(resp);
+                best = Some(&e.resp);
             }
         }
         match best {
@@ -131,7 +169,13 @@ impl SemanticCache {
         if self.cap == 0 {
             return;
         }
-        self.entries.push_back((embedding, model, sampling, resp));
+        self.entries.push_back(SemanticEntry {
+            embedding,
+            model,
+            sampling,
+            inserted: Instant::now(),
+            resp,
+        });
         while self.entries.len() > self.cap {
             self.entries.pop_front();
         }
@@ -634,6 +678,38 @@ mod tests {
         let hit2 = c.find_similar(&v, "m", 111);
         assert!(hit2.is_some());
         assert_eq!(hit2.unwrap().content, "deterministic answer");
+    }
+
+    #[test]
+    fn test_semantic_cache_ttl_expired_entry_is_miss_and_removed() {
+        // ADR-160: PASTURE_CACHE_TTL must bound staleness for the semantic cache
+        // too, not just the exact-match cache. An expired entry is a miss and is
+        // removed so it frees its slot (matching ResponseCache::get).
+        let mut c = SemanticCache::new(4, 0.9);
+        c.set_max_age(1); // 1-second TTL configured...
+        assert_eq!(c.max_age_secs(), 1);
+        // ...but back-date by forcing a sub-nanosecond effective TTL.
+        c.max_age = Some(Duration::from_nanos(1));
+        let v = vec![1.0_f64, 0.0];
+        c.put(v.clone(), "m".to_string(), 0, resp("stale"));
+        std::thread::sleep(Duration::from_millis(1));
+        let hit = c.find_similar(&v, "m", 0);
+        assert!(hit.is_none(), "expired semantic entry must not be served");
+        assert_eq!(c.misses(), 1);
+        assert_eq!(c.len(), 0, "expired entry must be removed");
+    }
+
+    #[test]
+    fn test_semantic_cache_no_ttl_keeps_entry() {
+        // Default (no TTL): an entry survives indefinitely until FIFO eviction.
+        let mut c = SemanticCache::new(4, 0.9);
+        assert_eq!(c.max_age_secs(), 0);
+        let v = vec![1.0_f64, 0.0];
+        c.put(v.clone(), "m".to_string(), 0, resp("fresh"));
+        std::thread::sleep(Duration::from_millis(1));
+        let hit = c.find_similar(&v, "m", 0);
+        assert!(hit.is_some(), "without TTL the entry must remain");
+        assert_eq!(hit.unwrap().content, "fresh");
     }
 
     #[test]

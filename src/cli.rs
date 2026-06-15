@@ -1389,8 +1389,11 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         .with_cascade(config.cascade)
         .with_cascade_logprob(config.cascade_logprob_threshold)
         .with_cache(config.cache_size)
-        .with_cache_ttl(config.cache_ttl_secs)
+        // with_semantic_cache before with_cache_ttl so the TTL applies to both
+        // caches (ADR-160): with_cache_ttl reads self.semantic_cache, which must
+        // already be initialised.
         .with_semantic_cache(config.semantic_cache_size, config.semantic_cache_threshold)
+        .with_cache_ttl(config.cache_ttl_secs)
         .with_hard_prompts(hard_prompts, config.hard_threshold)
         .with_models(models)
         .with_cloud_retry(config.cloud_retry)

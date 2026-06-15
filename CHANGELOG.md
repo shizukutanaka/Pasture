@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — `PASTURE_CACHE_TTL` now bounds the semantic cache too (ADR-160)
+
+- `with_cache_ttl` applied the TTL only to the exact-match cache; `SemanticCache` had no TTL, so with
+  `PASTURE_CACHE_TTL=3600` a semantic hit could return an answer arbitrarily old (until FIFO eviction),
+  silently violating the operator's staleness bound for time-sensitive prompts.  `SemanticCache` now
+  has the same `max_age` + per-entry timestamp as `ResponseCache`; `find_similar` drops expired
+  entries; the TTL applies to both caches.  2 new tests. (ADR-160)
+
 ### Fixed — Semantic cache is now keyed by sampling parameters (ADR-159)
 
 - After ADR-158 the semantic cache keyed on model but still ignored sampling parameters, so it could
