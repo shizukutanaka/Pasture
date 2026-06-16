@@ -56,13 +56,19 @@ pub fn restore(text: &str, mapping: &[(String, String)]) -> String {
 pub struct StreamRestorer {
     mapping: Mapping,
     pending: String,
+    /// Longest token in the mapping (e.g. `<EMAIL_1>` = 9 bytes). A dangling
+    /// `<` is held back only until the fragment reaches this length — past it,
+    /// no real token can still be completing, so the buffer is bounded (ADR-168).
+    max_token_len: usize,
 }
 
 impl StreamRestorer {
     pub fn new(mapping: Mapping) -> Self {
+        let max_token_len = mapping.iter().map(|(_, tok)| tok.len()).max().unwrap_or(0);
         Self {
             mapping,
             pending: String::new(),
+            max_token_len,
         }
     }
 
@@ -74,7 +80,21 @@ impl StreamRestorer {
         // the prefix of a token still arriving (or a literal '<' that simply has
         // no '>' yet; either way it flushes at finish()).
         let split = match self.pending.rfind('<') {
-            Some(i) if !self.pending[i..].contains('>') => i,
+            Some(i) if !self.pending[i..].contains('>') => {
+                // A real token (`<EMAIL_1>`) closes its '>' within `max_token_len`
+                // bytes. Once the dangling fragment reaches that length without a
+                // '>', it cannot be a token, so flushing it is both correct and
+                // necessary to bound the buffer — otherwise an unterminated '<' in
+                // the cloud stream (e.g. `a < b` in code, or an adversarial run with
+                // no '>') makes `pending` grow without limit and stalls streaming
+                // until finish(). With an empty mapping (max_token_len == 0) nothing
+                // is ever held, so the restorer is pure pass-through.
+                if self.pending.len() - i >= self.max_token_len {
+                    self.pending.len()
+                } else {
+                    i
+                }
+            }
             _ => self.pending.len(),
         };
         let flushable = restore(&self.pending[..split], &self.mapping);
@@ -370,6 +390,51 @@ mod tests {
         let b = r.push("more text");
         let tail = r.finish();
         assert_eq!(format!("{a}{b}{tail}"), "plain text more text");
+    }
+
+    #[test]
+    fn test_stream_restorer_bounds_buffer_on_unterminated_angle() {
+        // ADR-168: a dangling '<' followed by a long run with no '>' must not
+        // buffer the whole tail (which would stall streaming and grow memory
+        // unbounded). Once the fragment exceeds the longest token, it flushes.
+        let mut r = StreamRestorer::new(email_mapping()); // <EMAIL_1> = 9 bytes
+        let long_tail = "x".repeat(10_000);
+        let out = r.push(&format!("note: a < {long_tail}"));
+        // The bulk of the tail must have been emitted, not held in `pending`.
+        assert!(
+            out.len() >= long_tail.len(),
+            "long unterminated-'<' tail must flush, not buffer: emitted {} bytes",
+            out.len()
+        );
+        assert!(
+            r.pending.len() < 16,
+            "held-back buffer must stay bounded near max_token_len, was {}",
+            r.pending.len()
+        );
+        let tail = r.finish();
+        assert!(format!("{out}{tail}").contains("a < "), "literal '<' preserved");
+    }
+
+    #[test]
+    fn test_stream_restorer_split_token_still_restores_after_bound() {
+        // The bound must not break the legitimate split-token case: a real token
+        // arriving in pieces is shorter than max_token_len at each step, so it is
+        // still held and restored once complete.
+        let mut r = StreamRestorer::new(email_mapping());
+        let a = r.push("hi <EMA");
+        let b = r.push("IL_1>!");
+        let tail = r.finish();
+        assert_eq!(format!("{a}{b}{tail}"), "hi alice@example.com!");
+    }
+
+    #[test]
+    fn test_stream_restorer_empty_mapping_never_buffers() {
+        // With no mapping, restore is a no-op, so a '<' need never be held —
+        // even a dangling '<' flushes immediately (pure pass-through).
+        let mut r = StreamRestorer::new(Vec::new());
+        let out = r.push("a < b still flowing");
+        assert_eq!(out, "a < b still flowing");
+        assert!(r.pending.is_empty(), "empty mapping must not buffer: {:?}", r.pending);
     }
 
     #[test]

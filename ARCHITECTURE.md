@@ -1171,6 +1171,25 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-168 `StreamRestorer` buffer is bounded — an unterminated `<` can't stall the stream.**
+  Socratic probe of the streaming PII-restore path (IMP-19): "`push` holds back everything from the
+  last unterminated `<` until `finish()`. The split-token case it was built for is correct — but what
+  if the cloud streams an early `<` and then a long run of text with no `>`?" The buffer `pending`
+  grows *without bound*. A real restore token (`<EMAIL_1>`) is always short, yet the restorer held the
+  *entire* tail after a dangling `<` — so a verbose answer containing `a < b` in code, or an
+  adversarial response emitting `<` then megabytes with no `>`, buffers the whole remaining stream in
+  memory and emits nothing until the stream ends. That defeats SSE's incremental delivery (the user
+  sees a frozen stream) and amplifies memory. The hold-back never needs to exceed the longest mapping
+  token: a token closes its `>` within `max_token_len` bytes, so once the dangling fragment reaches
+  that length without a `>` it provably cannot be a token. Fix: `StreamRestorer::new` precomputes
+  `max_token_len = max(token.len())` (0 when the mapping is empty); `push` flushes the whole pending
+  buffer — rather than holding from the dangling `<` — once `pending.len() - i >= max_token_len`. This
+  is correctness-preserving (a real in-progress token is always shorter than `max_token_len` at each
+  step, so it is still held and restored — proven by the split-token regression test) and makes the
+  empty-mapping restorer pure pass-through (it never buffers). Zero new dependencies; 3 new tests
+  (10 000-byte unterminated-`<` tail flushes with bounded buffer; split token still restores after the
+  bound; empty mapping never buffers). 614 tests pass.
+
 - **ADR-167 Monitoring endpoints (`/metrics`, `/v1/stats`) are exempt from the rate limiter.**
   Socratic probe of `check_gate`: "The rate limiter is documented as capping `/v1/*` requests.
   `/metrics` is not under `/v1/` at all. Does it consume rate-limit tokens?" Yes — `check_gate`

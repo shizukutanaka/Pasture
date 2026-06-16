@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Streaming PII-restore buffer is bounded (`StreamRestorer`) (ADR-168)
+
+- The streaming pseudonymization restorer (`PASTURE_PSEUDONYMIZE=1`) held back everything after the
+  last unterminated `<` until the stream ended, to reassemble tokens (`<EMAIL_1>`) split across SSE
+  deltas. But a dangling `<` followed by a long run with no `>` — `a < b` in code, or an adversarial
+  response — made the buffer grow without bound: nothing was emitted until `finish()`, freezing the
+  stream and amplifying memory.  Fixed: `StreamRestorer` now precomputes the longest mapping token and
+  flushes the buffer once the dangling fragment exceeds that length (a real token always closes its
+  `>` within it, so this is correctness-preserving; the split-token case still restores). With an empty
+  mapping the restorer is pure pass-through and never buffers.  3 new tests.  614 tests. (ADR-168)
+
 ### Fixed — Monitoring endpoints exempt from rate limiter (`/metrics`, `/v1/stats`) (ADR-167)
 
 - `check_gate` exempted only `/health` from the global request-rate limiter. `/metrics` (outside
