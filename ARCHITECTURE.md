@@ -1171,6 +1171,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-172 `calibrate` warns when sample is too small to give a reliable quantile.**
+  Socratic probe of the calibrate UX: "A new user runs 5 test requests and then runs
+  `pasture calibrate`. They get `Calibrating threshold from 5 logged prompt(s)`. The
+  80th percentile of n=5 has a 95% CI that spans most of the sample range. They set
+  `PASTURE_THRESHOLD` from a near-random value." Neither `calibrate` nor `calibrate
+  --logprob` had a minimum-sample check. Fix: add `MIN_CALIBRATE_SAMPLE = 30` in
+  `cli.rs`; emit a `calibrate.small_sample` advisory (EN + JA) *before* the result
+  when `n < 30`. The threshold is still printed — so a new user can get started — but
+  the uncertainty is explicit. Zero new dependencies; advisory text only (no behaviour
+  change to the calibration math). 617 tests pass.
+
 - **ADR-171 `GET /v1/models` entries now include a `created` field.**
   Socratic probe of the `/v1/models` endpoint (IMP-8): "`build_models_response` emits
   `{\"id\":…, \"object\":\"model\", \"owned_by\":\"pasture\"}`. The OpenAI Model schema

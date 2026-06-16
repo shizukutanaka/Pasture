@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — `calibrate` warns when fewer than 30 samples are available (ADR-172)
+
+- `pasture calibrate` and `pasture calibrate --logprob` recommended a threshold from any
+  sample ≥ 1 with no caveat.  A quantile from n=5 has a 95% CI spanning most of the
+  sample range — the resulting `PASTURE_THRESHOLD` is statistically unreliable.  Fixed:
+  emit an advisory note when `n < 30` (EN + JA), before the recommended threshold, so
+  users know to collect more requests first.  The threshold is still printed.  Zero new
+  deps; no change to calibration math.  617 tests.  (ADR-172)
+
 ### Fixed — `GET /v1/models` entries now include the required `created` field (ADR-171)
 
 - `build_models_response` and `build_model_response` emitted model objects without the

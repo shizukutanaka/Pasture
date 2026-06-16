@@ -910,6 +910,13 @@ fn run_improvements(path: Option<&str>, review: bool) -> i32 {
     0
 }
 
+/// Minimum sample size for a reliable calibration quantile (ADR-172).
+/// Below this, the 95% CI for a quantile spans most of the data range and
+/// the recommendation is unreliable. The warning is advisory — we still
+/// print the threshold so a new user can get started — but the caveat
+/// makes the uncertainty explicit.
+const MIN_CALIBRATE_SAMPLE: usize = 30;
+
 /// `calibrate [--target <rate>]`: recommend a token threshold from the user's
 /// own logged prompt sizes so that ~`rate` of similar prompts route to cloud.
 fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
@@ -931,9 +938,10 @@ fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
                     println!("{}", t(lang, "calibrate.logprob.empty"));
                     return 0;
                 }
+                let n_lps = lps.len();
                 let (threshold, achieved) =
                     crate::calibrate::calibrate_logprob_threshold(&lps, target);
-                let n = lps.len().to_string();
+                let n = n_lps.to_string();
                 let tgt = format!("{:.0}", target * 100.0);
                 let thr = format!("{threshold:.3}");
                 let rate = format!("{:.1}", achieved * 100.0);
@@ -945,6 +953,16 @@ fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
                         &[("n", &n), ("target", &tgt)]
                     )
                 );
+                if n_lps < MIN_CALIBRATE_SAMPLE {
+                    println!(
+                        "{}",
+                        tf(
+                            lang,
+                            "calibrate.small_sample",
+                            &[("n", &n), ("min", &MIN_CALIBRATE_SAMPLE.to_string())]
+                        )
+                    );
+                }
                 println!(
                     "{}",
                     tf(
@@ -967,8 +985,9 @@ fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
                 );
                 return 0;
             }
+            let n_tok = tokens.len();
             let (threshold, achieved) = crate::calibrate::calibrate_threshold(&tokens, target);
-            let n = tokens.len().to_string();
+            let n = n_tok.to_string();
             let tgt = format!("{:.0}", target * 100.0);
             let thr = threshold.to_string();
             let rate = format!("{:.1}", achieved * 100.0);
@@ -976,6 +995,16 @@ fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
                 "{}",
                 tf(lang, "calibrate.header", &[("n", &n), ("target", &tgt)])
             );
+            if n_tok < MIN_CALIBRATE_SAMPLE {
+                println!(
+                    "{}",
+                    tf(
+                        lang,
+                        "calibrate.small_sample",
+                        &[("n", &n), ("min", &MIN_CALIBRATE_SAMPLE.to_string())]
+                    )
+                );
+            }
             println!(
                 "{}",
                 tf(
