@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Streaming chunks now share a single `created` timestamp (ADR-170)
+
+- `build_openai_chunk` and `build_openai_usage_chunk` each called `unix_now()` internally, so every SSE
+  chunk in the same completion carried a different `created` timestamp.  The OpenAI streaming API contract
+  requires `id`, `model`, `system_fingerprint`, and `created` to be identical across all chunks.  Fixed:
+  both builders accept a `created: u64` parameter; `stream_chat_to_socket` and `write_cached_stream`
+  capture `unix_now()` once per stream and pass it to every builder call.  The buffered-response path
+  (`build_openai_response`) was already correct.  1 new regression test.  616 tests.  (ADR-170)
+
 ### Fixed — Spike-only guard (budget off) no longer corrupts the usage gauge (ADR-169)
 
 - After ADR-163 added token pre-reservation, `apply_budget_guard` returned the estimated token count as

@@ -1021,13 +1021,16 @@ impl Proxy {
         let id = next_completion_id();
         let model = hit.model.clone();
         let fp = fingerprint_for_model(&model);
+        // Capture once so every chunk in this stream shares the same created
+        // timestamp, matching the OpenAI contract (ADR-170).
+        let created = unix_now();
         if !hit.content.is_empty() {
             let frame =
-                sse_frame(&build_openai_chunk(&id, &model, &fp, &hit.content, route_label, None));
+                sse_frame(&build_openai_chunk(&id, &model, &fp, &hit.content, route_label, None, created));
             sock.write_all(frame.as_bytes())?;
         }
         self.log_cost(route_label, hit, None, 0);
-        let stop = sse_frame(&build_openai_chunk(&id, &model, &fp, "", route_label, Some("stop")));
+        let stop = sse_frame(&build_openai_chunk(&id, &model, &fp, "", route_label, Some("stop"), created));
         sock.write_all(stop.as_bytes())?;
         if include_usage {
             let usage = sse_frame(&build_openai_usage_chunk(
@@ -1037,6 +1040,7 @@ impl Proxy {
                 route_label,
                 hit.prompt_tokens,
                 hit.completion_tokens,
+                created,
             ));
             sock.write_all(usage.as_bytes())?;
         }
@@ -2381,10 +2385,14 @@ impl Proxy {
             req
         };
 
-        // One id, model, and fingerprint shared by every chunk of this stream (OpenAI behaviour).
+        // One id, model, fingerprint, and created timestamp shared by every chunk
+        // of this stream (OpenAI behaviour). `created` is captured once so that
+        // the delta chunks, the stop chunk, and the optional usage chunk all carry
+        // the same value — not each their own call to unix_now() (ADR-170).
         let id = next_completion_id();
         let model = req.model.clone();
         let fp = fingerprint_for_model(&model);
+        let created = unix_now();
         // `otel_span` was started above (before the cache checks); it is filled with
         // system/route/usage and appended on success below.
         let mut io_err: Option<std::io::Error> = None;
@@ -2408,6 +2416,7 @@ impl Proxy {
                 &piece,
                 route_label,
                 None,
+                created,
             ));
             if let Err(e) = sock.write_all(frame.as_bytes()) {
                 io_err = Some(e);
@@ -2439,7 +2448,7 @@ impl Proxy {
                         let tail = rr.finish();
                         if !tail.is_empty() {
                             let frame = sse_frame(&build_openai_chunk(
-                                &id, &model, &fp, &tail, route_label, None,
+                                &id, &model, &fp, &tail, route_label, None, created,
                             ));
                             if let Err(e) = sock.write_all(frame.as_bytes()) {
                                 io_err = Some(e);
@@ -2448,7 +2457,7 @@ impl Proxy {
                     }
                     if io_err.is_none() {
                         let stop = sse_frame(&build_openai_chunk(
-                            &id, &model, &fp, "", route_label, Some("stop"),
+                            &id, &model, &fp, "", route_label, Some("stop"), created,
                         ));
                         if let Err(e) = sock.write_all(stop.as_bytes()) {
                             io_err = Some(e);
@@ -2462,6 +2471,7 @@ impl Proxy {
                             route_label,
                             r.prompt_tokens,
                             r.completion_tokens,
+                            created,
                         ));
                         if let Err(e) = sock.write_all(usage.as_bytes()) {
                             io_err = Some(e);
@@ -2952,8 +2962,10 @@ pub fn build_legacy_completion_response(resp: &CompletionResponse, route_label: 
 }
 
 /// Build an OpenAI-compatible streaming chunk (`chat.completion.chunk`). The `id`,
-/// `model`, and `fingerprint` are supplied by the caller so every chunk of one
-/// stream shares them (OpenAI behaviour).
+/// `model`, `fingerprint`, and `created` are supplied by the caller so every chunk
+/// of one stream shares them (OpenAI behaviour). Passing `created` as a parameter
+/// instead of calling `unix_now()` here ensures the timestamp is identical for
+/// every chunk in the stream, including the final usage and stop chunks (ADR-170).
 pub fn build_openai_chunk(
     id: &str,
     model: &str,
@@ -2961,6 +2973,7 @@ pub fn build_openai_chunk(
     delta: &str,
     route_label: &str,
     finish: Option<&str>,
+    created: u64,
 ) -> String {
     let delta_field = if delta.is_empty() {
         "{}".to_string()
@@ -2972,15 +2985,15 @@ pub fn build_openai_chunk(
         None => "null".to_string(),
     };
     format!(
-        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"logprobs\":null,\"finish_reason\":{finish_field}}}]}}",
-        unix_now(),
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"logprobs\":null,\"finish_reason\":{finish_field}}}]}}",
         escape_string(model)
     )
 }
 
 /// Build the final streaming chunk carrying token `usage` (emitted only when the
 /// client sets `stream_options.include_usage`). Per the OpenAI contract this
-/// chunk has an empty `choices` array. Shares the stream's `id`, `model`, and `fingerprint`.
+/// chunk has an empty `choices` array. Shares the stream's `id`, `model`,
+/// `fingerprint`, and `created` timestamp (ADR-170).
 pub fn build_openai_usage_chunk(
     id: &str,
     model: &str,
@@ -2988,10 +3001,10 @@ pub fn build_openai_usage_chunk(
     route_label: &str,
     prompt_tokens: u64,
     completion_tokens: u64,
+    created: u64,
 ) -> String {
     format!(
-        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}",
-        unix_now(),
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{}}}}}",
         escape_string(model),
         prompt_tokens + completion_tokens
     )

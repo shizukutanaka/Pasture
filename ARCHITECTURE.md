@@ -1171,6 +1171,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-170 Streaming chunks share a single `created` timestamp.**
+  Socratic probe of the SSE streaming path: "`build_openai_chunk` and `build_openai_usage_chunk` each call `unix_now()`
+  internally, so every chunk in the same response carries a *different* `created` timestamp. The OpenAI streaming API
+  contract requires `id`, `model`, `system_fingerprint`, and `created` to be identical across all chunks in one
+  completion." Client SDKs and stream parsers use these fields to correlate chunks and assemble completions; a
+  per-chunk clock that advances breaks that correlation, can cause SDK chunk-rejection, and makes the output
+  non-deterministic and untestable. Fix: both builders gain a `created: u64` parameter; `stream_chat_to_socket` and
+  `write_cached_stream` each capture `let created = unix_now()` once alongside `id`/`model`/`fp` and pass it to every
+  chunk-builder call site. `build_openai_response` (buffered path) was already correct — this change completes the
+  invariant. Zero new dependencies; 1 regression test (`test_stream_chunks_share_created`: three chunks with a fixed
+  timestamp, asserts every `created` field matches). 616 tests pass.
+
 - **ADR-169 Spike-only guard (budget off) reports `reserved=0` — no phantom-reservation reconcile.**
   Socratic probe of the budget/spike accounting after ADR-163's pre-reservation threading: "`check_budget_and_spike`
   only does the `fetch_add` pre-reservation inside `if budget_daily_tokens > 0`. But `apply_budget_guard`'s success
