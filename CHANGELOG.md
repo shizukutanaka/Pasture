@@ -5,6 +5,19 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Monitoring endpoints exempt from rate limiter (`/metrics`, `/v1/stats`) (ADR-167)
+
+- `check_gate` exempted only `/health` from the global request-rate limiter. `/metrics` (outside
+  the `/v1/*` namespace the limiter documents itself as covering) and `/v1/stats` (read-only, locally
+  computed telemetry) consumed rate-limit tokens exactly like `/v1/chat/completions`. A standard
+  Prometheus scraper at 15-second intervals (4 req/min) silently ate 40 % of a `PASTURE_RATE_LIMIT=10`
+  inference budget without doing any inference work.  Fixed: `check_gate` now exempts `/metrics` and
+  `/v1/stats` from rate-limit consumption after auth but before the token-bucket check.  Bearer-token
+  auth (`PASTURE_AUTH_TOKEN`) is still enforced for both endpoints — public deployments still guard
+  telemetry.  `/v1/models` remains rate-limited (within the documented `/v1/*` scope).  2 new tests
+  (exhausted-bucket still allows monitoring; auth still required when configured).  611 tests.
+  (ADR-167)
+
 ### Added — Optional cloud pricing makes `cloud_cost_usd` a real number (ADR-166)
 
 - `log_cost` hardcoded `cost_usd = 0.0` and no pricing existed anywhere, so the `cloud_cost_usd` field

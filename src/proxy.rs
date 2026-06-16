@@ -598,6 +598,15 @@ impl Proxy {
                 ));
             }
         }
+        // Monitoring endpoints (/metrics, /v1/stats) are read-only, zero-inference-cost
+        // and must not consume rate-limit tokens (ADR-167). A standard Prometheus scraper
+        // at 15-second intervals (4 req/min) would otherwise eat a disproportionate share
+        // of a tight inference budget — e.g. 40% of PASTURE_RATE_LIMIT=10. /metrics is
+        // also outside the /v1/* namespace the limiter documents itself as covering.
+        // Auth is still enforced above for both endpoints.
+        if path.starts_with("/metrics") || path.starts_with("/v1/stats") {
+            return None;
+        }
         if let Some(rl) = &self.rate_limiter {
             // Hold the guard so the Retry-After estimate reflects the same bucket
             // state as the denial. A poisoned lock fails open (request allowed).

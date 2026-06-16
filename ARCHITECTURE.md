@@ -1171,6 +1171,24 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-167 Monitoring endpoints (`/metrics`, `/v1/stats`) are exempt from the rate limiter.**
+  Socratic probe of `check_gate`: "The rate limiter is documented as capping `/v1/*` requests.
+  `/metrics` is not under `/v1/` at all. Does it consume rate-limit tokens?" Yes — `check_gate`
+  exempted only `/health`, so a Prometheus scraper hitting `/metrics` every 15 seconds (4 req/min)
+  silently consumed 40 % of a `PASTURE_RATE_LIMIT=10` inference budget without doing any inference
+  work. The root cause is that the rate-limiter exemption logic was a single path check (`/health`)
+  rather than expressing the intended policy: "cap *inference* requests." `/v1/stats` shares the
+  same defect — read-only, zero-backend-cost, locally computed from an incremental log cache, yet
+  competing with `/v1/chat/completions` for the same fixed-size bucket. Fixed by inserting a second
+  early-return in `check_gate` after auth but before the token-bucket consumption: any request for
+  `/metrics` or `/v1/stats` returns `None` (allow) without touching the bucket. Bearer-token auth
+  is still enforced for both endpoints — a public deployment should still guard telemetry. `/v1/models`
+  is intentionally left rate-limited: it is within the documented `/v1/*` scope and an onboarding
+  endpoint, not a monitoring path. Zero new dependencies; 2 tests
+  (`test_monitoring_endpoints_exempt_from_rate_limit` — exhausts the bucket with `/v1/models` and
+  confirms both monitoring endpoints pass; `test_monitoring_endpoints_auth_still_enforced` — confirms
+  401 is still returned without a token even when rate-limiting is bypassed). 611 tests pass.
+
 - **ADR-166 The `cloud_cost_usd` metric is real — optional per-1M cloud pricing, not a structural 0.**
   Following ADR-165's observability thread to its sibling metric: "`/metrics`, `/v1/stats`, and the
   `pasture stats` CLI all report `cloud_cost_usd` / `pasture_cloud_cost_usd_total` / 'cloud spend' — but

@@ -945,6 +945,53 @@ fn test_gate_rate_limit_enforced() {
 }
 
 #[test]
+fn test_monitoring_endpoints_exempt_from_rate_limit() {
+    // /metrics and /v1/stats must not consume rate-limit tokens even when the
+    // bucket is exhausted (ADR-167). A Prometheus scraper hitting /metrics at
+    // 15-second intervals (4 req/min) must not starve inference traffic.
+    let p = proxy_with(true, false, 100, "unused").with_rate_limit(1);
+    // Exhaust the single token with an inference-adjacent request.
+    assert!(p.check_gate("/v1/models", None).is_none(), "first /v1/models should pass");
+    // Bucket is now empty — inference request is denied.
+    assert_eq!(
+        p.check_gate("/v1/models", None).map(|g| g.0),
+        Some(429),
+        "second /v1/models should be 429"
+    );
+    // But monitoring endpoints bypass the limiter entirely.
+    assert!(
+        p.check_gate("/metrics", None).is_none(),
+        "/metrics must not consume rate-limit tokens"
+    );
+    assert!(
+        p.check_gate("/v1/stats", None).is_none(),
+        "/v1/stats must not consume rate-limit tokens"
+    );
+}
+
+#[test]
+fn test_monitoring_endpoints_auth_still_enforced() {
+    // /metrics and /v1/stats are exempt from rate limiting but NOT from auth:
+    // a deployment with PASTURE_AUTH_TOKEN still guards telemetry (ADR-167).
+    let p = proxy_with(true, false, 100, "unused")
+        .with_auth_token(Some("s3cret".to_string()))
+        .with_rate_limit(1);
+    assert_eq!(
+        p.check_gate("/metrics", None).map(|g| g.0),
+        Some(401),
+        "/metrics without token must be 401"
+    );
+    assert_eq!(
+        p.check_gate("/v1/stats", None).map(|g| g.0),
+        Some(401),
+        "/v1/stats without token must be 401"
+    );
+    // With the correct token both are admitted.
+    assert!(p.check_gate("/metrics", Some("Bearer s3cret")).is_none());
+    assert!(p.check_gate("/v1/stats", Some("Bearer s3cret")).is_none());
+}
+
+#[test]
 fn test_roundtrip_ratelimit_headers_present_when_enabled() {
     let p = proxy_with(true, false, 100, "unused").with_rate_limit(10);
     let resp = roundtrip_raw(p, "GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n".to_string());
