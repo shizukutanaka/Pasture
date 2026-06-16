@@ -151,10 +151,11 @@ impl Provider {
     /// Like `build_body` but with `"stream": true` for SSE streaming.
     pub fn build_body_stream(self, req: &CompletionRequest) -> String {
         let mut s = self.build_body(req);
-        // Insert the stream flag before the closing brace.
+        // Insert the stream flag and request a final usage chunk so
+        // stream_complete can log actual token counts (ADR-173).
         debug_assert!(s.ends_with('}'));
         s.pop();
-        s.push_str(",\"stream\":true}");
+        s.push_str(",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
         s
     }
 
@@ -229,6 +230,10 @@ impl Provider {
 pub enum OpenAiStreamEvent {
     Delta(String),
     Done,
+    /// Token usage from the final usage chunk (ADR-173).
+    /// Present only when `stream_options.include_usage: true` was requested
+    /// and the backend sent a usage-only chunk (`choices: []`).
+    Usage(u64, u64),
 }
 
 /// Mean per-token log-probability from an OpenAI chat-completions response
@@ -260,6 +265,17 @@ pub fn parse_openai_stream_line(line: &str) -> Option<OpenAiStreamEvent> {
         return Some(OpenAiStreamEvent::Done);
     }
     let v = parse(data).ok()?;
+    // Usage-only chunk: `{"choices":[],"usage":{"prompt_tokens":N,"completion_tokens":M}}`
+    // Sent by OpenAI-compatible backends when stream_options.include_usage is true (ADR-173).
+    if let Some(choices) = v.get("choices").and_then(JsonValue::as_array) {
+        if choices.is_empty() {
+            let (p, c) = usage(&v, "prompt_tokens", "completion_tokens");
+            if p > 0 || c > 0 {
+                return Some(OpenAiStreamEvent::Usage(p, c));
+            }
+            return None;
+        }
+    }
     let content = v
         .get("choices")
         .and_then(JsonValue::as_array)
@@ -317,11 +333,14 @@ pub fn http_status_error(status: u16, message: String) -> BackendError {
 /// offline and reused over the real TLS stream). Chunked-transfer size lines are
 /// ignored because they never start with `data:`; this assumes one SSE event per
 /// chunk, which OpenAI and Anthropic both honour.
+/// Read an HTTP SSE response from `reader`, invoking `on_delta` for each text
+/// delta as it arrives, and return the assembled content and any usage reported
+/// in the final usage chunk (ADR-173). Provider-agnostic and transport-agnostic.
 pub fn read_sse_body<R: std::io::Read>(
     reader: &mut R,
     provider: Provider,
     on_delta: &mut dyn FnMut(&str),
-) -> Result<String, BackendError> {
+) -> Result<(String, Option<(u64, u64)>), BackendError> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
     // Read until the headers terminator.
@@ -361,7 +380,8 @@ pub fn read_sse_body<R: std::io::Read>(
 
     let mut content = String::new();
     let mut line_buf: Vec<u8> = Vec::new();
-    emit_sse_lines(provider, &mut line_buf, &pending, &mut content, on_delta);
+    let mut stream_usage: Option<(u64, u64)> = None;
+    emit_sse_lines(provider, &mut line_buf, &pending, &mut content, on_delta, &mut stream_usage);
     loop {
         let n = reader
             .read(&mut chunk)
@@ -369,12 +389,12 @@ pub fn read_sse_body<R: std::io::Read>(
         if n == 0 {
             break;
         }
-        emit_sse_lines(provider, &mut line_buf, &chunk[..n], &mut content, on_delta);
+        emit_sse_lines(provider, &mut line_buf, &chunk[..n], &mut content, on_delta, &mut stream_usage);
     }
     if content.is_empty() {
         return Err(BackendError::Protocol("empty stream".into()));
     }
-    Ok(content)
+    Ok((content, stream_usage))
 }
 
 fn emit_sse_lines(
@@ -383,14 +403,21 @@ fn emit_sse_lines(
     incoming: &[u8],
     content: &mut String,
     on_delta: &mut dyn FnMut(&str),
+    stream_usage: &mut Option<(u64, u64)>,
 ) {
     line_buf.extend_from_slice(incoming);
     while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
         let line: Vec<u8> = line_buf.drain(..=pos).collect();
         let s = String::from_utf8_lossy(&line);
-        if let Some(OpenAiStreamEvent::Delta(d)) = provider.parse_stream_line(s.trim()) {
-            content.push_str(&d);
-            on_delta(&d);
+        match provider.parse_stream_line(s.trim()) {
+            Some(OpenAiStreamEvent::Delta(d)) => {
+                content.push_str(&d);
+                on_delta(&d);
+            }
+            Some(OpenAiStreamEvent::Usage(p, c)) => {
+                *stream_usage = Some((p, c));
+            }
+            _ => {}
         }
     }
 }
@@ -560,12 +587,13 @@ mod transport {
         ) -> Result<CompletionResponse, BackendError> {
             let host = self.provider.host();
             let path = self.provider.path();
-            // build_body_stream adds "stream":true on top of the base body;
-            // call opts variant so cache_control hints apply here too (IMP-18).
+            // build_body_opts + stream + stream_options.include_usage so the
+            // backend sends a final usage chunk (ADR-173); cache_control hints
+            // apply here too (IMP-18).
             let mut body = self.provider.build_body_opts(req, self.cache_control);
             debug_assert!(body.ends_with('}'));
             body.pop();
-            body.push_str(",\"stream\":true}");
+            body.push_str(",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
             let body = body;
             let mut header_lines = String::new();
             for (k, v) in self.provider.headers(&self.api_key) {
@@ -576,9 +604,13 @@ mod transport {
                 body.len()
             );
             let mut stream = tls_send(host, request.as_bytes())?;
-            let content = read_sse_body(&mut stream, self.provider, on_delta)?;
-            let prompt_tokens = crate::routing::estimate_tokens(&req.routing_text()) as u64;
-            let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
+            let (content, stream_usage) = read_sse_body(&mut stream, self.provider, on_delta)?;
+            // Use actual usage from the stream; fall back to estimate only if
+            // the backend did not send a usage chunk (ADR-173).
+            let (prompt_tokens, completion_tokens) = stream_usage.unwrap_or_else(|| (
+                crate::routing::estimate_tokens(&req.routing_text()) as u64,
+                crate::routing::estimate_tokens(&content) as u64,
+            ));
             Ok(CompletionResponse {
                 content,
                 model: self.model.clone(),
@@ -816,9 +848,24 @@ data: {\"choices\":[{\"delta\":{\"content\":\", world\"}}]}\n\n\
 data: [DONE]\n\n";
         let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
         let mut got = String::new();
-        let content = read_sse_body(&mut cur, Provider::OpenAI, &mut |d| got.push_str(d)).unwrap();
+        let (content, stream_usage) = read_sse_body(&mut cur, Provider::OpenAI, &mut |d| got.push_str(d)).unwrap();
         assert_eq!(content, "Hello, world");
         assert_eq!(got, "Hello, world"); // deltas were delivered incrementally
+        assert_eq!(stream_usage, None); // no usage chunk in this stream
+    }
+
+    #[test]
+    fn test_read_sse_body_openai_usage_chunk() {
+        // ADR-173: usage chunk with empty choices carries prompt+completion tokens.
+        let resp =
+            "HTTP/1.1 200 OK\r\n\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n\
+data: [DONE]\n\n";
+        let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
+        let (content, stream_usage) = read_sse_body(&mut cur, Provider::OpenAI, &mut |_| {}).unwrap();
+        assert_eq!(content, "hi");
+        assert_eq!(stream_usage, Some((5, 2)));
     }
 
     #[test]
@@ -830,7 +877,7 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
 data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"B\"}}\n\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
-        let content = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
+        let (content, _) = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
         assert_eq!(content, "AB");
     }
 

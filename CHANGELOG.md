@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Streaming backends now log actual token counts, not estimates (ADR-173)
+
+- Both `HttpLocalBackend::stream_complete` and `HttpsCloudBackend::stream_complete`
+  used `estimate_tokens` for `prompt_tokens` / `completion_tokens`, so streaming
+  requests logged wrong counts to the cost log, corrupted the daily-budget gauge, and
+  fed calibrate with biased data.  Fixed: outgoing streaming requests now include
+  `stream_options.include_usage:true`; a new `Usage(u64,u64)` variant in
+  `OpenAiStreamEvent` captures the final usage chunk; `read_sse_body` returns
+  `(String, Option<(u64,u64)>)`.  Backends that don't send a usage chunk fall back
+  to `estimate_tokens`.  2 new tests.  618 tests.  (ADR-173)
+
 ### Fixed — `calibrate` warns when fewer than 30 samples are available (ADR-172)
 
 - `pasture calibrate` and `pasture calibrate --logprob` recommended a threshold from any

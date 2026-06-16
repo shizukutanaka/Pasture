@@ -619,8 +619,11 @@ impl Backend for OpenAiCompatBackend {
     ) -> Result<CompletionResponse, BackendError> {
         let mut shaped = req.clone();
         shaped.model = self.model.clone();
+        // build_body_stream now includes stream_options.include_usage so
+        // backends that support it send a final usage chunk (ADR-173).
         let body = Provider::OpenAI.build_body_stream(&shaped);
         let mut content = String::new();
+        let mut stream_usage: Option<(u64, u64)> = None;
         http_post_streaming(
             &self.host,
             self.port,
@@ -628,19 +631,27 @@ impl Backend for OpenAiCompatBackend {
             &body,
             self.timeout,
             &mut |line| {
-                if let Some(crate::cloud::OpenAiStreamEvent::Delta(d)) =
-                    crate::cloud::parse_openai_stream_line(line)
-                {
-                    content.push_str(&d);
-                    on_delta(&d);
+                match crate::cloud::parse_openai_stream_line(line) {
+                    Some(crate::cloud::OpenAiStreamEvent::Delta(d)) => {
+                        content.push_str(&d);
+                        on_delta(&d);
+                    }
+                    Some(crate::cloud::OpenAiStreamEvent::Usage(p, c)) => {
+                        stream_usage = Some((p, c));
+                    }
+                    _ => {}
                 }
             },
         )?;
         if content.is_empty() {
             return Err(BackendError::Protocol("empty stream".to_string()));
         }
-        let prompt_tokens = crate::routing::estimate_tokens(&req.routing_text()) as u64;
-        let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
+        // Use actual usage from the stream; fall back to estimate only if the
+        // backend did not send a usage chunk (ADR-173).
+        let (prompt_tokens, completion_tokens) = stream_usage.unwrap_or_else(|| (
+            crate::routing::estimate_tokens(&req.routing_text()) as u64,
+            crate::routing::estimate_tokens(&content) as u64,
+        ));
         Ok(CompletionResponse {
             content,
             model: self.model.clone(),

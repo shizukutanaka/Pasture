@@ -1171,6 +1171,23 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-173 Streaming backends use actual token counts, not estimates.**
+  Socratic probe of the streaming cost path: "Both `HttpLocalBackend::stream_complete`
+  and `HttpsCloudBackend::stream_complete` call `estimate_tokens` for `prompt_tokens`
+  and `completion_tokens`. But OpenAI-compatible backends send a final usage chunk
+  (`choices:[], usage:{prompt_tokens:N, completion_tokens:M}`) when
+  `stream_options.include_usage:true` is requested. Does Pasture request it? Does
+  it capture the counts?" Neither — so every streaming request logs estimated (not
+  actual) token counts to the cost log, corrupts the daily-budget gauge (ADR-169),
+  and feeds calibrate with biased data. Fix: (1) add `"stream_options":{"include_usage":true}`
+  to the outgoing streaming body in `build_body_stream` and `HttpsCloudBackend::stream_complete`;
+  (2) add `Usage(u64, u64)` to `OpenAiStreamEvent`; (3) extend `parse_openai_stream_line`
+  to detect usage-only chunks; (4) extend `read_sse_body` to return
+  `(String, Option<(u64,u64)>)` and capture usage in `emit_sse_lines`; (5) both
+  `stream_complete` impls use the captured usage, falling back to `estimate_tokens`
+  only if the backend sent no usage chunk (older/non-compliant backends). Zero new
+  dependencies. 618 tests pass (2 new: usage chunk parsed; no usage falls back).
+
 - **ADR-172 `calibrate` warns when sample is too small to give a reliable quantile.**
   Socratic probe of the calibrate UX: "A new user runs 5 test requests and then runs
   `pasture calibrate`. They get `Calibrating threshold from 5 logged prompt(s)`. The
