@@ -786,6 +786,27 @@ fn http_post_streaming(
 
         if !header_done {
             if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                // Parse and validate the HTTP status code (ADR-174):
+                // without this check a non-2xx response silently becomes
+                // Protocol("empty stream") — the wrong error for a 4xx/5xx.
+                let header_text = String::from_utf8_lossy(&buf[..pos]);
+                let status: u16 = header_text
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if !(200..300).contains(&status) {
+                    let body_bytes = buf[pos + 4..].to_vec();
+                    let mut rest = body_bytes;
+                    let _ = stream.read_to_end(&mut rest);
+                    let snippet: String =
+                        String::from_utf8_lossy(&rest).chars().take(200).collect();
+                    return Err(crate::cloud::http_status_error(
+                        status,
+                        format!("HTTP {status}: {snippet}"),
+                    ));
+                }
                 // Drop headers; keep only the body bytes onward.
                 buf.drain(..pos + 4);
                 header_done = true;

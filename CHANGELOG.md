@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — `http_post_streaming` reports real HTTP errors from local backend (ADR-174)
+
+- When the local backend returned a non-2xx HTTP status (e.g. `401 Unauthorized`,
+  `500 Internal Server Error`), `http_post_streaming` silently consumed the error body
+  as SSE content, producing `Protocol("empty stream")` as the only visible error.
+  Fixed: the function now parses the HTTP status line and returns `http_status_error`
+  for non-2xx responses before invoking any `on_line` callback — matching
+  `read_sse_body`'s (cloud streaming) behaviour.  5xx errors remain `Transport`
+  (retryable, IMP-9); 4xx are `Protocol` (not retryable).  618 tests.  (ADR-174)
+
 ### Fixed — Streaming backends now log actual token counts, not estimates (ADR-173)
 
 - Both `HttpLocalBackend::stream_complete` and `HttpsCloudBackend::stream_complete`

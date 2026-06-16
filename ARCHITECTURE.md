@@ -1171,6 +1171,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-174 `http_post_streaming` checks HTTP status before emitting SSE lines.**
+  Socratic probe of the local-backend streaming path: "`http_post_streaming` strips
+  headers and calls `on_line` for every line in the body. Does it check the HTTP
+  status code first?" No — a `401 Unauthorized` or `500 Internal Server Error` from
+  the local backend silently produced `Protocol("empty stream")` (the only error
+  visible when no `Delta` events arrived) instead of the actual error. Compare:
+  `read_sse_body` (the cloud streaming path) parses the status and returns
+  `http_status_error(status, …)` for non-2xx. Fix: parse the status from the first
+  header line in `http_post_streaming` and return `http_status_error` before calling
+  `on_line`, matching `read_sse_body`'s behaviour. The same `crate::cloud::http_status_error`
+  helper is used so 5xx errors are `Transport` (retryable, IMP-9) and 4xx are
+  `Protocol` (not retryable). 618 tests pass (logic covered through the parallel
+  `read_sse_body` test path; requires real TCP for direct unit testing).
+
 - **ADR-173 Streaming backends use actual token counts, not estimates.**
   Socratic probe of the streaming cost path: "Both `HttpLocalBackend::stream_complete`
   and `HttpsCloudBackend::stream_complete` call `estimate_tokens` for `prompt_tokens`
