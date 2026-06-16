@@ -1171,6 +1171,23 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-169 Spike-only guard (budget off) reports `reserved=0` — no phantom-reservation reconcile.**
+  Socratic probe of the budget/spike accounting after ADR-163's pre-reservation threading: "`check_budget_and_spike`
+  only does the `fetch_add` pre-reservation inside `if budget_daily_tokens > 0`. But `apply_budget_guard`'s success
+  path returns `Ok((route, estimated))` unconditionally. What does `reserved` mean when the budget is *off* but spike
+  detection is *on*?" It is a lie: the estimate is computed (the spike check needs it) but **nothing was reserved** —
+  yet `estimated` flowed to `log_cost` as `reserved_tokens`. `log_cost` then took the reconciliation branch
+  (`reserved_tokens > 0`), adjusting `today_cloud_tokens` by `tokens − reserved` (or releasing `reserved − tokens`) as
+  if `estimated` had been added. It had not, so the `today_cloud_tokens` gauge — surfaced on `/metrics` and `/v1/stats`
+  (ADR-165) — was corrupted: because the estimate leans high (routing.rs over-predicts output for budget safety), the
+  release dominated and the gauge clamped toward 0, *under-reporting* real cloud usage for any operator running spike
+  detection without a daily cap. Fix: `apply_budget_guard` returns `estimated` only when `budget_daily_tokens > 0`
+  (a real reservation occurred), else 0 — so `log_cost` takes the correct post-hoc `fetch_add(actual)` path. The
+  `reserved` value now means exactly "tokens reserved in `today_cloud_tokens`", never "tokens estimated". Same
+  control-accuracy failure class as ADR-163/164, in the observability direction. Zero new dependencies; 1 test
+  (spike-on/budget-off cloud request leaves the gauge equal to the actual prompt+completion tokens, not a phantom
+  delta; proven to fail against the pre-fix code). 615 tests pass.
+
 - **ADR-168 `StreamRestorer` buffer is bounded — an unterminated `<` can't stall the stream.**
   Socratic probe of the streaming PII-restore path (IMP-19): "`push` holds back everything from the
   last unterminated `<` until `finish()`. The split-token case it was built for is correct — but what

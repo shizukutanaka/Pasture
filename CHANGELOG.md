@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Spike-only guard (budget off) no longer corrupts the usage gauge (ADR-169)
+
+- After ADR-163 added token pre-reservation, `apply_budget_guard` returned the estimated token count as
+  `reserved` on its success path even when the daily budget was disabled. But the actual `fetch_add`
+  reservation in `check_budget_and_spike` runs only when `budget_daily_tokens > 0`, so with spike detection
+  alone no tokens were reserved — yet `log_cost` reconciled against the phantom reservation, corrupting the
+  `today_cloud_tokens` gauge on `/metrics` and `/v1/stats` (it clamped toward 0, under-reporting real cloud
+  usage).  Fixed: the guard reports `reserved=0` unless the daily budget is active, so `log_cost` adds the
+  actual tokens post-hoc and the gauge tracks real usage.  1 new test (proven to fail pre-fix).  615 tests.
+  (ADR-169)
+
 ### Fixed — Streaming PII-restore buffer is bounded (`StreamRestorer`) (ADR-168)
 
 - The streaming pseudonymization restorer (`PASTURE_PSEUDONYMIZE=1`) held back everything after the

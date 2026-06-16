@@ -1227,8 +1227,17 @@ impl Proxy {
                 }
             }
         }
-        // Pre-reservation is in place: estimated tokens were added atomically.
-        Ok((route, estimated))
+        // A pre-reservation exists only when the daily budget is active: the
+        // `fetch_add` in check_budget_and_spike is guarded by `budget_daily_tokens
+        // > 0`. With spike detection alone (budget off), no tokens were reserved,
+        // so report 0 — otherwise log_cost would reconcile against a phantom
+        // reservation and corrupt the today_cloud_tokens gauge (ADR-169).
+        let reserved = if self.budget_daily_tokens > 0 {
+            estimated
+        } else {
+            0
+        };
+        Ok((route, reserved))
     }
 
     fn log_cost(

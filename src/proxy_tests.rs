@@ -3623,6 +3623,43 @@ fn test_budget_pre_reservation_blocks_at_ceiling() {
     let _ = std::fs::remove_file(&log);
 }
 
+#[test]
+fn test_spike_only_budget_off_gauge_tracks_actual_not_phantom_reservation() {
+    // ADR-169: with spike detection ON but the daily budget OFF, no pre-reservation
+    // is made — the fetch_add in check_budget_and_spike is guarded by budget>0. The
+    // guard must therefore report reserved=0 so log_cost adds the ACTUAL cloud tokens
+    // post-hoc. The pre-fix code returned reserved=estimated, so log_cost reconciled
+    // against a reservation that never happened, leaving the today_cloud_tokens gauge
+    // (/metrics, /v1/stats) wrong — clamped toward 0 because the high-leaning estimate
+    // dominated the release.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_budget(0, "local-only", 50, "/dev/null");
+    let today = unix_now() / 86_400;
+    p.budget_day.store(today, Ordering::Relaxed);
+    p.today_cloud_tokens.store(0, Ordering::Relaxed);
+
+    // model:"cloud" forces Route::Cloud. Cold start (count=0) skips the spike check,
+    // so the request proceeds to cloud and completes.
+    let body = r#"{"model":"cloud","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = p.handle_chat(body).expect("cloud request should succeed");
+    assert!(
+        resp.contains("\"x_pasture_route\":\"cloud\""),
+        "must route cloud: {resp}"
+    );
+
+    // The gauge must equal the actual cloud tokens used (prompt + completion), not a
+    // phantom-reservation delta. MockBackend reports estimate_tokens(routing_text)
+    // and estimate_tokens(reply); routing_text for one "hi" message is just "hi".
+    let used = p.today_cloud_tokens.load(Ordering::Relaxed);
+    let expected = crate::routing::estimate_tokens("hi") as u64
+        + crate::routing::estimate_tokens("cloud-reply") as u64;
+    assert_eq!(
+        used, expected,
+        "spike-only/budget-off gauge must track actual cloud tokens {expected}, got {used}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── ADR-164 budget release saturates at 0 across a UTC day rollover ───────────
 
 #[test]
