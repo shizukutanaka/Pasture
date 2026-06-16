@@ -95,6 +95,32 @@ fn test_build_model_response_found_and_missing() {
 }
 
 #[test]
+fn test_models_response_includes_created_field() {
+    // ADR-171: OpenAI Model schema requires `created` (integer).
+    // Strict clients (OpenAI SDK, Cursor) reject model objects that omit it.
+    let models = vec!["llama3".to_string()];
+    let list_body = build_models_response(&models);
+    let single_body = build_model_response(&models, "llama3").unwrap();
+    // list: each entry carries "created":<number>
+    let v = parse(&list_body).unwrap();
+    let entry = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .unwrap();
+    assert!(
+        matches!(entry.get("created"), Some(JsonValue::Number(_))),
+        "list entry must have created:number, got: {list_body}"
+    );
+    // single-model endpoint: also carries "created":<number>
+    let sv = parse(&single_body).unwrap();
+    assert!(
+        matches!(sv.get("created"), Some(JsonValue::Number(_))),
+        "single-model entry must have created:number, got: {single_body}"
+    );
+}
+
+#[test]
 fn test_is_timeout_classifies_kinds() {
     use std::io::{Error, ErrorKind};
     assert!(is_timeout(&Error::from(ErrorKind::WouldBlock)));

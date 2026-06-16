@@ -1171,6 +1171,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-171 `GET /v1/models` entries now include a `created` field.**
+  Socratic probe of the `/v1/models` endpoint (IMP-8): "`build_models_response` emits
+  `{\"id\":…, \"object\":\"model\", \"owned_by\":\"pasture\"}`. The OpenAI Model schema
+  requires four fields: `id`, `object`, `created` (integer), and `owned_by`. What does
+  a strict client like the OpenAI Python SDK or Cursor do when `created` is absent?"
+  They reject it: the Python SDK constructs a `Model` object whose `created` field is
+  declared non-optional; omitting it yields a `ValidationError`. Both `build_models_response`
+  and `build_model_response` were missing the field. Fix: `unix_now()` called once per
+  list (resp. per single-model request) and injected as `created` in every entry — the
+  standard approach for routing proxies that have no per-model creation timestamp.
+  1 new test (`test_models_response_includes_created_field`). 617 tests pass.
+
 - **ADR-170 Streaming chunks share a single `created` timestamp.**
   Socratic probe of the SSE streaming path: "`build_openai_chunk` and `build_openai_usage_chunk` each call `unix_now()`
   internally, so every chunk in the same response carries a *different* `created` timestamp. The OpenAI streaming API

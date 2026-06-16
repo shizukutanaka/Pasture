@@ -5,6 +5,14 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — `GET /v1/models` entries now include the required `created` field (ADR-171)
+
+- `build_models_response` and `build_model_response` emitted model objects without the
+  `created` (integer) field required by the OpenAI Model schema.  Strict clients such as
+  the OpenAI Python SDK (non-optional field) and Cursor reject incomplete model objects.
+  Fixed: `unix_now()` injected as `created` in every model entry — the standard approach
+  for proxies without per-model creation timestamps.  1 new test.  617 tests.  (ADR-171)
+
 ### Fixed — Streaming chunks now share a single `created` timestamp (ADR-170)
 
 - `build_openai_chunk` and `build_openai_usage_chunk` each called `unix_now()` internally, so every SSE

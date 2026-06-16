@@ -2680,12 +2680,16 @@ pub fn build_error_response_coded(message: &str, kind: &str, code: Option<&str>)
 
 /// Build an OpenAI-compatible `GET /v1/models` list response (IMP-8).
 /// Each model id is emitted as an `object: "model"` entry owned by "pasture".
+/// The `created` field is required by the OpenAI Model schema (ADR-171); Pasture
+/// has no per-model creation timestamp so `now` (request time) is used — the same
+/// approach taken by LiteLLM and other routing proxies.
 pub fn build_models_response(models: &[String]) -> String {
+    let now = unix_now();
     let entries: Vec<String> = models
         .iter()
         .map(|m| {
             format!(
-                "{{\"id\":\"{}\",\"object\":\"model\",\"owned_by\":\"pasture\"}}",
+                "{{\"id\":\"{}\",\"object\":\"model\",\"created\":{now},\"owned_by\":\"pasture\"}}",
                 escape_string(m)
             )
         })
@@ -2698,8 +2702,9 @@ pub fn build_models_response(models: &[String]) -> String {
 pub fn build_model_response(models: &[String], id: &str) -> Option<String> {
     if models.iter().any(|m| m == id) {
         Some(format!(
-            "{{\"id\":\"{}\",\"object\":\"model\",\"owned_by\":\"pasture\"}}",
-            escape_string(id)
+            "{{\"id\":\"{}\",\"object\":\"model\",\"created\":{},\"owned_by\":\"pasture\"}}",
+            escape_string(id),
+            unix_now()
         ))
     } else {
         None
