@@ -1171,6 +1171,32 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-177 Tool/function definitions are forwarded to the backend (IMP-10 completed).**
+  Socratic probe of the IMP-10 promise — "detect `tools`/`tool_choice` → escalate and
+  *pass through unchanged*": "`CompletionRequest` stores only `has_tools: bool`. Neither
+  `build_body_inner` (Ollama) nor `build_body_opts` (OpenAI/Anthropic) forwards the
+  `tools` array. So where does the payload go?" Nowhere — it was dropped. Pasture
+  escalated tool requests to the stronger model (correct routing) and then stripped the
+  tool definitions, so the model never saw them and *could not* make a tool call;
+  worse, the response parser required `choices[0].message.content`, which is `null` for
+  a tool call, so even a correct upstream tool response would have errored. The promise
+  was half-built: the routing signal without the payload. Fix (OpenAI-compatible path):
+  (1) carry the raw `tools` / `tool_choice` JSON on the request (in `SamplingParams`,
+  beside `response_format`, so no request-construction site changes); (2) forward them
+  in `openai_fields` (covers the cloud OpenAI provider and the local OpenAI-compatible
+  backend) and in Ollama's `build_body` (`tools` only — Ollama has no `tool_choice`);
+  (3) `parse_response` now extracts a `tool_calls` array and only errors when *neither*
+  text nor a tool call is present; (4) `CompletionResponse` gains `tool_calls`, and
+  `build_openai_response` emits the array with `finish_reason:"tool_calls"`; (5) the
+  cache key (`hash_sampling`) includes `tools`/`tool_choice` so different tools never
+  cross-serve. Empty `tools`/`null` `tool_choice` are not forwarded (nothing to carry).
+  **Scope / follow-ups:** Anthropic tool-use (different `tools` schema and `tool_use`
+  blocks) and streaming tool-call deltas are not yet forwarded — both fall back to the
+  prior behaviour and are documented as the next steps. Zero new dependencies. 630 tests
+  pass (7 new: forwarding in `openai_fields` and Ollama; `tool_calls` parsed; response
+  emits the array + finish reason; ordinary response stays `stop`; tools change the
+  cache key; request captures tools; empty tools not forwarded).
+
 - **ADR-176 Explicit `tool_choice: null` no longer forces escalation to the cloud.**
   Socratic probe of the IMP-10 tool-routing signal: "`tool_choice_active` is
   `tc.as_str() != Some(\"none\")`. What does a client that serializes every field —

@@ -180,8 +180,13 @@ impl Provider {
         }
     }
 
-    /// Extract (content, prompt_tokens, completion_tokens) from a success body.
-    pub fn parse_response(self, body: &str) -> Result<(String, u64, u64), BackendError> {
+    /// Extract (content, tool_calls, prompt_tokens, completion_tokens) from a
+    /// success body. `tool_calls` is the raw JSON array string when the model
+    /// chose to call a tool (ADR-177); `None` for an ordinary text completion.
+    pub fn parse_response(
+        self,
+        body: &str,
+    ) -> Result<(String, Option<String>, u64, u64), BackendError> {
         let v = parse(body).map_err(|e| BackendError::Protocol(e.to_string()))?;
         // Surface server-reported errors (e.g. LM Studio returns an error object
         // with a 500 when the model id does not match a loaded model).
@@ -195,19 +200,31 @@ impl Provider {
         }
         match self {
             Provider::OpenAI => {
-                let content = v
+                let message = v
                     .get("choices")
                     .and_then(JsonValue::as_array)
                     .and_then(|a| a.first())
-                    .and_then(|c| c.get("message"))
+                    .and_then(|c| c.get("message"));
+                // A tool-call response has `content: null` and a `tool_calls`
+                // array, so content alone cannot be required (ADR-177).
+                let tool_calls = message
+                    .and_then(|m| m.get("tool_calls"))
+                    .filter(|tc| matches!(tc, JsonValue::Array(a) if !a.is_empty()))
+                    .map(|tc| tc.to_json_string());
+                let content = message
                     .and_then(|m| m.get("content"))
                     .and_then(|c| c.as_str())
-                    .ok_or_else(|| {
-                        BackendError::Protocol("missing choices[0].message.content".into())
-                    })?
+                    .unwrap_or("")
                     .to_string();
+                // Reject only when there is neither text nor a tool call — a
+                // genuinely malformed response.
+                if content.is_empty() && tool_calls.is_none() {
+                    return Err(BackendError::Protocol(
+                        "missing choices[0].message.content and tool_calls".into(),
+                    ));
+                }
                 let (p, c) = usage(&v, "prompt_tokens", "completion_tokens");
-                Ok((content, p, c))
+                Ok((content, tool_calls, p, c))
             }
             Provider::Anthropic => {
                 let content = v
@@ -219,7 +236,9 @@ impl Provider {
                     .ok_or_else(|| BackendError::Protocol("missing content[0].text".into()))?
                     .to_string();
                 let (p, c) = usage(&v, "input_tokens", "output_tokens");
-                Ok((content, p, c))
+                // Anthropic tool-use forwarding is a follow-up (ADR-177): its
+                // tools schema and tool_use blocks differ from OpenAI's.
+                Ok((content, None, p, c))
             }
         }
     }
@@ -604,13 +623,14 @@ mod transport {
                     format!("HTTP {status}: {snippet}"),
                 ));
             }
-            let (content, prompt_tokens, completion_tokens) =
+            let (content, tool_calls, prompt_tokens, completion_tokens) =
                 self.provider.parse_response(&resp_body)?;
             Ok(CompletionResponse {
                 content,
                 model: self.model.clone(),
                 prompt_tokens,
                 completion_tokens,
+                tool_calls,
             })
         }
 
@@ -650,6 +670,9 @@ mod transport {
                 model: self.model.clone(),
                 prompt_tokens,
                 completion_tokens,
+                // Streaming tool-call deltas are a follow-up (ADR-177); the
+                // buffered path carries tool_calls today.
+                tool_calls: None,
             })
         }
     }
@@ -737,16 +760,29 @@ mod tests {
     #[test]
     fn test_parse_openai_response() {
         let body = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
-        let (c, p, comp) = Provider::OpenAI.parse_response(body).unwrap();
+        let (c, tc, p, comp) = Provider::OpenAI.parse_response(body).unwrap();
         assert_eq!(c, "hello");
+        assert_eq!(tc, None);
         assert_eq!((p, comp), (5, 3));
+    }
+
+    #[test]
+    fn test_parse_openai_response_tool_calls() {
+        // ADR-177: a tool-call response has content:null and a tool_calls array.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}],"usage":{"prompt_tokens":8,"completion_tokens":4}}"#;
+        let (c, tc, p, comp) = Provider::OpenAI.parse_response(body).unwrap();
+        assert_eq!(c, "", "content is empty for a pure tool call");
+        assert!(tc.is_some(), "tool_calls must be surfaced");
+        assert!(tc.unwrap().contains("get_weather"));
+        assert_eq!((p, comp), (8, 4));
     }
 
     #[test]
     fn test_parse_anthropic_response() {
         let body = r#"{"content":[{"type":"text","text":"hi there"}],"usage":{"input_tokens":7,"output_tokens":2}}"#;
-        let (c, p, comp) = Provider::Anthropic.parse_response(body).unwrap();
+        let (c, tc, p, comp) = Provider::Anthropic.parse_response(body).unwrap();
         assert_eq!(c, "hi there");
+        assert_eq!(tc, None);
         assert_eq!((p, comp), (7, 2));
     }
 

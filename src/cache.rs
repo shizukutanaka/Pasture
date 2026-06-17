@@ -226,6 +226,15 @@ fn hash_sampling(h: &mut DefaultHasher, s: &crate::backend::SamplingParams) {
     if let Some(rf) = &s.response_format {
         rf.to_json_string().hash(h);
     }
+    // tools / tool_choice change the answer (the model may call a tool), so they
+    // are part of the key — two requests with identical messages but different
+    // tools must not cross-serve a cached response (ADR-177).
+    if let Some(tools) = &s.tools {
+        tools.to_json_string().hash(h);
+    }
+    if let Some(tc) = &s.tool_choice {
+        tc.to_json_string().hash(h);
+    }
 }
 
 /// Stable signature of just the sampling parameters (ADR-159). The semantic
@@ -383,6 +392,7 @@ mod tests {
             model: "m".to_string(),
             prompt_tokens: 1,
             completion_tokens: 1,
+            tool_calls: None,
         }
     }
 

@@ -895,6 +895,18 @@ impl Proxy {
             presence_penalty: finite("presence_penalty"),
             frequency_penalty: finite("frequency_penalty"),
             response_format: v.get("response_format").cloned(),
+            // Forward tool definitions verbatim so the backend can make tool
+            // calls (ADR-177). Only a non-empty `tools` array and a non-null
+            // `tool_choice` are carried — an empty/null value is meaningless and
+            // would only bloat the upstream request.
+            tools: v
+                .get("tools")
+                .filter(|t| matches!(t, JsonValue::Array(a) if !a.is_empty()))
+                .cloned(),
+            tool_choice: v
+                .get("tool_choice")
+                .filter(|t| !matches!(t, JsonValue::Null))
+                .cloned(),
         }
     }
 
@@ -2839,8 +2851,14 @@ pub fn build_openai_response_with_injection(
         Some(label) => format!(",\"x_pasture_injection_flag\":\"{}\"", escape_string(label)),
         None => String::new(),
     };
+    // A tool-call response carries a `tool_calls` array and the `tool_calls`
+    // finish reason (ADR-177); an ordinary completion carries neither.
+    let (tool_calls_field, finish_reason) = match &resp.tool_calls {
+        Some(tc) => (format!(",\"tool_calls\":{tc}"), "tool_calls"),
+        None => (String::new(), "stop"),
+    };
     format!(
-        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fp}\",\"x_pasture_route\":\"{}\"{flag_field},\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"logprobs\":null,\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\"system_fingerprint\":\"{fp}\",\"x_pasture_route\":\"{}\"{flag_field},\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"{tool_calls_field}}},\"logprobs\":null,\"finish_reason\":\"{finish_reason}\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
         next_completion_id(),
         unix_now(),
         escape_string(&resp.model),

@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Tool/function calling is forwarded to the backend (ADR-177)
+
+- IMP-10 detected `tools`/`tool_choice` and escalated to the stronger model, but the
+  tool definitions were never forwarded to any backend — so the model could not make a
+  tool call, and a tool-call response (`content: null`) would have errored.  Now the
+  raw `tools`/`tool_choice` are carried on the request and forwarded on the
+  OpenAI-compatible path (cloud OpenAI provider, local OpenAI-compatible backend, and
+  Ollama's `tools`).  `tool_calls` responses are parsed and re-emitted with
+  `finish_reason:"tool_calls"`, and the cache key now distinguishes different tools.
+  Anthropic tool-use and streaming tool-call deltas remain follow-ups (they fall back to
+  the prior behaviour).  7 new tests.  630 tests.  (ADR-177)
+
 ### Fixed — Explicit `tool_choice: null` no longer forces cloud escalation (ADR-176)
 
 - A request carrying `"tool_choice": null` (emitted by serializers that include every

@@ -52,6 +52,14 @@ pub struct SamplingParams {
     /// Structured-output request (`response_format`), forwarded so JSON mode /
     /// JSON-schema output works through the proxy. Stored as the raw JSON value.
     pub response_format: Option<JsonValue>,
+    /// Tool/function definitions (`tools`), forwarded verbatim so the backend can
+    /// emit tool calls (IMP-10 / ADR-177). Stored as the raw JSON array value.
+    /// Kept here (alongside `response_format`) so every CompletionRequest carries
+    /// it without touching the many request-construction sites; `has_tools` on the
+    /// request is the derived routing signal, this is the payload that is forwarded.
+    pub tools: Option<JsonValue>,
+    /// Tool-selection control (`tool_choice`), forwarded verbatim (ADR-177).
+    pub tool_choice: Option<JsonValue>,
 }
 
 impl SamplingParams {
@@ -94,6 +102,15 @@ impl SamplingParams {
         if let Some(rf) = &self.response_format {
             out.push_str(&format!(",\"response_format\":{}", rf.to_json_string()));
         }
+        // Forward tool definitions and selection verbatim so the backend can make
+        // tool calls (ADR-177). The proxy already escalated to the stronger model
+        // (IMP-10); dropping the payload here would make tool calls impossible.
+        if let Some(tools) = &self.tools {
+            out.push_str(&format!(",\"tools\":{}", tools.to_json_string()));
+        }
+        if let Some(tc) = &self.tool_choice {
+            out.push_str(&format!(",\"tool_choice\":{}", tc.to_json_string()));
+        }
         out
     }
 
@@ -113,6 +130,16 @@ impl SamplingParams {
                 .map(|schema| format!(",\"format\":{}", schema.to_json_string()))
                 .unwrap_or_default(),
             _ => String::new(),
+        }
+    }
+
+    /// Ollama top-level `tools` field, comma-prefixed (empty if none). Ollama's
+    /// `/api/chat` accepts the same `tools` array shape as OpenAI (ADR-177); it
+    /// has no `tool_choice`, so only `tools` is forwarded here.
+    pub fn ollama_tools_field(&self) -> String {
+        match &self.tools {
+            Some(tools) => format!(",\"tools\":{}", tools.to_json_string()),
+            None => String::new(),
         }
     }
 
@@ -169,12 +196,16 @@ impl CompletionRequest {
 }
 
 /// A completed response plus token accounting.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompletionResponse {
     pub content: String,
     pub model: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Raw `tool_calls` JSON array from the assistant message, when the model
+    /// chose to call a tool instead of (or alongside) emitting text (ADR-177).
+    /// `None` for an ordinary text completion. Forwarded verbatim to the client.
+    pub tool_calls: Option<String>,
 }
 
 /// Embedding vectors for one or more inputs, plus token accounting (IMP-8).
@@ -338,6 +369,7 @@ impl Backend for MockBackend {
             model: req.model.clone(),
             prompt_tokens,
             completion_tokens: crate::routing::estimate_tokens(&self.reply) as u64,
+            tool_calls: None,
         })
     }
 
@@ -396,10 +428,11 @@ impl OllamaBackend {
             })
             .collect();
         format!(
-            "{{\"model\":\"{}\",\"stream\":{stream},\"messages\":[{}]{}{}}}",
+            "{{\"model\":\"{}\",\"stream\":{stream},\"messages\":[{}]{}{}{}}}",
             escape_string(&req.model),
             msgs.join(","),
             req.sampling.ollama_format_field(),
+            req.sampling.ollama_tools_field(),
             req.sampling.ollama_options()
         )
     }
@@ -437,6 +470,7 @@ impl Backend for OllamaBackend {
             model: self.model.clone(),
             prompt_tokens,
             completion_tokens,
+            tool_calls: None,
         })
     }
 
@@ -470,6 +504,7 @@ impl Backend for OllamaBackend {
             model: self.model.clone(),
             prompt_tokens,
             completion_tokens,
+            tool_calls: None,
         })
     }
 
@@ -574,13 +609,14 @@ impl Backend for OpenAiCompatBackend {
             &body,
             self.timeout,
         )?;
-        let (content, prompt_tokens, completion_tokens) =
+        let (content, tool_calls, prompt_tokens, completion_tokens) =
             Provider::OpenAI.parse_response(&resp_body)?;
         Ok(CompletionResponse {
             content,
             model: self.model.clone(),
             prompt_tokens,
             completion_tokens,
+            tool_calls,
         })
     }
 
@@ -598,7 +634,7 @@ impl Backend for OpenAiCompatBackend {
             &body,
             self.timeout,
         )?;
-        let (content, prompt_tokens, completion_tokens) =
+        let (content, tool_calls, prompt_tokens, completion_tokens) =
             Provider::OpenAI.parse_response(&resp_body)?;
         let confidence = crate::cloud::mean_logprob_from_openai(&resp_body);
         Ok((
@@ -607,6 +643,7 @@ impl Backend for OpenAiCompatBackend {
                 model: self.model.clone(),
                 prompt_tokens,
                 completion_tokens,
+                tool_calls,
             },
             confidence,
         ))
@@ -657,6 +694,7 @@ impl Backend for OpenAiCompatBackend {
             model: self.model.clone(),
             prompt_tokens,
             completion_tokens,
+            tool_calls: None,
         })
     }
 
@@ -1061,5 +1099,40 @@ mod tests {
         assert!(f.contains("\"seed\":42"));
         // Empty sampling produces no fields.
         assert_eq!(SamplingParams::default().openai_fields(), "");
+    }
+
+    #[test]
+    fn test_openai_fields_forwards_tools_and_tool_choice() {
+        // ADR-177: tools and tool_choice are forwarded verbatim so the backend
+        // can make tool calls.
+        let s = SamplingParams {
+            tools: Some(
+                crate::json::parse(r#"[{"type":"function","function":{"name":"f"}}]"#).unwrap(),
+            ),
+            tool_choice: Some(crate::json::parse(r#""auto""#).unwrap()),
+            ..Default::default()
+        };
+        let f = s.openai_fields();
+        // (the JSON serializer sorts object keys, so match on stable substrings)
+        assert!(f.contains("\"tools\":["), "{f}");
+        assert!(f.contains("\"name\":\"f\""), "{f}");
+        assert!(f.contains("\"tool_choice\":\"auto\""), "{f}");
+        // Absent → not emitted.
+        assert_eq!(SamplingParams::default().openai_fields(), "");
+    }
+
+    #[test]
+    fn test_ollama_forwards_tools() {
+        // ADR-177: Ollama's /api/chat accepts the same tools shape (no tool_choice).
+        let mut r = req();
+        r.sampling.tools =
+            Some(crate::json::parse(r#"[{"type":"function","function":{"name":"f"}}]"#).unwrap());
+        r.sampling.tool_choice = Some(crate::json::parse(r#""auto""#).unwrap());
+        let body = OllamaBackend::build_body(&r);
+        assert!(body.contains("\"tools\":["), "{body}");
+        assert!(body.contains("\"name\":\"f\""), "{body}");
+        // Ollama has no tool_choice; it must not be injected.
+        assert!(!body.contains("tool_choice"), "{body}");
+        assert!(crate::json::parse(&body).is_ok(), "valid JSON: {body}");
     }
 }

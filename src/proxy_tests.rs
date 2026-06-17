@@ -498,6 +498,7 @@ fn test_response_includes_created() {
         model: "m".into(),
         prompt_tokens: 1,
         completion_tokens: 1,
+        tool_calls: None,
     };
     assert!(build_openai_response(&resp, "local").contains("\"created\":"));
     assert!(build_openai_chunk(
@@ -519,6 +520,7 @@ fn test_completion_ids_are_unique_and_prefixed() {
         model: "m".into(),
         prompt_tokens: 1,
         completion_tokens: 1,
+        tool_calls: None,
     };
     let id_of = |json: &str| {
         crate::json::parse(json)
@@ -1693,6 +1695,7 @@ impl Backend for FlakyBackend {
             model: "flaky".into(),
             prompt_tokens: 1,
             completion_tokens: 1,
+            tool_calls: None,
         })
     }
 }
@@ -2291,6 +2294,7 @@ fn test_finalize_streamed_accounts_without_client_io() {
         model: "m".to_string(),
         prompt_tokens: 7,
         completion_tokens: 11,
+        tool_calls: None,
     };
     let mut span = p
         .otel_log
@@ -2335,6 +2339,7 @@ fn test_finalize_streamed_accrues_cloud_budget() {
         model: "m".to_string(),
         prompt_tokens: 100,
         completion_tokens: 50,
+        tool_calls: None,
     };
     let mut span = None;
     p.finalize_streamed(&r, Route::Cloud, "cloud", &mut span, None, None, None, "cloud-model", 0, 0);
@@ -2363,6 +2368,7 @@ fn test_build_openai_response_shape_is_valid_json() {
         model: "m".to_string(),
         prompt_tokens: 3,
         completion_tokens: 2,
+        tool_calls: None,
     };
     let json = build_openai_response(&resp, "cloud");
     let parsed = parse(&json).unwrap();
@@ -2386,6 +2392,7 @@ fn test_response_choice_has_null_logprobs() {
         model: "m".into(),
         prompt_tokens: 1,
         completion_tokens: 1,
+        tool_calls: None,
     };
     let json = build_openai_response(&resp, "local");
     let v = parse(&json).unwrap();
@@ -2485,6 +2492,7 @@ fn test_response_includes_system_fingerprint() {
         model: "llama3".into(),
         prompt_tokens: 1,
         completion_tokens: 1,
+        tool_calls: None,
     };
     let json = build_openai_response(&resp, "local");
     let v = parse(&json).unwrap();
@@ -3009,6 +3017,103 @@ fn test_tool_choice_null_with_empty_tools_does_not_escalate() {
     assert!(!req.has_tools, "empty tools + null tool_choice must stay local");
 }
 
+// ── tool passthrough (ADR-177) ────────────────────────────────────────────
+
+#[test]
+fn test_parse_request_captures_tools_for_forwarding() {
+    // ADR-177: a non-empty tools array and tool_choice are stored on the request
+    // (in sampling) so they can be forwarded to the backend, not just counted.
+    let req = Proxy::parse_request(
+        r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"get_weather"}}],"tool_choice":"auto"}"#,
+    )
+    .unwrap();
+    assert!(req.has_tools);
+    let tools = req.sampling.tools.expect("tools captured");
+    assert!(tools.to_json_string().contains("get_weather"));
+    assert_eq!(
+        req.sampling.tool_choice.map(|t| t.to_json_string()),
+        Some("\"auto\"".to_string())
+    );
+}
+
+#[test]
+fn test_parse_request_empty_tools_not_forwarded() {
+    // An empty tools array / null tool_choice carries nothing to forward.
+    let req = Proxy::parse_request(
+        r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[],"tool_choice":null}"#,
+    )
+    .unwrap();
+    assert!(req.sampling.tools.is_none(), "empty tools not forwarded");
+    assert!(req.sampling.tool_choice.is_none(), "null tool_choice not forwarded");
+}
+
+#[test]
+fn test_build_openai_response_emits_tool_calls() {
+    // ADR-177: a response carrying tool_calls emits the array and the
+    // "tool_calls" finish reason; an ordinary response does neither.
+    let resp = CompletionResponse {
+        content: String::new(),
+        model: "m".into(),
+        prompt_tokens: 8,
+        completion_tokens: 4,
+        tool_calls: Some(
+            r#"[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]"#
+                .to_string(),
+        ),
+    };
+    let json = build_openai_response(&resp, "cloud");
+    let v = parse(&json).unwrap();
+    let choice = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .unwrap();
+    assert_eq!(
+        choice.get("finish_reason").and_then(|r| r.as_str()),
+        Some("tool_calls")
+    );
+    let message = choice.get("message").unwrap();
+    assert!(
+        message.get("tool_calls").is_some(),
+        "message must carry tool_calls: {json}"
+    );
+    // Still valid JSON overall.
+    assert!(parse(&json).is_ok());
+}
+
+#[test]
+fn test_build_openai_response_no_tool_calls_is_stop() {
+    let resp = CompletionResponse {
+        content: "plain".into(),
+        model: "m".into(),
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        tool_calls: None,
+    };
+    let json = build_openai_response(&resp, "local");
+    assert!(json.contains("\"finish_reason\":\"stop\""), "{json}");
+    assert!(!json.contains("tool_calls"), "{json}");
+}
+
+#[test]
+fn test_tool_definitions_change_cache_key() {
+    // ADR-177: identical messages but different tools must not share a cache key.
+    let base = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]"#;
+    let a = Proxy::parse_request(&format!(
+        "{base},\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":\"a\"}}}}]}}"
+    ))
+    .unwrap();
+    let b = Proxy::parse_request(&format!(
+        "{base},\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":\"b\"}}}}]}}"
+    ))
+    .unwrap();
+    assert_ne!(
+        crate::cache::request_key(&a),
+        crate::cache::request_key(&b),
+        "different tools must produce different cache keys"
+    );
+}
+
 // ── /v1/completions legacy shim (IMP-legacy-completions) ─────────────────
 
 #[test]
@@ -3043,6 +3148,7 @@ fn test_build_legacy_completion_response_shape() {
         model: "local-model".to_string(),
         prompt_tokens: 5,
         completion_tokens: 3,
+        tool_calls: None,
     };
     let json = build_legacy_completion_response(&resp, "local");
     assert!(json.contains("\"object\":\"text_completion\""), "{json}");
@@ -3337,6 +3443,7 @@ impl Backend for RecordingEchoBackend {
             model: req.model.clone(),
             prompt_tokens: 1,
             completion_tokens: 1,
+            tool_calls: None,
         })
     }
 }
@@ -3760,6 +3867,7 @@ fn test_budget_reconcile_does_not_underflow_across_day_rollover() {
         model: "m".to_string(),
         prompt_tokens: 4,
         completion_tokens: 6,
+        tool_calls: None,
     };
     // reserved=500, actual=10 → reconcile subtracts 490 from a counter of 0.
     p.log_cost("cloud", &r, None, 500);
@@ -3786,6 +3894,7 @@ fn test_budget_local_fallback_release_does_not_underflow() {
         model: "m".to_string(),
         prompt_tokens: 0,
         completion_tokens: 0,
+        tool_calls: None,
     };
     // Planned cloud (reserved=300) fell back to local; release 300 from a 0 counter.
     p.log_cost("local", &r, None, 300);
@@ -3859,6 +3968,7 @@ fn test_cloud_cost_logged_from_pricing() {
         model: "cloud-model".to_string(),
         prompt_tokens: 1000,
         completion_tokens: 500,
+        tool_calls: None,
     };
     p.log_cost("cloud", &r, None, 0);
     let recs = crate::cost::read_log(&log).unwrap();
@@ -3882,6 +3992,7 @@ fn test_local_and_cache_cost_zero_even_with_pricing() {
         model: "m".to_string(),
         prompt_tokens: 1000,
         completion_tokens: 500,
+        tool_calls: None,
     };
     p.log_cost("local", &r, None, 0);
     p.log_cost("cache", &r, None, 0);
@@ -3902,6 +4013,7 @@ fn test_cloud_price_clamps_negative_and_nonfinite() {
         model: "cloud-model".to_string(),
         prompt_tokens: 1000,
         completion_tokens: 500,
+        tool_calls: None,
     };
     p.log_cost("cloud", &r, None, 0);
     let recs = crate::cost::read_log(&log).unwrap();
@@ -3920,6 +4032,7 @@ fn test_no_pricing_keeps_cost_zero() {
         model: "cloud-model".to_string(),
         prompt_tokens: 1000,
         completion_tokens: 500,
+        tool_calls: None,
     };
     p.log_cost("cloud", &r, None, 0);
     let recs = crate::cost::read_log(&log).unwrap();
