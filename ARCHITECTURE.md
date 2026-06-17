@@ -1171,6 +1171,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-176 Explicit `tool_choice: null` no longer forces escalation to the cloud.**
+  Socratic probe of the IMP-10 tool-routing signal: "`tool_choice_active` is
+  `tc.as_str() != Some(\"none\")`. What does a client that serializes every field —
+  emitting `\"tool_choice\": null` with no tools — get?" `JsonValue::Null.as_str()`
+  is `None`, and `None != Some(\"none\")` is `true`, so `has_tools` was set and the
+  request was escalated to the cloud. Many OpenAI-compatible clients (Pydantic without
+  `exclude_none`, various JS SDKs) emit an explicit `null` for unset optional fields,
+  so this silently forced *every* request from such a client to the cloud — defeating
+  the privacy-first local-first default and burning cloud spend, the exact opposite of
+  the routing philosophy. Fix: treat `JsonValue::Null` like an absent field
+  (`!matches!(tc, JsonValue::Null) && tc.as_str() != Some(\"none\")`). Named-function
+  objects and `\"auto\"`/`\"required\"` still escalate; `\"none\"` and now `null` stay
+  local. 622 tests pass (2 new: bare `null`; `tools:[]` + `null` together).
+
 - **ADR-175 Anthropic streaming also reports actual token counts (ADR-173 follow-up).**
   Socratic probe of the ADR-173 fix: "ADR-173 made streaming log actual token counts
   — but `read_sse_body` gets usage via `provider.parse_stream_line`, and

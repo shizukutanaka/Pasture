@@ -820,9 +820,12 @@ impl Proxy {
                 .map(|a| !a.is_empty())
                 .unwrap_or(false)
         };
+        // An explicit JSON `null` (common from serializers that emit every
+        // field) means "no tool choice" — treat it like absent, not active,
+        // so it does not force every request to the cloud (ADR-176).
         let tool_choice_active = v
             .get("tool_choice")
-            .map(|tc| tc.as_str() != Some("none"))
+            .map(|tc| !matches!(tc, JsonValue::Null) && tc.as_str() != Some("none"))
             .unwrap_or(false);
         let has_tools =
             non_empty_array("tools") || non_empty_array("functions") || tool_choice_active;

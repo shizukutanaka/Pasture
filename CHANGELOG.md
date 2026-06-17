@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Explicit `tool_choice: null` no longer forces cloud escalation (ADR-176)
+
+- A request carrying `"tool_choice": null` (emitted by serializers that include every
+  field, e.g. Pydantic without `exclude_none`) was treated as an active tool choice —
+  `JsonValue::Null.as_str()` is `None` and `None != Some("none")` is true — so `has_tools`
+  was set and the request escalated to the cloud.  This silently forced *every* request
+  from such a client off-device, defeating local-first routing.  Fixed: a `null`
+  `tool_choice` is treated like an absent field.  Named-function objects and
+  `auto`/`required` still escalate; `none` and `null` stay local.  2 new tests.  622 tests.
+  (ADR-176)
+
 ### Fixed — Anthropic streaming also logs actual token counts (ADR-175)
 
 - ADR-173 fixed streaming token accounting for the OpenAI provider, but

@@ -2985,6 +2985,30 @@ fn test_tool_choice_named_function_escalates() {
     );
 }
 
+#[test]
+fn test_tool_choice_null_does_not_escalate() {
+    // ADR-176: an explicit JSON null (many serializers emit every field) must
+    // behave like absent — not force escalation to the cloud.
+    let req = Proxy::parse_request(
+        r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":null}"#,
+    )
+    .unwrap();
+    assert!(
+        !req.has_tools,
+        "tool_choice:null must not set has_tools (would falsely escalate every request)"
+    );
+}
+
+#[test]
+fn test_tool_choice_null_with_empty_tools_does_not_escalate() {
+    // The realistic shape from a serializer: tools:[] and tool_choice:null together.
+    let req = Proxy::parse_request(
+        r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[],"tool_choice":null}"#,
+    )
+    .unwrap();
+    assert!(!req.has_tools, "empty tools + null tool_choice must stay local");
+}
+
 // ── /v1/completions legacy shim (IMP-legacy-completions) ─────────────────
 
 #[test]
