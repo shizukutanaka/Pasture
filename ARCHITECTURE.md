@@ -1171,6 +1171,21 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-175 Anthropic streaming also reports actual token counts (ADR-173 follow-up).**
+  Socratic probe of the ADR-173 fix: "ADR-173 made streaming log actual token counts
+  — but `read_sse_body` gets usage via `provider.parse_stream_line`, and
+  `parse_anthropic_stream_line` only handles `content_block_delta` and `message_stop`.
+  Does the Anthropic provider ever surface usage?" No — so Anthropic cloud streaming
+  still fell back to `estimate_tokens`, leaving the same biased cost-log / budget-gauge
+  defect ADR-173 fixed for OpenAI. Anthropic splits usage across two events:
+  `message_start` carries `message.usage.input_tokens`; the final `message_delta`
+  carries the cumulative `usage.output_tokens` (the `message_start` `output_tokens` is
+  a placeholder). Fix: `parse_anthropic_stream_line` now emits `Usage(input, 0)` from
+  `message_start` and `Usage(0, output)` from `message_delta`; `emit_sse_lines` merges
+  partial usage events (a non-zero field overwrites), so OpenAI's single combined event
+  and Anthropic's two split events both produce the correct `(prompt, completion)` pair.
+  Zero new dependencies. 620 tests pass (2 new: split-usage merge; per-event parse).
+
 - **ADR-174 `http_post_streaming` checks HTTP status before emitting SSE lines.**
   Socratic probe of the local-backend streaming path: "`http_post_streaming` strips
   headers and calls `on_line` for every line in the body. Does it check the HTTP

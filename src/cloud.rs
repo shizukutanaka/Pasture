@@ -291,6 +291,10 @@ pub fn parse_openai_stream_line(line: &str) -> Option<OpenAiStreamEvent> {
 
 /// Parse one SSE `data:` line from an Anthropic Messages streaming response.
 /// Text arrives as `content_block_delta` events; `message_stop` signals the end.
+/// Token usage is split across two events (ADR-175): `message_start` carries
+/// `message.usage.input_tokens`, and the final `message_delta` carries the
+/// cumulative `usage.output_tokens`. Each is surfaced as a partial `Usage`
+/// event (the other field 0) and merged by the caller.
 pub fn parse_anthropic_stream_line(line: &str) -> Option<OpenAiStreamEvent> {
     let data = line.trim().strip_prefix("data:")?.trim();
     let v = parse(data).ok()?;
@@ -301,7 +305,33 @@ pub fn parse_anthropic_stream_line(line: &str) -> Option<OpenAiStreamEvent> {
             .and_then(|t| t.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| OpenAiStreamEvent::Delta(s.to_string())),
+        // message_start.message.usage.input_tokens — prompt tokens (output is a
+        // placeholder here, filled by the later message_delta).
+        Some("message_start") => {
+            let input = v
+                .get("message")
+                .and_then(|m| m.get("usage"))
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(json_u64);
+            input.map(|p| OpenAiStreamEvent::Usage(p, 0))
+        }
+        // message_delta.usage.output_tokens — final cumulative completion tokens.
+        Some("message_delta") => {
+            let output = v
+                .get("usage")
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(json_u64);
+            output.map(|c| OpenAiStreamEvent::Usage(0, c))
+        }
         Some("message_stop") => Some(OpenAiStreamEvent::Done),
+        _ => None,
+    }
+}
+
+/// Read a JSON number as u64 (truncating), or None for non-numbers.
+fn json_u64(v: &JsonValue) -> Option<u64> {
+    match v {
+        JsonValue::Number(f) => Some(*f as u64),
         _ => None,
     }
 }
@@ -415,7 +445,11 @@ fn emit_sse_lines(
                 on_delta(&d);
             }
             Some(OpenAiStreamEvent::Usage(p, c)) => {
-                *stream_usage = Some((p, c));
+                // Merge partial usage: a non-zero field overwrites. OpenAI sends
+                // both counts in one event; Anthropic splits them across
+                // message_start (input) and message_delta (output) (ADR-175).
+                let (ep, ec) = stream_usage.unwrap_or((0, 0));
+                *stream_usage = Some((if p > 0 { p } else { ep }, if c > 0 { c } else { ec }));
             }
             _ => {}
         }
@@ -879,6 +913,39 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
         let (content, _) = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
         assert_eq!(content, "AB");
+    }
+
+    #[test]
+    fn test_read_sse_body_anthropic_usage_split_across_events() {
+        // ADR-175: input_tokens arrives in message_start, output_tokens in the
+        // final message_delta. The two partial Usage events must merge to (in, out).
+        let resp = "HTTP/1.1 200 OK\r\n\r\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
+        let (content, stream_usage) = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
+        assert_eq!(content, "hi");
+        // input from message_start; output from message_delta (NOT the placeholder 1).
+        assert_eq!(stream_usage, Some((25, 42)));
+    }
+
+    #[test]
+    fn test_anthropic_stream_line_usage_events() {
+        // message_start → Usage(input, 0); message_delta → Usage(0, output).
+        assert_eq!(
+            parse_anthropic_stream_line(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}"
+            ),
+            Some(OpenAiStreamEvent::Usage(7, 0))
+        );
+        assert_eq!(
+            parse_anthropic_stream_line(
+                "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":13}}"
+            ),
+            Some(OpenAiStreamEvent::Usage(0, 13))
+        );
     }
 
     #[test]

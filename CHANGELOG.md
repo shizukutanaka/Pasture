@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Anthropic streaming also logs actual token counts (ADR-175)
+
+- ADR-173 fixed streaming token accounting for the OpenAI provider, but
+  `parse_anthropic_stream_line` never surfaced usage, so Anthropic cloud streaming
+  still fell back to `estimate_tokens`.  Anthropic splits usage across two SSE events:
+  `message_start` (input tokens) and the final `message_delta` (cumulative output
+  tokens).  Fixed: the parser emits a partial `Usage` from each, and `emit_sse_lines`
+  merges them (non-zero field wins).  2 new tests.  620 tests.  (ADR-175)
+
 ### Fixed — `http_post_streaming` reports real HTTP errors from local backend (ADR-174)
 
 - When the local backend returned a non-2xx HTTP status (e.g. `401 Unauthorized`,
