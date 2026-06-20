@@ -1900,3 +1900,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   whole message. The restore path (`restore(resp.content, mapping)`) is unchanged: it replaces
   tokens in the text response, which works regardless of where the tokens were introduced.
   Zero new dependencies; 5 new tests; 668 total.
+
+- **ADR-189 Pseudonymize restore covers cloud-generated `tool_calls` in the response.**
+  Socratic probe of ADR-188's restore path: "ADR-188 pseudonymizes the outbound `tool_calls_json`
+  history — but when the cloud model *responds* with its own tool call that echoes a pseudonymized
+  token from the request context (e.g. `<EMAIL_1>` appeared in history and the model uses it in its
+  reply tool call), does `restore()` de-anonymize it before the client sees it?" It did not. The
+  buffered path restored `resp.content` (line 1519) but not `resp.tool_calls`; the streaming path
+  emitted the tool-calls SSE chunk verbatim. The raw `<EMAIL_1>` token was forwarded to the client
+  in the `tool_calls` field, breaking any workflow that reads tool-call arguments. Both the mapping
+  (`pseudo_mapping` on the buffered path) and the mapping clone (`cache_mapping`, kept for
+  cache-restoration per ADR-147) were already available — the fix is two targeted additions. The
+  streaming path reuses `cache_mapping` (no new state). Non-pseudonymized requests are unaffected
+  (both branches gate on an existing non-empty mapping). Zero new dependencies; 2 new tests; 670
+  total.

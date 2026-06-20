@@ -3544,6 +3544,90 @@ fn test_streaming_without_system_prompt_sends_only_user_text() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// A cloud backend that replies with a fixed `tool_calls` JSON string.
+/// Used to simulate the case where the cloud model echoes back a
+/// pseudonymized token inside its tool-call arguments.
+struct ToolCallReplyBackend {
+    tool_calls_json: String,
+}
+impl Backend for ToolCallReplyBackend {
+    fn name(&self) -> &str { "cloud" }
+    fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
+        Ok(CompletionResponse {
+            content: String::new(),
+            model: req.model.clone(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            tool_calls: Some(self.tool_calls_json.clone()),
+        })
+    }
+}
+
+#[test]
+fn test_pseudonymize_restores_tokens_in_response_tool_calls() {
+    // ADR-189 (buffered path): when a cloud backend returns tool_calls that
+    // echo back a pseudonymized token (e.g. the model saw <EMAIL_1> in the
+    // request history and used it in its own tool call), the response
+    // tool_calls field must be de-anonymized before the client sees it.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100_000, true, true).with_allow_sensitive_cloud(true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(ToolCallReplyBackend {
+            // Cloud echoes the pseudonymized email token in its own tool call.
+            tool_calls_json: r#"[{"function":{"name":"send","arguments":"{\"to\":\"<EMAIL_1>\"}"}}]"#
+                .to_string(),
+        })),
+        &log,
+    )
+    .with_pseudonymize(true);
+    // model:"cloud" pins the cloud route; the email in the request causes the
+    // pseudonymizer to assign <EMAIL_1> = alice@example.com before sending.
+    let body = r#"{"model":"cloud","messages":[{"role":"user","content":"email alice@example.com now"}]}"#;
+    let resp = proxy.handle_chat(body).expect("chat must succeed");
+    assert!(
+        resp.contains("alice@example.com"),
+        "token in response tool_calls must be restored: {resp}"
+    );
+    assert!(
+        !resp.contains("<EMAIL_1>"),
+        "raw pseudo token must not reach the client: {resp}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_pseudonymize_restores_tokens_in_response_tool_calls() {
+    // ADR-189 (streaming path): same as the buffered case but for stream:true.
+    // The cloud-generated tool_calls chunk must have tokens de-anonymized before
+    // it is sent to the client; raw tokens must not appear in the SSE output.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100_000, true, true).with_allow_sensitive_cloud(true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(ToolCallReplyBackend {
+            tool_calls_json: r#"[{"function":{"name":"send","arguments":"{\"to\":\"<EMAIL_1>\"}"}}]"#
+                .to_string(),
+        })),
+        &log,
+    )
+    .with_pseudonymize(true);
+    let body = r#"{"model":"cloud","stream":true,"messages":[{"role":"user","content":"email alice@example.com now"}]}"#;
+    let (status, sse) = roundtrip(proxy, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    assert!(
+        sse.contains("alice@example.com"),
+        "token in streaming tool_calls chunk must be restored: {sse}"
+    );
+    assert!(
+        !sse.contains("<EMAIL_1>"),
+        "raw pseudo token must not appear in the streamed output: {sse}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 #[test]
 fn test_streaming_masks_pii_before_cloud_and_restores() {
     // Regression: a streaming cloud request with PASTURE_PSEUDONYMIZE must mask

@@ -1517,6 +1517,13 @@ impl Proxy {
         if let Some(ref mapping) = pseudo_mapping {
             if !mapping.is_empty() {
                 resp.content = crate::pseudonymize::restore(&resp.content, mapping);
+                // ADR-189: also restore in cloud-generated tool_calls. The cloud
+                // may echo back a pseudonymized token it saw in the request history
+                // (e.g. <EMAIL_1> in an argument), which must be un-masked before
+                // the response reaches the client.
+                if let Some(ref mut tc) = resp.tool_calls {
+                    *tc = crate::pseudonymize::restore(tc, mapping);
+                }
             }
         }
 
@@ -2519,8 +2526,20 @@ impl Proxy {
                     // finish reason.
                     if io_err.is_none() {
                         if let Some(tc) = &r.tool_calls {
+                            // ADR-189: restore pseudonymized tokens in the cloud's
+                            // tool_calls before forwarding to the client. cache_mapping
+                            // holds the same mapping as the StreamRestorer (the text
+                            // deltas were already restored via StreamRestorer.push()).
+                            let restored_tc: String;
+                            let tc_to_emit = match cache_mapping.as_ref() {
+                                Some(m) if !m.is_empty() => {
+                                    restored_tc = crate::pseudonymize::restore(tc, m);
+                                    &restored_tc
+                                }
+                                _ => tc,
+                            };
                             let frame = sse_frame(&build_openai_tool_calls_chunk(
-                                &id, &model, &fp, tc, route_label, created,
+                                &id, &model, &fp, tc_to_emit, route_label, created,
                             ));
                             if let Err(e) = sock.write_all(frame.as_bytes()) {
                                 io_err = Some(e);

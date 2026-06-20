@@ -5,6 +5,21 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Pseudonymize restore covers cloud-generated `tool_calls` (ADR-189)
+
+- When a cloud model responded with its own tool call that echoed a
+  pseudonymized token it saw in the request history (e.g. `<EMAIL_1>` passed
+  via the context), the `tool_calls` field of the response was forwarded to
+  the client with the raw opaque token — not the real value.  Only
+  `resp.content` was being restored; `resp.tool_calls` was not.  The same
+  omission affected the streaming path, where the tool-calls SSE chunk was
+  emitted verbatim.
+
+  Both paths now restore tokens in the `tool_calls` field using the same
+  mapping already in scope (`pseudo_mapping` / `cache_mapping`).  The
+  streaming path reuses the `cache_mapping` clone maintained for cache
+  restoration (ADR-147) — no new state.  2 new tests.  670 tests.  (ADR-189)
+
 ### Fixed — Pseudonymizer scrubs PII in tool-call argument JSON (ADR-188)
 
 - When `PASTURE_PSEUDONYMIZE=1` (masked-cloud mode), the pseudonymizer only
