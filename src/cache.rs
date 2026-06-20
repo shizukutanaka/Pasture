@@ -195,6 +195,15 @@ pub fn request_key(req: &CompletionRequest) -> u64 {
         // Normalise leading/trailing whitespace so "hi " and "hi" share a key.
         // Internal whitespace is left intact (code/formatting matters there).
         m.content.trim().hash(&mut h);
+        // ADR-186: an assistant message's tool_calls and a tool-result message's
+        // tool_call_id are part of the request the backend sees and change the
+        // answer, exactly like sampling-level tools/tool_choice (ADR-177). Two
+        // multi-turn histories with identical message content but different tool
+        // calls (e.g. book(NYC) vs book(LON)) must not cross-serve a cached
+        // response. These fields are structured, not user prose, so no whitespace
+        // normalisation — an exact match is required.
+        m.tool_call_id.hash(&mut h);
+        m.tool_calls_json.hash(&mut h);
     }
     hash_sampling(&mut h, &req.sampling);
     h.finish()
@@ -412,6 +421,33 @@ mod tests {
         assert_eq!(request_key(&req("m", "hi")), request_key(&req("m", "hi")));
         assert_ne!(request_key(&req("m", "hi")), request_key(&req("m", "bye")));
         assert_ne!(request_key(&req("a", "hi")), request_key(&req("b", "hi")));
+    }
+
+    #[test]
+    fn test_request_key_distinguishes_tool_calls_and_id() {
+        // ADR-186: two histories with identical message content/role but different
+        // assistant tool_calls (or tool-result tool_call_id) must NOT collide —
+        // otherwise a book(NYC) conversation could be served a cached book(LON) reply.
+        let base = req("m", "book a flight");
+        let mut with_nyc = req("m", "book a flight");
+        with_nyc.messages[0].tool_calls_json =
+            Some(r#"[{"id":"c1","function":{"name":"book","arguments":"{\"to\":\"NYC\"}"}}]"#.to_string());
+        let mut with_lon = req("m", "book a flight");
+        with_lon.messages[0].tool_calls_json =
+            Some(r#"[{"id":"c1","function":{"name":"book","arguments":"{\"to\":\"LON\"}"}}]"#.to_string());
+        // tool_calls present must differ from none, and the two argument sets must differ.
+        assert_ne!(request_key(&base), request_key(&with_nyc));
+        assert_ne!(request_key(&with_nyc), request_key(&with_lon));
+
+        // tool_call_id on a tool-result message is likewise significant.
+        let mut id_a = req("m", "ok");
+        id_a.messages[0].tool_call_id = Some("call_a".to_string());
+        let mut id_b = req("m", "ok");
+        id_b.messages[0].tool_call_id = Some("call_b".to_string());
+        assert_ne!(request_key(&id_a), request_key(&id_b));
+
+        // Sanity: identical tool_calls still produce a stable, equal key.
+        assert_eq!(request_key(&with_nyc), request_key(&with_nyc));
     }
 
     #[test]

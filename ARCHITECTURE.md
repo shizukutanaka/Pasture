@@ -1834,3 +1834,22 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   inheriting ADR-155's backward-clock safety (a backward step still cannot reset it). Cold-start
   (`count == 0`) already bypasses the spike check, so the post-reset state is the well-tested cold
   path. Zero new dependencies; 1 new test; 660 total.
+
+- **ADR-186 Exact-match cache key includes message-level `tool_calls` / `tool_call_id`.**
+  Socratic probe of the ADR-177..185 tool-calling series from the cache lens: "ADR-177 put
+  sampling-level `tools`/`tool_choice` in the cache key — but ADR-182/183 added *message-level*
+  `tool_call_id` and `tool_calls_json`. Are those in the key too?" They were not. `request_key()`
+  hashed only `m.role` and `m.content.trim()` per message, so two multi-turn histories with identical
+  message content but different assistant `tool_calls` — e.g. an assistant turn calling `book(NYC)`
+  vs `book(LON)`, each followed by the same tool-result content and user follow-up — collided to the
+  same key, and the second conversation would be served the first's cached completion (a wrong,
+  potentially cross-context answer referencing the wrong arguments). The cache is reached for
+  tool-calling requests because `has_tools` does not make a request sensitive — sensitivity comes
+  from `classify(routing_text())`, which is content-only — so non-sensitive tool requests *are*
+  cached. The fix folds `m.tool_call_id` and `m.tool_calls_json` into the per-message hash (exact,
+  no whitespace normalisation since they are structured, not prose). This is the exact invariant
+  ADR-177 enforced at the sampling level, applied at the message level the new fields introduced.
+  The change can only split previously-colliding keys, never merge distinct ones, so no valid hit is
+  lost; plain (non-tool) requests have both fields `None` and an unchanged key. The semantic-cache
+  `sampling_key` path (ADR-159) already hashed sampling-level tools and is unaffected. Zero new
+  dependencies; 1 new test; 661 total.

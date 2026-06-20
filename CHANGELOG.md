@@ -5,6 +5,24 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Cache key includes message-level `tool_calls` / `tool_call_id` (ADR-186)
+
+- The exact-match cache key (`request_key`) hashed only each message's `role`
+  and trimmed `content` (plus sampling-level `tools`/`tool_choice` from
+  ADR-177), but **not** the message-level `tool_calls_json` (assistant tool
+  calls, ADR-183) or `tool_call_id` (tool-result id, ADR-182).  Two multi-turn
+  histories with identical message content but different tool-call arguments —
+  e.g. `book(NYC)` vs `book(LON)` — collided to the same key, so the second
+  conversation could be served the first's cached reply.  Tool requests do
+  reach the cache: `has_tools` does not mark a request sensitive (sensitivity
+  is content-only via `classify`), so they are cacheable.
+
+  `request_key` now folds `tool_call_id` and `tool_calls_json` into the
+  per-message hash (exact match; no whitespace normalisation for structured
+  data).  The change can only split previously-colliding keys, never merge
+  distinct ones — no valid hit is lost, and plain non-tool requests (both
+  fields `None`) keep an unchanged key.  1 new test.  661 tests.  (ADR-186)
+
 ### Fixed — Spike-detector average resets on UTC day rollover (ADR-185)
 
 - The daily token budget resets at UTC midnight (ADR-155), but the spike
