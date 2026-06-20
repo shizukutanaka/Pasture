@@ -1027,7 +1027,7 @@ mod transport {
             // Use actual usage from the stream; fall back to estimate only if
             // the backend did not send a usage chunk (ADR-173).
             let (prompt_tokens, completion_tokens) = result.usage.unwrap_or_else(|| (
-                crate::routing::estimate_tokens(&req.routing_text()) as u64,
+                crate::routing::estimate_tokens(&req.estimation_text()) as u64,
                 crate::routing::estimate_tokens(&result.content) as u64,
             ));
             Ok(CompletionResponse {

@@ -4196,7 +4196,7 @@ fn test_otel_span_finish_reason_derived_for_buffered_tool_call() {
     // Instead, directly test emit_cache_hit_span since finalize_streamed and run_completion
     // call the same finish_reason_for helper — a unit test on the helper is sufficient,
     // and the integration is verified by the helper tests above.
-    let _ = std::fs::remove_file(&otel);
+    let _ = std::fs::remove_file(otel);
 }
 
 #[test]

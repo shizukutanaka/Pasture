@@ -1073,7 +1073,7 @@ impl Proxy {
             sock.write_all(frame.as_bytes())?;
         }
         self.log_cost(route_label, hit, None, 0);
-        let finish = finish_reason_for(&hit);
+        let finish = finish_reason_for(hit);
         let stop = sse_frame(&build_openai_chunk(&id, &model, &fp, "", route_label, Some(finish), created));
         sock.write_all(stop.as_bytes())?;
         if include_usage {
@@ -1258,7 +1258,7 @@ impl Proxy {
         // IMP-24: estimate input + predicted output tokens (cloud cost is driven
         // mostly by output, so input alone under-estimates spend).
         let estimated =
-            crate::routing::estimate_total_tokens(&req.routing_text(), req.sampling.max_tokens)
+            crate::routing::estimate_total_tokens(&req.estimation_text(), req.sampling.max_tokens)
                 as u64;
         if let Some(reason) = self.check_budget_and_spike(estimated) {
             match self.budget_action.as_str() {
@@ -2518,7 +2518,7 @@ impl Proxy {
                         }
                     }
                     if io_err.is_none() {
-                        let finish = finish_reason_for(&r);
+                        let finish = finish_reason_for(r);
                         let stop = sse_frame(&build_openai_chunk(
                             &id, &model, &fp, "", route_label, Some(finish), created,
                         ));

@@ -1797,3 +1797,22 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   emits the matching `tool_use` content blocks via `translate_openai_tool_calls_to_anthropic_blocks`.
   The pseudonymization pipeline carries `tool_calls_json` through untouched.
   Zero new dependencies; 7 new tests; 658 total.
+
+- **ADR-184 Token estimation counts tool definitions and `tool_calls` payloads.**
+  Socratic probe of the ADR-177..183 tool-calling series from the cost/budget angle: "when a
+  backend sends no usage chunk, what token count does a tool-heavy request log?" `routing_text()`
+  joins only message `content`, so the `tools` array (often hundreds of tokens of JSON schema),
+  `tool_choice`, and assistant `tool_calls` arguments were all excluded from the estimate — yet
+  those bytes are serialised into the request body and billed by the provider. The estimate
+  fallback therefore systematically under-counted tool-calling requests in the cost log, the daily
+  budget gauge/cap (IMP-26 / ADR-165/169), the spike detector, and cloud spend (ADR-166) — the
+  unsafe direction for a budget control. `routing_text()` must stay content-only: it also feeds
+  privacy `classify()` (user-visible text only) and the routing decision (where tool presence
+  already forces escalation via `has_tools`). The fix is a separate
+  `CompletionRequest::estimation_text()` (= `routing_text()` + serialised `tools`/`tool_choice` +
+  assistant `tool_calls_json`) used at the five token-accounting sites — the three local-backend
+  estimate fallbacks, the cloud streaming fallback, and `apply_budget_guard`'s pre-reservation —
+  leaving the decision/privacy sites on `routing_text()`. The actual-usage path (ADR-173/175) is
+  unaffected: actual counts still take precedence, this only improves the fallback. Also cleaned
+  three pre-existing clippy warnings (ADR-181 `finish_reason_for(&hit)`/`(&r)` double-refs, a test
+  needless borrow). Zero new dependencies; 1 new test; 659 total.

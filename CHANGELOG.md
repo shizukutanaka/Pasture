@@ -5,6 +5,24 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Token estimation counts tool definitions / `tool_calls` (ADR-184)
+
+- The token-estimate fallback (used for the cost log and budget/spike guard
+  when a backend sends no usage chunk) joined only message `content` via
+  `routing_text()`, so the `tools` schema (often hundreds of tokens), the
+  `tool_choice`, and assistant `tool_calls` arguments — all really sent to and
+  billed by the provider — were excluded.  Tool-heavy requests were therefore
+  systematically under-counted in the cost log, the daily budget gauge/cap, the
+  spike detector, and cloud spend — the unsafe direction for a budget control.
+
+  New `CompletionRequest::estimation_text()` extends `routing_text()` with the
+  serialised tool payload; the five token-accounting sites use it, while the
+  routing-decision and privacy sites keep `routing_text()` (content-only, as
+  `classify()` requires; tool presence already forces escalation).  The
+  actual-usage path (ADR-173/175) is unaffected — actual counts still win.
+  Also cleaned three pre-existing clippy warnings.  1 new test.  659 tests.
+  (ADR-184)
+
 ### Fixed — Multi-turn tool calling: assistant `tool_calls` history (ADR-183)
 
 - Assistant messages with `content:null` and a `tool_calls` array (the

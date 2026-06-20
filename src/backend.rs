@@ -202,6 +202,32 @@ impl CompletionRequest {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    /// Text used for *token-count estimation* — the cost-log fallback (when a
+    /// backend sends no usage chunk) and the budget/spike pre-reservation. It
+    /// extends `routing_text()` with the serialised `tools`/`tool_choice`
+    /// definitions and any assistant `tool_calls` payloads, because those bytes
+    /// are really sent to and billed by the backend (ADR-184). `routing_text()`
+    /// deliberately excludes them: tool presence already forces escalation via
+    /// `has_tools`, and privacy `classify()` must see only user-visible content.
+    pub fn estimation_text(&self) -> String {
+        let mut text = self.routing_text();
+        if let Some(tools) = &self.sampling.tools {
+            text.push('\n');
+            text.push_str(&tools.to_json_string());
+        }
+        if let Some(tc) = &self.sampling.tool_choice {
+            text.push('\n');
+            text.push_str(&tc.to_json_string());
+        }
+        for m in &self.messages {
+            if let Some(tc) = &m.tool_calls_json {
+                text.push('\n');
+                text.push_str(tc);
+            }
+        }
+        text
+    }
 }
 
 /// A completed response plus token accounting.
@@ -489,7 +515,7 @@ impl Backend for OllamaBackend {
             self.timeout,
         )?;
         let content = Self::parse_response(&response)?;
-        let prompt_tokens = crate::routing::estimate_tokens(&req.routing_text()) as u64;
+        let prompt_tokens = crate::routing::estimate_tokens(&req.estimation_text()) as u64;
         let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
         Ok(CompletionResponse {
             content,
@@ -523,7 +549,7 @@ impl Backend for OllamaBackend {
         if content.is_empty() {
             return Err(BackendError::Protocol("empty stream".to_string()));
         }
-        let prompt_tokens = crate::routing::estimate_tokens(&req.routing_text()) as u64;
+        let prompt_tokens = crate::routing::estimate_tokens(&req.estimation_text()) as u64;
         let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
         Ok(CompletionResponse {
             content,
@@ -718,7 +744,7 @@ impl Backend for OpenAiCompatBackend {
         // Use actual usage from the stream; fall back to estimate only if the
         // backend did not send a usage chunk (ADR-173).
         let (prompt_tokens, completion_tokens) = stream_usage.unwrap_or_else(|| (
-            crate::routing::estimate_tokens(&req.routing_text()) as u64,
+            crate::routing::estimate_tokens(&req.estimation_text()) as u64,
             crate::routing::estimate_tokens(&content) as u64,
         ));
         Ok(CompletionResponse {
@@ -937,6 +963,44 @@ mod tests {
     #[test]
     fn test_routing_text_joins_messages() {
         assert_eq!(req().routing_text(), "be brief\nhello");
+    }
+
+    #[test]
+    fn test_estimation_text_includes_tools_and_tool_calls() {
+        // A plain request: estimation_text == routing_text (no tool payload).
+        assert_eq!(req().estimation_text(), req().routing_text());
+
+        // With a tools definition and an assistant tool_calls payload, the
+        // estimation text must carry those billed bytes (ADR-184) while
+        // routing_text stays user-content-only.
+        let mut r = req();
+        let tools = crate::json::parse(
+            r#"[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]"#,
+        )
+        .unwrap();
+        r.sampling.tools = Some(tools);
+        r.messages.push(Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls_json: Some(
+                r#"[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+
+        let routing = r.routing_text();
+        let estimation = r.estimation_text();
+        assert!(estimation.len() > routing.len());
+        assert!(estimation.contains("get_weather"));
+        assert!(estimation.contains("city"));
+        // routing_text must NOT carry the tool definition (privacy/decision text).
+        assert!(!routing.contains("description"));
+        // The estimate over estimation_text exceeds the estimate over routing_text.
+        assert!(
+            crate::routing::estimate_tokens(&estimation)
+                > crate::routing::estimate_tokens(&routing)
+        );
     }
 
     #[test]
