@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Anthropic `tool_choice` translation (ADR-180)
+
+- ADR-179 omitted `tool_choice` for Anthropic, so `tool_choice:"required"` was
+  silently ignored — Anthropic defaulted to `auto`, breaking agent loops that
+  use `required` to force at least one tool call.  Now `"auto"` maps to
+  `{"type":"auto"}`, `"required"` to `{"type":"any"}`, and a named-function
+  object to `{"type":"tool","name":"..."}`.  The field is only emitted when
+  `tools` is present (Anthropic rejects the combination otherwise).  `"none"`
+  and `null` are still handled upstream (ADR-176).  4 new tests.  648 tests.
+  (ADR-180)
+
 ### Fixed — Anthropic tool-use forwarding (ADR-179)
 
 - ADR-177/178 delivered tool calling for OpenAI-compatible backends, but the

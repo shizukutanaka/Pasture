@@ -141,6 +141,13 @@ impl Provider {
                 if let Some(tools) = &req.sampling.tools {
                     extra.push_str(&translate_tools_to_anthropic(tools));
                 }
+                // Translate OpenAI tool_choice to Anthropic's enum (ADR-180).
+                // Only emitted when tools are present (Anthropic requires both or neither).
+                if req.sampling.tools.is_some() {
+                    if let Some(tc) = &req.sampling.tool_choice {
+                        extra.push_str(&translate_tool_choice_to_anthropic(tc));
+                    }
+                }
                 format!(
                     "{{\"model\":\"{}\",\"max_tokens\":{max_tokens}{},\"messages\":[{}]{}}}",
                     escape_string(&req.model),
@@ -671,6 +678,36 @@ fn find_crlf2(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// Translate an OpenAI `tool_choice` value to Anthropic's `tool_choice` object (ADR-180).
+/// OpenAI → Anthropic:
+///   `"auto"`                                         → `{"type":"auto"}`
+///   `"required"`                                     → `{"type":"any"}`
+///   `{"type":"function","function":{"name":"f"}}`   → `{"type":"tool","name":"f"}`
+///   `"none"` and `null` are handled upstream (not forwarded); absent value → omit field.
+/// Returns a comma-prefixed `,"tool_choice":{...}` fragment or empty string.
+fn translate_tool_choice_to_anthropic(tc: &JsonValue) -> String {
+    match tc {
+        JsonValue::Str(s) => match s.as_str() {
+            "auto" => ",\"tool_choice\":{\"type\":\"auto\"}".to_string(),
+            "required" => ",\"tool_choice\":{\"type\":\"any\"}".to_string(),
+            _ => String::new(), // unknown string → omit (default auto)
+        },
+        JsonValue::Object(_) => {
+            // OpenAI named-function: {"type":"function","function":{"name":"f"}}
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                return String::new();
+            }
+            format!(",\"tool_choice\":{{\"type\":\"tool\",\"name\":\"{}\"}}", escape_string(name))
+        }
+        _ => String::new(),
+    }
+}
+
 /// Translate an OpenAI-format `tools` array to Anthropic's schema (ADR-179).
 /// OpenAI: `[{"type":"function","function":{"name","description","parameters":{...}}}]`
 /// Anthropic: `[{"name","description","input_schema":{...}}]`
@@ -1121,6 +1158,49 @@ mod tests {
         // ADR-179: content_block_start with type=text yields None (text arrives in delta).
         let line = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
         assert_eq!(parse_anthropic_stream_line(line), None);
+    }
+
+    #[test]
+    fn test_anthropic_body_translates_tool_choice_auto() {
+        // ADR-180: tool_choice:"auto" → {"type":"auto"}
+        let mut r = req();
+        r.sampling.tools = Some(crate::json::parse(r#"[{"type":"function","function":{"name":"f","parameters":{}}}]"#).unwrap());
+        r.sampling.tool_choice = Some(crate::json::parse(r#""auto""#).unwrap());
+        let b = Provider::Anthropic.build_body(&r);
+        assert!(b.contains("\"tool_choice\":{\"type\":\"auto\"}"), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
+    }
+
+    #[test]
+    fn test_anthropic_body_translates_tool_choice_required() {
+        // ADR-180: tool_choice:"required" → {"type":"any"}
+        let mut r = req();
+        r.sampling.tools = Some(crate::json::parse(r#"[{"type":"function","function":{"name":"f","parameters":{}}}]"#).unwrap());
+        r.sampling.tool_choice = Some(crate::json::parse(r#""required""#).unwrap());
+        let b = Provider::Anthropic.build_body(&r);
+        assert!(b.contains("\"tool_choice\":{\"type\":\"any\"}"), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
+    }
+
+    #[test]
+    fn test_anthropic_body_translates_tool_choice_named_function() {
+        // ADR-180: {"type":"function","function":{"name":"get_weather"}} → {"type":"tool","name":"get_weather"}
+        let mut r = req();
+        r.sampling.tools = Some(crate::json::parse(r#"[{"type":"function","function":{"name":"get_weather","parameters":{}}}]"#).unwrap());
+        r.sampling.tool_choice = Some(crate::json::parse(r#"{"type":"function","function":{"name":"get_weather"}}"#).unwrap());
+        let b = Provider::Anthropic.build_body(&r);
+        assert!(b.contains("\"tool_choice\":{\"type\":\"tool\",\"name\":\"get_weather\"}"), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
+    }
+
+    #[test]
+    fn test_anthropic_body_no_tool_choice_when_no_tools() {
+        // ADR-180: tool_choice is only emitted when tools are also present (Anthropic requires both).
+        let mut r = req();
+        r.sampling.tool_choice = Some(crate::json::parse(r#""auto""#).unwrap());
+        // No tools set
+        let b = Provider::Anthropic.build_body(&r);
+        assert!(!b.contains("\"tool_choice\""), "{b}");
     }
 
     #[test]

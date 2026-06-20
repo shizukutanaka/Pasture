@@ -1748,3 +1748,15 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   keeps `stream_options`; Anthropic gets only `stream:true`. `tool_choice` translation to
   Anthropic's `{type:auto/any/tool}` enum is a follow-up (ADR-180). Zero new dependencies;
   10 new tests; 644 total.
+
+- **ADR-180 Anthropic `tool_choice` translation.**
+  Socratic probe of ADR-179: "ADR-179 omits `tool_choice` for Anthropic — what happens when a
+  user sends `tool_choice:"required"`?" Anthropic's API uses its default (`auto`) since the field
+  is absent; the user's intent (force at least one tool call) is silently lost. For multi-step
+  agent loops where the orchestrator sets `required` to prevent the model from answering in prose,
+  this breaks the agent's state machine. Anthropic has direct equivalents for all three meaningful
+  values: `"auto"` → `{"type":"auto"}`, `"required"` → `{"type":"any"}`, and OpenAI's named-
+  function object `{"type":"function","function":{"name":"f"}}` → `{"type":"tool","name":"f"}`.
+  New `translate_tool_choice_to_anthropic()` performs this mapping; it is only emitted when
+  `tools` is also present (Anthropic rejects the combination otherwise). `"none"` and `null` are
+  handled upstream (ADR-176) and never reach this path. Zero new dependencies; 4 new tests.
