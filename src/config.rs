@@ -590,6 +590,109 @@ mod tests {
         assert_eq!(Config::default().listen_addr, "127.0.0.1:8645");
     }
 
+    /// Extract every distinct `PASTURE_*` token that appears inside a
+    /// `std::env::var("…")` call in `config.rs` — the precise set of environment
+    /// variables the config layer actually reads (comments and doc strings are
+    /// ignored because they are not inside a `var("…")` call).
+    fn env_vars_read_by_config() -> std::collections::BTreeSet<String> {
+        let src = include_str!("config.rs");
+        let mut found = std::collections::BTreeSet::new();
+        let needle = "std::env::var(\"";
+        let mut rest = src;
+        while let Some(i) = rest.find(needle) {
+            rest = &rest[i + needle.len()..];
+            if let Some(end) = rest.find('"') {
+                let name = &rest[..end];
+                if name.starts_with("PASTURE_") {
+                    found.insert(name.to_string());
+                }
+            }
+        }
+        found
+    }
+
+    /// Extract every `PASTURE_*` token that appears in a **config-table row** of
+    /// `SPEC.md` (a markdown line beginning with `|`). The table is the
+    /// authoritative list of recognised variables; prose elsewhere may legitimately
+    /// mention a non-variable (e.g. the drift note that names the historical
+    /// `PASTURE_PROXY_TOKEN` precisely to say it is *not* recognised), so only
+    /// table rows are treated as "documented as a real variable".
+    fn env_vars_documented_in_spec() -> std::collections::BTreeSet<String> {
+        // SPEC.md lives at the crate root, next to Cargo.toml.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/SPEC.md");
+        let spec = std::fs::read_to_string(path).expect("SPEC.md must be readable");
+        let mut found = std::collections::BTreeSet::new();
+        for line in spec.lines() {
+            if !line.trim_start().starts_with('|') {
+                continue;
+            }
+            let bytes = line.as_bytes();
+            let mut i = 0;
+            while i + 8 <= bytes.len() {
+                if &bytes[i..i + 8] == b"PASTURE_" {
+                    let start = i;
+                    let mut j = i + 8;
+                    while j < bytes.len()
+                        && (bytes[j].is_ascii_uppercase()
+                            || bytes[j].is_ascii_digit()
+                            || bytes[j] == b'_')
+                    {
+                        j += 1;
+                    }
+                    // Require a non-empty suffix so the bare `PASTURE_*` glob in prose
+                    // never registers as a variable name.
+                    if j > start + 8 {
+                        found.insert(line[start..j].to_string());
+                    }
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn test_spec_documents_every_env_var_config_reads() {
+        // ADR-190: guard against SPEC.md / implementation drift. Every environment
+        // variable the config layer reads MUST be documented in SPEC.md §8. This
+        // test would have caught the historical `PASTURE_PROXY_TOKEN` mismatch and
+        // the 21 vars that were silently missing from the spec table.
+        let read = env_vars_read_by_config();
+        let documented = env_vars_documented_in_spec();
+        let undocumented: Vec<&String> = read.difference(&documented).collect();
+        assert!(
+            undocumented.is_empty(),
+            "these env vars are read by config.rs but undocumented in SPEC.md: {undocumented:?}"
+        );
+    }
+
+    #[test]
+    fn test_spec_has_no_phantom_pasture_env_vars() {
+        // ADR-190 (reverse direction): SPEC.md must not document a PASTURE_* env var
+        // that the config layer never reads — that is how `PASTURE_PROXY_TOKEN` crept
+        // in. A handful of non-config vars are read elsewhere (proxy/cli/cost) or are
+        // documented prefixes; allow-list those so the test targets real drift.
+        let documented = env_vars_documented_in_spec();
+        let read = env_vars_read_by_config();
+        // Vars surfaced in SPEC.md but resolved outside config.rs (BYOK keys read by
+        // the cloud layer; referral keys read by the CLI; the i18n language var).
+        let allow_external: &[&str] = &[
+            "PASTURE_OPENAI_API_KEY",
+            "PASTURE_ANTHROPIC_API_KEY",
+            "PASTURE_LANG",
+        ];
+        let phantom: Vec<&String> = documented
+            .iter()
+            .filter(|v| !read.contains(*v) && !allow_external.contains(&v.as_str()))
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "SPEC.md documents PASTURE_* vars that config.rs never reads (drift or typo): {phantom:?}"
+        );
+    }
+
     #[test]
     fn test_parse_price_pair_valid() {
         assert_eq!(parse_price_pair("2.50,10.00"), Some((2.50, 10.00)));

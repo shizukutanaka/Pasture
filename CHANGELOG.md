@@ -5,6 +5,21 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Docs + Tests — SPEC.md brought current; drift-guard test (ADR-190)
+
+- `SPEC.md` had drifted well behind the implementation: it omitted **21**
+  `PASTURE_*` env vars, named a non-existent `PASTURE_PROXY_TOKEN` (real:
+  `PASTURE_AUTH_TOKEN`), and invented per-input/output price vars (real: the
+  single `PASTURE_CLOUD_PRICE_PER_1M`).  The spec is now current through
+  ADR-189 — added the budget/spike guard (§7.1), injection guard (§7.2), OTel
+  trace log (§9.1), the three request projections (§4), tool/function calling
+  (§12), and reversible pseudonymization (§13).
+- New std-only drift-guard tests in `config.rs`: every env var the config layer
+  reads via `std::env::var("PASTURE_*")` must appear in a SPEC.md config-table
+  row, and no table row may name a var the code never reads.  This makes
+  doc/implementation divergence a test failure.  It immediately caught four
+  further gaps while updating the spec.  2 new tests.  672 tests.  (ADR-190)
+
 ### Fixed — Pseudonymize restore covers cloud-generated `tool_calls` (ADR-189)
 
 - When a cloud model responded with its own tool call that echoed a

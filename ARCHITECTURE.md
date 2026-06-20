@@ -1914,3 +1914,25 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   streaming path reuses `cache_mapping` (no new state). Non-pseudonymized requests are unaffected
   (both branches gate on an existing non-empty mapping). Zero new dependencies; 2 new tests; 670
   total.
+
+- **ADR-190 SPEC.md / config drift-guard test; spec brought current through ADR-189.**
+  The user asked to refresh the specification and enumerate strengths/weaknesses/improvements.
+  Auditing SPEC.md against the code exposed substantial drift: it tracked ADRs only through ~136,
+  omitted **21** `PASTURE_*` env vars the config layer reads, referenced a non-existent
+  `PASTURE_PROXY_TOKEN` (the real var is `PASTURE_AUTH_TOKEN`), and invented separate
+  per-input/per-output price vars (the real one is the single `PASTURE_CLOUD_PRICE_PER_1M`). The
+  documentation lagging the implementation is itself the defect. The project already values parity
+  tests (the i18n EN/JA key-parity test), so the systemic fix is a test that fails whenever the
+  env-var surface and SPEC.md diverge in either direction. `test_spec_documents_every_env_var_config_reads`
+  extracts the read-set from `config.rs` (only tokens inside a `std::env::var("…")` call, so
+  comments never count) and the documented-set from SPEC.md **config-table rows** (lines starting
+  with `|`, so prose that legitimately names a non-variable — like the drift note explaining
+  `PASTURE_PROXY_TOKEN` is *not* recognised — is excluded), then asserts read ⊆ documented.
+  `test_spec_has_no_phantom_pasture_env_vars` checks the reverse, allow-listing the three vars
+  resolved outside `config.rs` (BYOK keys, referral, `PASTURE_LANG`). Writing the test immediately
+  paid off — it caught four further gaps in the hand-updated spec (`PASTURE_OLLAMA_PORT` written as
+  shorthand `_PORT`; `PASTURE_CLOUD_FALLBACK_PROVIDER/MODEL` documented only in prose; a duplicated
+  `PASTURE_CLOUD_MODEL` row). Alongside the test, SPEC.md gained §4 three-projections, §7.1
+  budget/spike, §7.2 injection guard, §9.1 OTel, §12 tool-calling (ADR-177…189), §13
+  pseudonymization, and a refreshed §14 conformance. Std-only (reads `config.rs` via `include_str!`,
+  SPEC.md via `CARGO_MANIFEST_DIR`); zero runtime cost; zero new deps; 2 new tests; 672 total.

@@ -1,8 +1,8 @@
 # Pasture — Specification (SPEC.md)
 
-Version: tracks `Cargo.toml` (0.26.0 + Unreleased). Status: normative for the
-HTTP API and routing engine; descriptive for the CLI. Keywords **MUST**, **SHOULD**,
-**MAY** per RFC 2119.
+Version: tracks `Cargo.toml` (0.26.0 + Unreleased, current through ADR-189). Status:
+normative for the HTTP API and routing engine; descriptive for the CLI. Keywords
+**MUST**, **SHOULD**, **MAY** per RFC 2119.
 
 > This is the contract the implementation is held to. The **Conformance** section
 > (§12) records where the code already satisfies the spec and which gaps this round
@@ -45,13 +45,14 @@ library only; the cloud (HTTPS/TLS) path is gated behind the optional `cloud` fe
 | `chat <text>` | one-shot completion through the router |
 | `serve` | start the OpenAI-compatible proxy |
 | `up` | ensure Ollama + model, then serve |
+| `setup` | beginner welcome + `doctor` check |
 | `connect <app>` | print client setup (Cursor / Open WebUI / Continue / SDK / lmstudio) |
-| `calibrate [--logprob]` | recommend `PASTURE_THRESHOLD` / cascade threshold from the cost log |
+| `calibrate [--target R \| --logprob \| --error --labels <f>]` | recommend `PASTURE_THRESHOLD` / cascade threshold from the cost log |
 | `models` | recommend local models for this machine |
 | `doctor` | diagnose setup and print fixes |
-| `eval` | routing accuracy + threshold sweep |
-| `stats` | summarize the cost log |
-| `improvements [path]` | print the self-improvement ledger (verified change history) |
+| `eval [--external <file>] [--json]` | routing accuracy + threshold sweep |
+| `stats [--json]` | summarize the cost log |
+| `improvements [path] [--review]` | print the self-improvement ledger (verified change history) |
 | `config` | print effective configuration |
 | `donate` / `refer` | monetization surfaces (links only) |
 | `version` / `help` | version / usage |
@@ -193,6 +194,17 @@ other text ≈ 1 token / 4 chars.
 **Hardware thresholds:** GPU ≥ 8 GB VRAM → 2000; GPU present or RAM ≥ 16 GB → 800;
 else → 300. Overridable by `PASTURE_THRESHOLD`.
 
+**Three request projections (purpose-built, never conflated):** the request is reduced
+to text three different ways, each matched to its job (ADR-184/187):
+- **`routing_text`** = message `content` only — drives the routing **decision** and the
+  token-length heuristic above. Tool bytes are excluded so they don't inflate length.
+- **`estimation_text`** = `routing_text` + serialised `tools`/`tool_choice` + assistant
+  `tool_calls` — drives **token accounting** (cost log, budget/spike), because those
+  bytes are really billed by the provider.
+- **`privacy_text`** = `routing_text` + assistant `tool_calls` arguments — drives PII
+  **classification** (§5), so a secret living only in a tool-call argument cannot escape
+  the sensitivity guard. Tool *definitions* are excluded (developer schema, not PII).
+
 ---
 
 ## 5. Privacy classification
@@ -256,6 +268,33 @@ false negative = data leak (unacceptable).
   set, a global token bucket caps `/v1/*`; requests over budget yield `429`. `/health`
   is exempt. Default (0) = unlimited.
 
+### 7.1 Cost budget & spike guard (IMP-26)
+
+Applied **only** to cloud-bound, non-sensitive completions; the daily counter and the
+spike average are both **UTC-day-scoped** (lazy reset at midnight, no timer thread;
+the daily counter is seeded from the cost log at startup so it survives a restart,
+ADR-155/185).
+
+- **Daily budget.** `PASTURE_BUDGET_DAILY_TOKENS=<n>` caps cumulative cloud tokens
+  (prompt+completion) per UTC day. Tokens are **pre-reserved atomically** before the
+  request and reconciled against actual usage afterward (ADR-163), so a `stream:true`
+  request cannot bypass the cap. The estimate counts tool definitions and `tool_calls`
+  payloads, not just message content (`estimation_text`, ADR-184). On exceedance the
+  `PASTURE_BUDGET_ACTION` fires: `local-only` (default) silently reroutes to local;
+  `warn` proceeds to cloud and logs to stderr; `block` returns `429`.
+- **Spike guard.** `PASTURE_SPIKE_FACTOR=<f>` (default 50; 0 disables) routes a single
+  request **local** when its estimated tokens exceed `f ×` the running cloud-request
+  average, catching a runaway prompt even when the daily budget is off.
+
+### 7.2 Prompt-injection guard (IMP-20)
+
+`PASTURE_INJECTION_GUARD` ∈ {`off` (default), `flag`, `block`} runs deterministic,
+case-insensitive lexical matching (EN+JA) at the proxy boundary against role-switch /
+system-override phrases (`role_switch`) and data-exfiltration phrases (`exfil_attempt`).
+`flag` annotates the response with `x_pasture_injection_flag:<label>` and proceeds;
+`block` returns `400`. Only the matched **label** is ever recorded — never prompt
+content (I3).
+
 ---
 
 ## 8. Configuration
@@ -266,11 +305,12 @@ wins). Variables:
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `PASTURE_LISTEN_ADDR` | `127.0.0.1:8645` | proxy listen address |
-| `PASTURE_OLLAMA_HOST` / `_PORT` | `127.0.0.1` / `11434` | local Ollama endpoint |
+| `PASTURE_OLLAMA_HOST` / `PASTURE_OLLAMA_PORT` | `127.0.0.1` / `11434` | local Ollama endpoint |
 | `PASTURE_LOCAL_MODEL` | `llama3` | local model id |
 | `PASTURE_LOCAL_BACKEND` | `ollama` | `ollama` \| `lmstudio`/`openai` |
 | `PASTURE_LOCAL_OPENAI_URL` | `http://127.0.0.1:1234/v1` | OpenAI-compat local URL |
-| `PASTURE_CLOUD_PROVIDER` / `_MODEL` | — / `gpt-4o-mini` | cloud provider / model |
+| `PASTURE_CLOUD_PROVIDER` / `PASTURE_CLOUD_MODEL` | — / `gpt-4o-mini` | cloud provider / model |
+| `PASTURE_CLOUD_FALLBACK_PROVIDER` / `PASTURE_CLOUD_FALLBACK_MODEL` | _(off)_ | secondary cloud provider/model tried when the primary fails all retries (IMP-9) |
 | `PASTURE_OPENAI_API_KEY` / `PASTURE_ANTHROPIC_API_KEY` | — | BYOK (never logged) |
 | `PASTURE_THRESHOLD` | hardware | token length threshold override |
 | `PASTURE_CASCADE` | off | enable cascade |
@@ -288,6 +328,34 @@ wins). Variables:
 | `PASTURE_RATE_LIMIT` | `0` | global requests/min cap on `/v1/*` (0 = unlimited) |
 | `PASTURE_CORS_ORIGINS` | _(off)_ | CORS allow-list (comma-separated, or `*`) for browser clients (§3.6) |
 | `PASTURE_REQUEST_TIMEOUT` | `30` | per-connection read/write timeout in seconds (0 = none, §7) |
+| `PASTURE_AUTH_TOKEN` | _(off)_ | require `Authorization: Bearer <token>` on `/v1/*` (§7) |
+| `PASTURE_RATE_LIMIT` | `0` | global requests/min cap on `/v1/*` (0 = unlimited, §7) |
+| `PASTURE_MAX_BODY_BYTES` | `16777216` | request body cap in bytes; larger ⇒ `413` (§7) |
+| `PASTURE_LOCAL_TIMEOUT` | `120` | per-request local-backend read timeout (seconds) |
+| `PASTURE_CLOUD_PRICE_PER_1M` | `0,0` | cloud price `"<input>,<output>"` USD per 1M tokens (§9, ADR-166) |
+| `PASTURE_BUDGET_DAILY_TOKENS` | `0` | daily cloud-token cap; 0 = disabled (§7.1, ADR-26) |
+| `PASTURE_BUDGET_ACTION` | `local-only` | over-budget action: `local-only` \| `warn` \| `block` (§7.1) |
+| `PASTURE_SPIKE_FACTOR` | `50` | route local if a request exceeds `factor × running cloud avg`; 0 = off (§7.1) |
+| `PASTURE_PSEUDONYMIZE` | off | mask PII with reversible tokens on cloud-bound requests (§14, IMP-19) |
+| `PASTURE_INJECTION_GUARD` | `off` | prompt-injection guard: `off` \| `flag` \| `block` (§7.2, IMP-20) |
+| `PASTURE_SEMANTIC_CACHE` | `0` | semantic (embedding) cache capacity; 0 = disabled (§6, IMP-12) |
+| `PASTURE_SEMANTIC_THRESHOLD` | `0.92` | cosine-similarity threshold for a semantic-cache hit (§6) |
+| `PASTURE_CACHE_TTL` | `0` | cached-entry TTL in seconds; 0 = no TTL (FIFO only) |
+| `PASTURE_CACHE_CONTROL` | off | inject Anthropic `cache_control` prompt-caching hint (no-op for OpenAI) |
+| `PASTURE_HARD_PROMPTS` | _(off)_ | path to known-hard-prompts file; near-matches escalate to cloud (IMP-14) |
+| `PASTURE_HARD_THRESHOLD` | `0.85` | cosine similarity at which a prompt counts as "near a known-hard prompt" |
+| `PASTURE_SKILLS` | _(off)_ | skill→route overrides, e.g. `code:local,math:cloud` (IMP-25) |
+| `PASTURE_SYSTEM_PROMPT` | _(off)_ | system prompt prepended to every proxied request |
+| `PASTURE_ACCESS_LOG` | _(off)_ | path for a per-request JSONL access log (PII-free, I3) |
+| `PASTURE_OTEL_LOG` | _(off)_ | path for an OpenTelemetry GenAI trace log (§9.1, IMP-23) |
+| `PASTURE_STATE` | `pasture-state.txt` | small state file (donation-nudge counter) |
+| `PASTURE_DONATE_URL` | _(off)_ | donation URL surfaced by `donate` and the nudge |
+| `PASTURE_NO_NUDGE` | off | disable the periodic stderr donation nudge |
+
+> **Spec-drift note (this round):** earlier spec text referenced `PASTURE_PROXY_TOKEN`;
+> the implemented variable is **`PASTURE_AUTH_TOKEN`** (the only name recognised). The
+> cloud-price variable is the single **`PASTURE_CLOUD_PRICE_PER_1M`** (`"<in>,<out>"`),
+> not separate per-input/per-output vars.
 
 ---
 
@@ -296,7 +364,16 @@ wins). Variables:
 One line per completion. Fields: `ts` (Unix s), `route`, `model`, `prompt_tokens`,
 `completion_tokens`, `cost_usd` (0 for local/cache), and optional `logprob`. No PII
 (I3). `stats` aggregates: counts by route, cloud rate, cache-hit rate, token totals,
-spend, and the logprob distribution.
+spend, and the logprob distribution. `cost_usd` is real when `PASTURE_CLOUD_PRICE_PER_1M`
+is set (ADR-166), else structural `0`.
+
+### 9.1 OpenTelemetry trace log (opt-in, IMP-23)
+
+When `PASTURE_OTEL_LOG=<path>` is set, one JSONL span is appended per request using
+GenAI semantic-convention attributes: `gen_ai.system`, `gen_ai.request.model`,
+`gen_ai.usage.input_tokens`/`output_tokens`, `pasture.route` ∈ {local,cloud,cache},
+`status` ∈ {ok,error}, and `finish_reason` (`stop` | `tool_calls`, ADR-181). Trace/span
+ids are time+counter derived (not crypto-random). No PII (I3).
 
 ---
 
@@ -316,7 +393,48 @@ or via `PASTURE_LANG`. A test enforces EN/JA key parity.
 
 ---
 
-## 12. Conformance & gaps
+## 12. Tool / function calling (ADR-177…189)
+
+Pasture proxies the full OpenAI tool-calling loop across both providers, end to end:
+
+- **Request in.** `tools` / `tool_choice` are forwarded verbatim; a non-empty `tools`
+  array is also a hard routing signal (§4, IMP-10). Assistant history messages may
+  carry `content:null` with a `tool_calls` array (valid; ADR-183), and tool-result
+  messages carry `tool_call_id` (ADR-182). Both fields are parsed and preserved.
+- **Provider translation.** For OpenAI the fields pass through; for Anthropic,
+  `role:"tool"` results are rewritten to a `user` message with a `tool_result` content
+  block, and assistant `tool_calls` to `tool_use` blocks (ADR-179/180/183).
+- **Response out.** A tool-call completion carries a `tool_calls` array and
+  `finish_reason:"tool_calls"` (ADR-177/181), in both buffered and SSE form (ADR-178).
+- **Cache.** The exact-match key includes message-level `tool_calls`/`tool_call_id`
+  (ADR-186), so two histories that differ only in tool arguments never cross-serve.
+- **Privacy.** Tool-call arguments are classified for PII (`privacy_text`, §4/§5,
+  ADR-187) and pseudonymized when masking is on (§14, ADR-188/189).
+
+---
+
+## 13. Reversible pseudonymization (opt-in, IMP-19 / ADR-188-189)
+
+When `PASTURE_PSEUDONYMIZE=1`, **cloud-bound** requests have detected PII replaced with
+stable opaque tokens before they leave the machine, and the cloud response has the
+tokens restored to the original values. Categories: `<EMAIL_n>`, `<IP_n>` (v4+v6),
+`<PHONE_n>`, `<KEY_n>`. Coverage:
+
+- **Message content** — tokenised and restored (buffered + SSE, the latter handling a
+  token split across deltas, ADR-168).
+- **Tool-call arguments** — PII inside the JSON-encoded `arguments` is masked via a
+  JSON-string-aware walker (ADR-188); the same value in content and arguments shares one
+  token, restored from a single mapping entry.
+- **Cloud-generated `tool_calls` in the response** — also restored, so a token the model
+  echoes back never reaches the client raw (ADR-189).
+
+The mapping lives only in memory for the request and is **never logged** (I3/I5). This is
+best-effort over the patterns Pasture detects — it is **not** a guarantee that no other
+sensitive data is sent; `PASTURE_LOCAL_ONLY` remains the hard guarantee.
+
+---
+
+## 14. Conformance & gaps
 
 **Satisfied by the current implementation:** §2 CLI; §3.1–3.3 (incl. `/v1/models`,
 IMP-8) **+ §3.2b `/v1/embeddings` (IMP-8 completion, ADR-034) + §3.2c `/v1/stats`
@@ -341,8 +459,21 @@ IMP-8) **+ §3.2b `/v1/embeddings` (IMP-8 completion, ADR-034) + §3.2c `/v1/sta
 **Shipped since initial spec (tracked in COMPETITIVE.md / ARCHITECTURE.md):**
 - `tool_choice` is not separately inspected; only the presence of `tools`/`functions` arrays
   matters for hard-signal routing (ADR-031, IMP-10). Full `tool_choice` parsing remains future work.
+- **Full multi-turn tool/function calling** across OpenAI + Anthropic, incl. cache-key,
+  privacy, and pseudonymization coverage (§12/§13, ADR-177…189).
 - Multi-provider cloud fallback chain: `PASTURE_CLOUD_FALLBACK_PROVIDER` / `PASTURE_CLOUD_FALLBACK_MODEL`
   configure a secondary cloud provider tried when the primary fails all retries (IMP-9, ADR-136).
-- Auth + rate-limit: `PASTURE_PROXY_TOKEN` + `PASTURE_RATE_LIMIT` (IMP-15, COMPETITIVE.md).
+- Auth + rate-limit: **`PASTURE_AUTH_TOKEN`** + `PASTURE_RATE_LIMIT` (IMP-15, §7).
+- Cost budget + spike guard: `PASTURE_BUDGET_DAILY_TOKENS` / `_ACTION` / `PASTURE_SPIKE_FACTOR`
+  (§7.1, IMP-26, ADR-155/163/184/185).
+- Prompt-injection guard: `PASTURE_INJECTION_GUARD` (§7.2, IMP-20).
 - Semantic cache: `PASTURE_SEMANTIC_CACHE` via local embeddings (IMP-12, ADR-123).
 - Calibrated-uncertainty escalation: `calibrate --logprob` + mean-logprob cascade (IMP-13, ADR-124).
+
+**Known remaining gaps / future work:**
+- `tool_choice` value (`"auto"`/`"none"`/named) is forwarded but not used as a routing
+  signal beyond mere tool presence.
+- `\uXXXX`-escaped PII inside JSON is decoded by the parser but the pseudonymizer's
+  string walker matches on the decoded text only when it forms a recognisable token;
+  adversarially split escapes are out of scope (best-effort, §13).
+- The semantic cache is buffered-only (no SSE replay).
