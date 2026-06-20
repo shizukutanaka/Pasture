@@ -31,6 +31,7 @@ pub fn pseudonymize_messages(messages: &[Message]) -> (Vec<Message>, Mapping) {
         .map(|m| Message {
             role: m.role.clone(),
             content: replace_in_text(&m.content, &mut ctx),
+            tool_call_id: m.tool_call_id.clone(),
         })
         .collect();
     (result, ctx.mapping)
@@ -231,6 +232,7 @@ mod tests {
         Message {
             role: "user".to_string(),
             content: content.to_string(),
+            ..Default::default()
         }
     }
 
@@ -332,6 +334,7 @@ mod tests {
         let msgs = vec![Message {
             role: "system".to_string(),
             content: "You help alice@example.com".to_string(),
+            ..Default::default()
         }];
         let (out, _) = pseudonymize_messages(&msgs);
         assert_eq!(out[0].role, "system");

@@ -379,6 +379,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: content.to_string(),
+                ..Default::default()
             }],
             stream: false,
             has_tools: false,

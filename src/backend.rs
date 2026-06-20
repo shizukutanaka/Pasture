@@ -14,10 +14,14 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 /// A single chat message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// The `tool_call_id` field from a `role:"tool"` result message (ADR-182).
+    /// Required by OpenAI when forwarding tool-result turns; mapped to
+    /// `tool_use_id` in the Anthropic `tool_result` block.
+    pub tool_call_id: Option<String>,
 }
 
 /// A normalised chat-completion request.
@@ -420,11 +424,22 @@ impl OllamaBackend {
             .messages
             .iter()
             .map(|m| {
-                format!(
-                    "{{\"role\":\"{}\",\"content\":\"{}\"}}",
-                    escape_string(&m.role),
-                    escape_string(&m.content)
-                )
+                // Ollama /api/chat accepts tool_call_id for tool-result messages
+                // (same format as OpenAI) (ADR-182).
+                if let Some(tid) = &m.tool_call_id {
+                    format!(
+                        "{{\"role\":\"{}\",\"tool_call_id\":\"{}\",\"content\":\"{}\"}}",
+                        escape_string(&m.role),
+                        escape_string(tid),
+                        escape_string(&m.content)
+                    )
+                } else {
+                    format!(
+                        "{{\"role\":\"{}\",\"content\":\"{}\"}}",
+                        escape_string(&m.role),
+                        escape_string(&m.content)
+                    )
+                }
             })
             .collect();
         format!(
@@ -894,10 +909,12 @@ mod tests {
                 Message {
                     role: "system".to_string(),
                     content: "be brief".to_string(),
+                    ..Default::default()
                 },
                 Message {
                     role: "user".to_string(),
                     content: "hello".to_string(),
+                    ..Default::default()
                 },
             ],
             stream: false,

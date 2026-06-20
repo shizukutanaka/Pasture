@@ -67,11 +67,22 @@ impl Provider {
                     .messages
                     .iter()
                     .map(|m| {
-                        format!(
-                            "{{\"role\":\"{}\",\"content\":\"{}\"}}",
-                            escape_string(&m.role),
-                            escape_string(&m.content)
-                        )
+                        // For role:"tool" result messages, tool_call_id is required by
+                        // the OpenAI API (ADR-182). Emit it as a top-level field when present.
+                        if let Some(tid) = &m.tool_call_id {
+                            format!(
+                                "{{\"role\":\"{}\",\"tool_call_id\":\"{}\",\"content\":\"{}\"}}",
+                                escape_string(&m.role),
+                                escape_string(tid),
+                                escape_string(&m.content)
+                            )
+                        } else {
+                            format!(
+                                "{{\"role\":\"{}\",\"content\":\"{}\"}}",
+                                escape_string(&m.role),
+                                escape_string(&m.content)
+                            )
+                        }
                     })
                     .collect();
                 format!(
@@ -91,6 +102,19 @@ impl Provider {
                 for m in &req.messages {
                     if m.role == "system" {
                         system_parts.push(m.content.as_str());
+                    } else if m.role == "tool" {
+                        // Translate OpenAI role:"tool" result messages to Anthropic's
+                        // tool_result format (ADR-182). Anthropic requires these to be
+                        // wrapped as role:"user" with a tool_result content block.
+                        let tool_use_id = m
+                            .tool_call_id
+                            .as_deref()
+                            .unwrap_or(""); // id required; omitting is better than a 400
+                        conv_msgs.push(format!(
+                            "{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{}\"}}]}}",
+                            escape_string(tool_use_id),
+                            escape_string(&m.content)
+                        ));
                     } else {
                         conv_msgs.push(format!(
                             "{{\"role\":\"{}\",\"content\":\"{}\"}}",
@@ -993,6 +1017,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                ..Default::default()
             }],
             stream: false,
             has_tools: false,
@@ -1565,5 +1590,64 @@ data: {\"type\":\"message_stop\"}\n\n";
             "all-whitespace key should be None after trimming"
         );
         std::env::remove_var("PASTURE_ANTHROPIC_API_KEY");
+    }
+
+    // ---- ADR-182 tests ----
+
+    #[test]
+    fn test_openai_body_emits_tool_call_id_for_tool_message() {
+        // ADR-182: role:"tool" with tool_call_id → "tool_call_id" field in the message object.
+        // OpenAI requires this field; without it the API returns 400.
+        let mut r = req();
+        r.messages = vec![
+            crate::backend::Message {
+                role: "user".to_string(),
+                content: "What is the weather?".to_string(),
+                ..Default::default()
+            },
+            crate::backend::Message {
+                role: "tool".to_string(),
+                content: "72°F".to_string(),
+                tool_call_id: Some("call_1".to_string()),
+            },
+        ];
+        let b = Provider::OpenAI.build_body(&r);
+        assert!(b.contains("\"tool_call_id\":\"call_1\""), "{b}");
+        assert!(b.contains("\"role\":\"tool\""), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
+    }
+
+    #[test]
+    fn test_anthropic_body_translates_tool_result_message() {
+        // ADR-182: Anthropic requires tool result messages as role:"user" with a
+        // tool_result content block — NOT role:"tool".
+        let mut r = req();
+        r.messages = vec![
+            crate::backend::Message {
+                role: "user".to_string(),
+                content: "What is the weather?".to_string(),
+                ..Default::default()
+            },
+            crate::backend::Message {
+                role: "tool".to_string(),
+                content: "72°F".to_string(),
+                tool_call_id: Some("toolu_01".to_string()),
+            },
+        ];
+        let b = Provider::Anthropic.build_body(&r);
+        // Must be role:"user" (Anthropic form), not role:"tool"
+        assert!(!b.contains("\"role\":\"tool\""), "Anthropic must not emit role:tool: {b}");
+        assert!(b.contains("\"role\":\"user\""), "{b}");
+        assert!(b.contains("\"type\":\"tool_result\""), "{b}");
+        assert!(b.contains("\"tool_use_id\":\"toolu_01\""), "{b}");
+        assert!(b.contains("72"), "{b}"); // content value
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
+    }
+
+    #[test]
+    fn test_openai_body_plain_messages_unchanged_by_adr182() {
+        // ADR-182 regression: ordinary user/assistant messages must NOT gain tool_call_id.
+        let b = Provider::OpenAI.build_body(&req());
+        assert!(!b.contains("tool_call_id"), "{b}");
     }
 }

@@ -2654,6 +2654,7 @@ fn test_inject_context_prepends_system() {
         messages: vec![Message {
             role: "user".to_string(),
             content: "hi".to_string(),
+            ..Default::default()
         }],
         stream: false,
         has_tools: false,
@@ -2673,10 +2674,12 @@ fn test_inject_context_merges_existing_system() {
             Message {
                 role: "system".to_string(),
                 content: "be brief".to_string(),
+                ..Default::default()
             },
             Message {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                ..Default::default()
             },
         ],
         stream: false,
@@ -2709,6 +2712,7 @@ fn make_req_user(content: &str) -> CompletionRequest {
         messages: vec![Message {
             role: "user".to_string(),
             content: content.to_string(),
+            ..Default::default()
         }],
         stream: false,
         has_tools: false,
@@ -2734,10 +2738,12 @@ fn test_prepend_system_prompt_merges_existing_system() {
             Message {
                 role: "system".to_string(),
                 content: "existing".to_string(),
+                ..Default::default()
             },
             Message {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                ..Default::default()
             },
         ],
         stream: false,
@@ -4191,4 +4197,18 @@ fn test_otel_span_finish_reason_derived_for_buffered_tool_call() {
     // call the same finish_reason_for helper — a unit test on the helper is sufficient,
     // and the integration is verified by the helper tests above.
     let _ = std::fs::remove_file(&otel);
+}
+
+#[test]
+fn test_parse_request_extracts_tool_call_id() {
+    // ADR-182: parse_request must preserve tool_call_id from tool-result messages.
+    let body = r#"{"model":"m","messages":[
+        {"role":"user","content":"What's the weather?"},
+        {"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"call_1","content":"72°F"}
+    ]}"#;
+    let req = Proxy::parse_request(body).unwrap();
+    let tool_msg = req.messages.iter().find(|m| m.role == "tool").unwrap();
+    assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_1"), "tool_call_id must be preserved");
+    assert_eq!(tool_msg.content, "72°F");
 }

@@ -1286,6 +1286,7 @@ fn chat_request(model: &str, text: &str) -> CompletionRequest {
         messages: vec![Message {
             role: "user".to_string(),
             content: text.to_string(),
+            ..Default::default()
         }],
         stream: false,
         has_tools: false,

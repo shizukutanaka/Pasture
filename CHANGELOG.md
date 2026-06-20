@@ -5,6 +5,21 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Multi-turn tool calling: `tool_call_id` forwarding (ADR-182)
+
+- `Message` struct only stored `role` and `content`, so `tool_call_id` from
+  `role:"tool"` result messages was silently dropped.  OpenAI requires this
+  field and returns 400 without it; Anthropic requires the result wrapped as
+  `role:"user"` with a `tool_result` content block (and rejects `role:"tool"`
+  entirely).  Both failures made the second turn of every tool-calling agent
+  loop impossible through Pasture.
+  
+  Now `Message` carries `tool_call_id: Option<String>`; `parse_request`
+  extracts it; OpenAI and Ollama body builders emit it; the Anthropic builder
+  translates `role:"tool"` to the `tool_result` format.  Follow-up (ADR-183):
+  assistant messages with prior `tool_calls` in the history are forwarded
+  without the array.  4 new tests.  655 tests.  (ADR-182)
+
 ### Fixed — OTel span `finish_reason` for tool-call responses (ADR-181)
 
 - The OTel trace log recorded incorrect `finish_reason` for tool-call responses:

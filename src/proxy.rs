@@ -805,7 +805,13 @@ impl Proxy {
                 .unwrap_or("user")
                 .to_string();
             let content = Self::extract_message_content(m)?;
-            parsed.push(Message { role, content });
+            // Carry tool_call_id for role:"tool" result messages so the backend
+            // can enforce OpenAI's requirement and Anthropic's translation (ADR-182).
+            let tool_call_id = m
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            parsed.push(Message { role, content, tool_call_id });
         }
         if parsed.is_empty() {
             return Err(ProxyError::BadRequest("no messages provided".to_string()));
@@ -1832,6 +1838,7 @@ impl Proxy {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: prompt_text,
+                ..Default::default()
             }],
             stream: false,
             has_tools: false,
@@ -2664,6 +2671,7 @@ fn prepend_system_prompt(req: &CompletionRequest, prompt: &str) -> CompletionReq
             Message {
                 role: "system".to_string(),
                 content: prompt.to_string(),
+                ..Default::default()
             },
         );
     }

@@ -1770,3 +1770,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   `finish_reason_for(resp)` helper returns `"tool_calls"` when `resp.tool_calls` is `Some`,
   `"stop"` otherwise. All three sites and the two inline ternary expressions are updated to use
   it. Zero new dependencies; 3 new tests; 651 total.
+
+- **ADR-182 Multi-turn tool calling: `tool_call_id` in tool-result messages.**
+  Socratic probe of the multi-turn tool-calling path: "ADR-177 fixed single-turn tool calling —
+  but the agent loop has a second turn: the client sends `role:'tool'` with `tool_call_id`. What
+  does Pasture do?" Two failures: (1) `Message` only stored `role` and `content` — `tool_call_id`
+  was silently dropped; OpenAI's API requires it for tool-result messages (returns 400 without it).
+  (2) For Anthropic, `role:'tool'` is invalid; results must be `role:'user'` with a `tool_result`
+  content block. `Message` gains `tool_call_id: Option<String>` and `#[derive(Default)]`; all
+  construction sites use `..Default::default()`. `parse_request` extracts the field. The OpenAI
+  and Ollama body builders emit it when present; the Anthropic builder translates `role:'tool'` to
+  `{"role":"user","content":[{"type":"tool_result","tool_use_id":"...","content":"..."}]}`.
+  Follow-up ADR-183: the assistant message carrying prior `tool_calls` in the history lacks that
+  array when forwarded (only `content:""` is sent), which strict providers may reject. Zero new
+  dependencies; 4 new tests; 655 total.
