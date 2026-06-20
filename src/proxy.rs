@@ -424,7 +424,9 @@ impl Proxy {
             span.input_tokens = resp.prompt_tokens;
             span.output_tokens = resp.completion_tokens;
             span.route = route_label;
-            span.finish_reason = Some("stop".to_string());
+            // Derive finish_reason from the response: tool calls use "tool_calls",
+            // ordinary completions use "stop" (ADR-181).
+            span.finish_reason = Some(finish_reason_for(resp).to_string());
             span.finish();
             if let Err(e) = span.append_to(log_path) {
                 eprintln!("pasture: otel log write failed: {e}");
@@ -1052,7 +1054,7 @@ impl Proxy {
             sock.write_all(frame.as_bytes())?;
         }
         self.log_cost(route_label, hit, None, 0);
-        let finish = if hit.tool_calls.is_some() { "tool_calls" } else { "stop" };
+        let finish = finish_reason_for(&hit);
         let stop = sse_frame(&build_openai_chunk(&id, &model, &fp, "", route_label, Some(finish), created));
         sock.write_all(stop.as_bytes())?;
         if include_usage {
@@ -1097,7 +1099,9 @@ impl Proxy {
             span.input_tokens = r.prompt_tokens;
             span.output_tokens = r.completion_tokens;
             span.route = route_label;
-            span.finish_reason = Some("stop".to_string());
+            // Derive finish_reason from the response: tool calls use "tool_calls",
+            // ordinary completions use "stop" (ADR-181).
+            span.finish_reason = Some(finish_reason_for(r).to_string());
             span.finish();
             if let Err(e) = span.append_to(log_path) {
                 eprintln!("pasture: otel log write failed: {e}");
@@ -1495,6 +1499,8 @@ impl Proxy {
             span.input_tokens = resp.prompt_tokens;
             span.output_tokens = resp.completion_tokens;
             span.route = route.as_str();
+            // Derive finish_reason from the response (ADR-181).
+            span.finish_reason = Some(finish_reason_for(&resp).to_string());
             span.finish();
             if let Err(e) = span.append_to(log_path) {
                 eprintln!("pasture: otel log write failed: {e}");
@@ -2492,7 +2498,7 @@ impl Proxy {
                         }
                     }
                     if io_err.is_none() {
-                        let finish = if r.tool_calls.is_some() { "tool_calls" } else { "stop" };
+                        let finish = finish_reason_for(&r);
                         let stop = sse_frame(&build_openai_chunk(
                             &id, &model, &fp, "", route_label, Some(finish), created,
                         ));
@@ -2854,6 +2860,13 @@ pub fn fingerprint_for_model(model: &str) -> String {
         h = h.wrapping_mul(FNV_PRIME);
     }
     format!("fp_pasture_{:08x}", h as u32)
+}
+
+/// Return the OpenAI `finish_reason` string for a completed response (ADR-181).
+/// A response with a `tool_calls` array uses `"tool_calls"`; all others use `"stop"`.
+/// Used for both the SSE stop chunk and the OTel span `finish_reason` attribute.
+pub fn finish_reason_for(resp: &CompletionResponse) -> &'static str {
+    if resp.tool_calls.is_some() { "tool_calls" } else { "stop" }
 }
 
 pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> String {

@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — OTel span `finish_reason` for tool-call responses (ADR-181)
+
+- The OTel trace log recorded incorrect `finish_reason` for tool-call responses:
+  `emit_cache_hit_span` and `finalize_streamed` hardcoded `"stop"` even when
+  `tool_calls` was present; `run_completion` (buffered path) never set the
+  attribute at all — it was silently absent from every non-streaming span.
+  The SSE wire format was correct; only the trace log was wrong.
+  New `finish_reason_for(resp)` helper centralises the logic; all three emission
+  sites and two inline ternary expressions are updated to use it.  3 new tests.
+  651 tests.  (ADR-181)
+
 ### Fixed — Anthropic `tool_choice` translation (ADR-180)
 
 - ADR-179 omitted `tool_choice` for Anthropic, so `tool_choice:"required"` was

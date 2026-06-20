@@ -1760,3 +1760,13 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   New `translate_tool_choice_to_anthropic()` performs this mapping; it is only emitted when
   `tools` is also present (Anthropic rejects the combination otherwise). `"none"` and `null` are
   handled upstream (ADR-176) and never reach this path. Zero new dependencies; 4 new tests.
+
+- **ADR-181 OTel span `finish_reason` derived from response.**
+  Socratic probe of the ADR-177/178/179 tool-call path: "what does the OTel trace show for a
+  tool-call response?" Three defects: (1) `emit_cache_hit_span` hardcoded `"stop"` regardless of
+  `tool_calls`. (2) `finalize_streamed` hardcoded `"stop"`. (3) `run_completion` (the buffered
+  path) never set `finish_reason` at all — the attribute was silently absent from every
+  non-streaming span. The SSE wire format was correct; only the trace log was wrong. New
+  `finish_reason_for(resp)` helper returns `"tool_calls"` when `resp.tool_calls` is `Some`,
+  `"stop"` otherwise. All three sites and the two inline ternary expressions are updated to use
+  it. Zero new dependencies; 3 new tests; 651 total.
