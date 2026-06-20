@@ -935,7 +935,11 @@ impl Proxy {
     /// Returns the decision and whether the content was sensitive.
     fn classify_and_decide(&self, req: &CompletionRequest) -> Result<(Decision, bool), ProxyError> {
         let text = req.routing_text();
-        let report = crate::privacy::classify(&text);
+        // Privacy classification scans tool-call arguments too (ADR-187): PII can
+        // live solely in tool_calls_json, which routing_text() omits. The routing
+        // *difficulty* decision below still uses content-only `text` so tool bytes
+        // don't inflate the token-length heuristic.
+        let report = crate::privacy::classify(&req.privacy_text());
         let sensitive = report.is_sensitive();
         if sensitive {
             eprintln!(

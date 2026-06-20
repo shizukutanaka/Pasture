@@ -1982,6 +1982,29 @@ fn test_handle_chat_sensitive_kept_local_despite_long() {
 }
 
 #[test]
+fn test_sensitive_tool_call_argument_kept_local() {
+    // ADR-187: PII living ONLY in an assistant message's tool_calls arguments
+    // (not in any message content) must still be classified sensitive and kept
+    // local. routing_text() is content-only, so before this fix the credit card
+    // below was invisible to classify() and the long benign content escalated the
+    // request to cloud — leaking the card. privacy_text() now scans tool_calls_json.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log); // low threshold -> would be cloud by length
+    // Benign, long user content (forces a cloud route on length alone); the only
+    // sensitive value is the Luhn-valid card inside the assistant tool call.
+    let long = "word ".repeat(50);
+    let body = format!(
+        r#"{{"model":"m","messages":[{{"role":"user","content":"{long}"}},{{"role":"assistant","content":null,"tool_calls":[{{"id":"c1","type":"function","function":{{"name":"charge_card","arguments":"{{\"number\":\"4111111111111111\"}}"}}}}]}}]}}"#
+    );
+    let resp = p.handle_chat(&body).unwrap();
+    assert!(
+        resp.contains("\"x_pasture_route\":\"local\""),
+        "PII in a tool-call argument must keep the request local: {resp}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_handle_chat_writes_cost_log() {
     let log = tmp_log();
     let p = proxy_with(true, true, 100, &log);

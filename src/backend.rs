@@ -228,6 +228,28 @@ impl CompletionRequest {
         }
         text
     }
+
+    /// Text scanned by the privacy classifier (I3, ADR-187). Extends
+    /// `routing_text()` with the model-generated tool-call arguments
+    /// (`tool_calls_json`): those are serialised into the outbound request body
+    /// and can carry PII derived from the conversation (e.g. a credit-card number
+    /// passed to a `charge_card` tool), yet `routing_text()` is content-only and
+    /// would miss them — letting a request whose only sensitive value lives in a
+    /// tool call escalate to cloud (`has_tools` is a hard signal) and leak it.
+    /// Tool *definitions* (`sampling.tools`) are deliberately excluded: they are
+    /// developer-authored schema, not conversation PII, and classifying them would
+    /// false-positive every request that merely declares a tool whose description
+    /// mentions a privacy keyword, forcing it local for no privacy gain.
+    pub fn privacy_text(&self) -> String {
+        let mut text = self.routing_text();
+        for m in &self.messages {
+            if let Some(tc) = &m.tool_calls_json {
+                text.push('\n');
+                text.push_str(tc);
+            }
+        }
+        text
+    }
 }
 
 /// A completed response plus token accounting.
@@ -1001,6 +1023,38 @@ mod tests {
             crate::routing::estimate_tokens(&estimation)
                 > crate::routing::estimate_tokens(&routing)
         );
+    }
+
+    #[test]
+    fn test_privacy_text_includes_tool_calls_but_not_tool_definitions() {
+        // A plain request: privacy_text == routing_text (no tool payload).
+        assert_eq!(req().privacy_text(), req().routing_text());
+
+        // tool_calls arguments (model-generated, may carry PII) must appear so
+        // classify() can see them (ADR-187); tool *definitions* must not, to avoid
+        // false-positive sensitivity on developer-authored schema.
+        let mut r = req();
+        r.sampling.tools = Some(
+            crate::json::parse(
+                r#"[{"type":"function","function":{"name":"charge","description":"SECRETSCHEMA"}}]"#,
+            )
+            .unwrap(),
+        );
+        r.messages.push(Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls_json: Some(
+                r#"[{"id":"c1","function":{"name":"charge","arguments":"{\"card\":\"4111111111111111\"}"}}]"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        let privacy = r.privacy_text();
+        assert!(privacy.contains("4111111111111111"), "tool-call args must be scanned");
+        assert!(!privacy.contains("SECRETSCHEMA"), "tool definitions must be excluded");
+        // The credit card is now visible to the classifier.
+        assert!(crate::privacy::classify(&privacy).is_sensitive());
+        assert!(!crate::privacy::classify(&r.routing_text()).is_sensitive());
     }
 
     #[test]

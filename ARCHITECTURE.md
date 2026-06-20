@@ -1853,3 +1853,28 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   lost; plain (non-tool) requests have both fields `None` and an unchanged key. The semantic-cache
   `sampling_key` path (ADR-159) already hashed sampling-level tools and is unaffected. Zero new
   dependencies; 1 new test; 661 total.
+
+- **ADR-187 Privacy classifier scans tool-call arguments, not just message content.**
+  Socratic probe surfaced by ADR-186: "ADR-186 confirmed tool-calling requests *are* cached and
+  routed because sensitivity comes from `classify(routing_text())`, which is content-only — so where
+  does sensitive data in a tool-call *argument* get classified?" Nowhere. `routing_text()` joins only
+  message `content`, so PII living solely in an assistant message's `tool_calls_json` (a credit card
+  passed to a `charge_card` tool, an email or API key in tool arguments) was invisible to
+  `classify()`. The request was then deemed non-sensitive and, because `has_tools` is a hard
+  escalation signal (and long content escalates on length), routed to **cloud** — leaking the PII
+  off the machine, violating the project's core guarantee that sensitive content must not leave
+  unless `PASTURE_ALLOW_SENSITIVE_CLOUD` is set. ADR-184 had reasoned `routing_text()` must stay
+  content-only for `classify()` ("user-visible text only"), but that missed that `tool_calls_json`
+  is *also* outbound request data carrying conversation-derived PII — `estimation_text()` already
+  counted those bytes for billing, yet `classify()` never saw them. The fix gives privacy its own
+  projection: `CompletionRequest::privacy_text()` = `routing_text()` + every assistant
+  `tool_calls_json`, scanned by `classify()`. The routing *difficulty* decision still uses
+  content-only `routing_text()` so tool bytes don't inflate the token-length heuristic. Tool
+  *definitions* (`sampling.tools`) are deliberately excluded — developer-authored schema, not
+  conversation PII; classifying them would false-positive every request that merely declares a tool
+  whose description mentions a keyword. The request now has three purpose-built projections:
+  `routing_text` (decision/length), `estimation_text` (billing, ADR-184), `privacy_text` (PII).
+  The change can only make *more* requests classify sensitive (kept local, also uncached via the
+  same flag) — strictly the safe direction; non-PII tool requests route identically. Both buffered
+  and streaming paths are covered (both go through `classify_and_decide`). Zero new dependencies;
+  2 new tests; 663 total.

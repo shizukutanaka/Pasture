@@ -5,6 +5,26 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Privacy classifier scans tool-call arguments (ADR-187)
+
+- Sensitivity was decided by `classify(routing_text())`, which joins only
+  message `content`.  PII living **solely** in an assistant message's
+  `tool_calls_json` — a credit card passed to a `charge_card` tool, an email or
+  API key in tool arguments — was invisible to the classifier.  The request was
+  then deemed non-sensitive and, because `has_tools` (and long content)
+  escalates to cloud, the PII was sent off the machine — violating the
+  guarantee that sensitive content stays local unless
+  `PASTURE_ALLOW_SENSITIVE_CLOUD` is set.
+
+  New `CompletionRequest::privacy_text()` = `routing_text()` + every assistant
+  `tool_calls_json`; `classify()` now runs on it.  The routing difficulty/length
+  decision still uses content-only `routing_text()`.  Tool *definitions*
+  (`sampling.tools`) are excluded by design (developer schema, not conversation
+  PII — classifying them would false-positive every tool request).  The change
+  only ever marks **more** requests sensitive (kept local, also uncached) — the
+  safe direction; non-PII tool requests route identically.  Both buffered and
+  streaming paths covered.  2 new tests.  663 tests.  (ADR-187)
+
 ### Fixed — Cache key includes message-level `tool_calls` / `tool_call_id` (ADR-186)
 
 - The exact-match cache key (`request_key`) hashed only each message's `role`
