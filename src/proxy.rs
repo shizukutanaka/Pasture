@@ -1044,8 +1044,16 @@ impl Proxy {
                 sse_frame(&build_openai_chunk(&id, &model, &fp, &hit.content, route_label, None, created));
             sock.write_all(frame.as_bytes())?;
         }
+        // Replay any tool_calls as a delta chunk before the stop chunk (ADR-178),
+        // so a cached tool-call response is not silently dropped on the stream path.
+        if let Some(tc) = &hit.tool_calls {
+            let frame =
+                sse_frame(&build_openai_tool_calls_chunk(&id, &model, &fp, tc, route_label, created));
+            sock.write_all(frame.as_bytes())?;
+        }
         self.log_cost(route_label, hit, None, 0);
-        let stop = sse_frame(&build_openai_chunk(&id, &model, &fp, "", route_label, Some("stop"), created));
+        let finish = if hit.tool_calls.is_some() { "tool_calls" } else { "stop" };
+        let stop = sse_frame(&build_openai_chunk(&id, &model, &fp, "", route_label, Some(finish), created));
         sock.write_all(stop.as_bytes())?;
         if include_usage {
             let usage = sse_frame(&build_openai_usage_chunk(
@@ -2470,9 +2478,23 @@ impl Proxy {
                             }
                         }
                     }
+                    // Emit accumulated tool_calls as a delta chunk before the stop
+                    // chunk (ADR-178); the stop chunk then carries the tool_calls
+                    // finish reason.
                     if io_err.is_none() {
+                        if let Some(tc) = &r.tool_calls {
+                            let frame = sse_frame(&build_openai_tool_calls_chunk(
+                                &id, &model, &fp, tc, route_label, created,
+                            ));
+                            if let Err(e) = sock.write_all(frame.as_bytes()) {
+                                io_err = Some(e);
+                            }
+                        }
+                    }
+                    if io_err.is_none() {
+                        let finish = if r.tool_calls.is_some() { "tool_calls" } else { "stop" };
                         let stop = sse_frame(&build_openai_chunk(
-                            &id, &model, &fp, "", route_label, Some("stop"), created,
+                            &id, &model, &fp, "", route_label, Some(finish), created,
                         ));
                         if let Err(e) = sock.write_all(stop.as_bytes()) {
                             io_err = Some(e);
@@ -3012,6 +3034,24 @@ pub fn build_openai_chunk(
     };
     format!(
         "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"logprobs\":null,\"finish_reason\":{finish_field}}}]}}",
+        escape_string(model)
+    )
+}
+
+/// Build a streaming chunk carrying a `tool_calls` array in the delta (ADR-178).
+/// `tool_calls` is the raw JSON array. Shares the stream's `id`/`model`/
+/// `fingerprint`/`created`; `finish_reason` is null (the following stop chunk
+/// carries `"tool_calls"`).
+pub fn build_openai_tool_calls_chunk(
+    id: &str,
+    model: &str,
+    fingerprint: &str,
+    tool_calls: &str,
+    route_label: &str,
+    created: u64,
+) -> String {
+    format!(
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":{tool_calls}}},\"logprobs\":null,\"finish_reason\":null}}]}}",
         escape_string(model)
     )
 }

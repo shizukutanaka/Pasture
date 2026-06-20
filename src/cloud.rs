@@ -253,6 +253,10 @@ pub enum OpenAiStreamEvent {
     /// Present only when `stream_options.include_usage: true` was requested
     /// and the backend sent a usage-only chunk (`choices: []`).
     Usage(u64, u64),
+    /// A `delta.tool_calls` fragment (raw JSON array string), streamed when the
+    /// model is making a tool call (ADR-178). Accumulated across chunks by the
+    /// caller into a complete `tool_calls` array.
+    ToolCallDelta(String),
 }
 
 /// Mean per-token log-probability from an OpenAI chat-completions response
@@ -295,16 +299,96 @@ pub fn parse_openai_stream_line(line: &str) -> Option<OpenAiStreamEvent> {
             return None;
         }
     }
-    let content = v
+    let delta = v
         .get("choices")
         .and_then(JsonValue::as_array)
         .and_then(|a| a.first())
-        .and_then(|c| c.get("delta"))
-        .and_then(|d| d.get("content"))
-        .and_then(|c| c.as_str());
+        .and_then(|c| c.get("delta"));
+    // A tool-call fragment: `delta.tool_calls` is a (partial) array (ADR-178).
+    if let Some(tc) = delta
+        .and_then(|d| d.get("tool_calls"))
+        .filter(|tc| matches!(tc, JsonValue::Array(a) if !a.is_empty()))
+    {
+        return Some(OpenAiStreamEvent::ToolCallDelta(tc.to_json_string()));
+    }
+    let content = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str());
     match content {
         Some(c) if !c.is_empty() => Some(OpenAiStreamEvent::Delta(c.to_string())),
         _ => None,
+    }
+}
+
+/// Accumulates OpenAI streamed `tool_calls` delta fragments into a complete
+/// `tool_calls` array (ADR-178). Fragments are merged by `index`: `id`, `type`,
+/// and `function.name` are set from the first fragment that carries them;
+/// `function.arguments` strings are concatenated across fragments.
+#[derive(Default)]
+pub struct ToolCallAccumulator {
+    slots: Vec<ToolCallSlot>,
+}
+
+#[derive(Default)]
+struct ToolCallSlot {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ToolCallAccumulator {
+    /// Ingest one `delta.tool_calls` array (the raw JSON string from a
+    /// `ToolCallDelta` event).
+    pub fn push(&mut self, delta_json: &str) {
+        let Ok(arr) = parse(delta_json) else { return };
+        let Some(items) = arr.as_array() else { return };
+        for (pos, item) in items.iter().enumerate() {
+            let idx = item
+                .get("index")
+                .and_then(|v| match v {
+                    JsonValue::Number(n) => Some(*n as usize),
+                    _ => None,
+                })
+                .unwrap_or(pos);
+            while self.slots.len() <= idx {
+                self.slots.push(ToolCallSlot::default());
+            }
+            let slot = &mut self.slots[idx];
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    slot.id = id.to_string();
+                }
+            }
+            if let Some(func) = item.get("function") {
+                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        slot.name = name.to_string();
+                    }
+                }
+                if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                    slot.arguments.push_str(args);
+                }
+            }
+        }
+    }
+
+    /// Build the complete `tool_calls` array JSON, or `None` if nothing was
+    /// accumulated. Each call is `{"id","type":"function","function":{"name","arguments"}}`.
+    pub fn finish(self) -> Option<String> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let calls: Vec<String> = self
+            .slots
+            .into_iter()
+            .map(|s| {
+                format!(
+                    "{{\"id\":\"{}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
+                    escape_string(&s.id),
+                    escape_string(&s.name),
+                    escape_string(&s.arguments)
+                )
+            })
+            .collect();
+        Some(format!("[{}]", calls.join(",")))
     }
 }
 
@@ -382,14 +466,24 @@ pub fn http_status_error(status: u16, message: String) -> BackendError {
 /// offline and reused over the real TLS stream). Chunked-transfer size lines are
 /// ignored because they never start with `data:`; this assumes one SSE event per
 /// chunk, which OpenAI and Anthropic both honour.
+/// The assembled content, optional usage, and any accumulated `tool_calls`
+/// array from a streamed SSE response (ADR-173/178).
+#[derive(Debug)]
+pub struct SseStreamResult {
+    pub content: String,
+    pub usage: Option<(u64, u64)>,
+    pub tool_calls: Option<String>,
+}
+
 /// Read an HTTP SSE response from `reader`, invoking `on_delta` for each text
-/// delta as it arrives, and return the assembled content and any usage reported
-/// in the final usage chunk (ADR-173). Provider-agnostic and transport-agnostic.
+/// delta as it arrives, and return the assembled content, any usage reported in
+/// the final usage chunk (ADR-173), and any streamed `tool_calls` (ADR-178).
+/// Provider-agnostic and transport-agnostic.
 pub fn read_sse_body<R: std::io::Read>(
     reader: &mut R,
     provider: Provider,
     on_delta: &mut dyn FnMut(&str),
-) -> Result<(String, Option<(u64, u64)>), BackendError> {
+) -> Result<SseStreamResult, BackendError> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
     // Read until the headers terminator.
@@ -430,7 +524,8 @@ pub fn read_sse_body<R: std::io::Read>(
     let mut content = String::new();
     let mut line_buf: Vec<u8> = Vec::new();
     let mut stream_usage: Option<(u64, u64)> = None;
-    emit_sse_lines(provider, &mut line_buf, &pending, &mut content, on_delta, &mut stream_usage);
+    let mut tool_acc = ToolCallAccumulator::default();
+    emit_sse_lines(provider, &mut line_buf, &pending, &mut content, on_delta, &mut stream_usage, &mut tool_acc);
     loop {
         let n = reader
             .read(&mut chunk)
@@ -438,12 +533,19 @@ pub fn read_sse_body<R: std::io::Read>(
         if n == 0 {
             break;
         }
-        emit_sse_lines(provider, &mut line_buf, &chunk[..n], &mut content, on_delta, &mut stream_usage);
+        emit_sse_lines(provider, &mut line_buf, &chunk[..n], &mut content, on_delta, &mut stream_usage, &mut tool_acc);
     }
-    if content.is_empty() {
+    let tool_calls = tool_acc.finish();
+    // A pure tool-call stream has empty content but a tool_calls array, so the
+    // emptiness check must consider both (ADR-178).
+    if content.is_empty() && tool_calls.is_none() {
         return Err(BackendError::Protocol("empty stream".into()));
     }
-    Ok((content, stream_usage))
+    Ok(SseStreamResult {
+        content,
+        usage: stream_usage,
+        tool_calls,
+    })
 }
 
 fn emit_sse_lines(
@@ -453,6 +555,7 @@ fn emit_sse_lines(
     content: &mut String,
     on_delta: &mut dyn FnMut(&str),
     stream_usage: &mut Option<(u64, u64)>,
+    tool_acc: &mut ToolCallAccumulator,
 ) {
     line_buf.extend_from_slice(incoming);
     while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
@@ -469,6 +572,9 @@ fn emit_sse_lines(
                 // message_start (input) and message_delta (output) (ADR-175).
                 let (ep, ec) = stream_usage.unwrap_or((0, 0));
                 *stream_usage = Some((if p > 0 { p } else { ep }, if c > 0 { c } else { ec }));
+            }
+            Some(OpenAiStreamEvent::ToolCallDelta(frag)) => {
+                tool_acc.push(&frag); // accumulate streamed tool_calls (ADR-178)
             }
             _ => {}
         }
@@ -658,21 +764,20 @@ mod transport {
                 body.len()
             );
             let mut stream = tls_send(host, request.as_bytes())?;
-            let (content, stream_usage) = read_sse_body(&mut stream, self.provider, on_delta)?;
+            let result = read_sse_body(&mut stream, self.provider, on_delta)?;
             // Use actual usage from the stream; fall back to estimate only if
             // the backend did not send a usage chunk (ADR-173).
-            let (prompt_tokens, completion_tokens) = stream_usage.unwrap_or_else(|| (
+            let (prompt_tokens, completion_tokens) = result.usage.unwrap_or_else(|| (
                 crate::routing::estimate_tokens(&req.routing_text()) as u64,
-                crate::routing::estimate_tokens(&content) as u64,
+                crate::routing::estimate_tokens(&result.content) as u64,
             ));
             Ok(CompletionResponse {
-                content,
+                content: result.content,
                 model: self.model.clone(),
                 prompt_tokens,
                 completion_tokens,
-                // Streaming tool-call deltas are a follow-up (ADR-177); the
-                // buffered path carries tool_calls today.
-                tool_calls: None,
+                // Streamed tool_calls accumulated by read_sse_body (ADR-178).
+                tool_calls: result.tool_calls,
             })
         }
     }
@@ -918,10 +1023,11 @@ data: {\"choices\":[{\"delta\":{\"content\":\", world\"}}]}\n\n\
 data: [DONE]\n\n";
         let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
         let mut got = String::new();
-        let (content, stream_usage) = read_sse_body(&mut cur, Provider::OpenAI, &mut |d| got.push_str(d)).unwrap();
-        assert_eq!(content, "Hello, world");
+        let r = read_sse_body(&mut cur, Provider::OpenAI, &mut |d| got.push_str(d)).unwrap();
+        assert_eq!(r.content, "Hello, world");
         assert_eq!(got, "Hello, world"); // deltas were delivered incrementally
-        assert_eq!(stream_usage, None); // no usage chunk in this stream
+        assert_eq!(r.usage, None); // no usage chunk in this stream
+        assert_eq!(r.tool_calls, None);
     }
 
     #[test]
@@ -933,9 +1039,29 @@ data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
 data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n\
 data: [DONE]\n\n";
         let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
-        let (content, stream_usage) = read_sse_body(&mut cur, Provider::OpenAI, &mut |_| {}).unwrap();
-        assert_eq!(content, "hi");
-        assert_eq!(stream_usage, Some((5, 2)));
+        let r = read_sse_body(&mut cur, Provider::OpenAI, &mut |_| {}).unwrap();
+        assert_eq!(r.content, "hi");
+        assert_eq!(r.usage, Some((5, 2)));
+    }
+
+    #[test]
+    fn test_read_sse_body_openai_tool_calls() {
+        // ADR-178: streamed tool_call fragments accumulate into a complete array;
+        // content is empty for a pure tool call.
+        let resp = "HTTP/1.1 200 OK\r\n\r\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"loc\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\":\\\"SF\\\"}\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n";
+        let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
+        let r = read_sse_body(&mut cur, Provider::OpenAI, &mut |_| {}).unwrap();
+        assert_eq!(r.content, "", "pure tool call has empty content");
+        let tc = r.tool_calls.expect("tool_calls accumulated");
+        assert!(tc.contains("\"name\":\"get_weather\""), "{tc}");
+        assert!(tc.contains("\"id\":\"call_1\""), "{tc}");
+        // arguments concatenated across fragments
+        assert!(tc.contains("{\\\"loc\\\":\\\"SF\\\"}"), "{tc}");
     }
 
     #[test]
@@ -947,8 +1073,8 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
 data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"B\"}}\n\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
-        let (content, _) = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
-        assert_eq!(content, "AB");
+        let r = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
+        assert_eq!(r.content, "AB");
     }
 
     #[test]
@@ -961,10 +1087,42 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
-        let (content, stream_usage) = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
-        assert_eq!(content, "hi");
+        let r = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
+        assert_eq!(r.content, "hi");
         // input from message_start; output from message_delta (NOT the placeholder 1).
-        assert_eq!(stream_usage, Some((25, 42)));
+        assert_eq!(r.usage, Some((25, 42)));
+    }
+
+    #[test]
+    fn test_tool_call_accumulator_empty_and_merge() {
+        // Empty → None.
+        assert_eq!(ToolCallAccumulator::default().finish(), None);
+        // Two indexed calls, arguments split across fragments.
+        let mut acc = ToolCallAccumulator::default();
+        acc.push(r#"[{"index":0,"id":"a","type":"function","function":{"name":"f","arguments":"{\"x\":"}}]"#);
+        acc.push(r#"[{"index":0,"function":{"arguments":"1}"}}]"#);
+        acc.push(r#"[{"index":1,"id":"b","type":"function","function":{"name":"g","arguments":"{}"}}]"#);
+        let out = acc.finish().unwrap();
+        let v = parse(&out).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "{out}");
+        assert_eq!(arr[0].get("id").and_then(|x| x.as_str()), Some("a"));
+        assert!(out.contains("\"name\":\"f\""), "{out}");
+        // arguments concatenated in order
+        assert!(out.contains("{\\\"x\\\":1}"), "{out}");
+        assert_eq!(arr[1].get("id").and_then(|x| x.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn test_tool_call_delta_event_parsed() {
+        // ADR-178: a delta.tool_calls line is surfaced as a ToolCallDelta event.
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"f","arguments":""}}]}}]}"#;
+        match parse_openai_stream_line(line) {
+            Some(OpenAiStreamEvent::ToolCallDelta(frag)) => {
+                assert!(frag.contains("\"name\":\"f\""), "{frag}");
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
     }
 
     #[test]

@@ -2554,6 +2554,28 @@ fn test_usage_chunk_includes_model() {
 }
 
 #[test]
+fn test_tool_calls_chunk_shape() {
+    // ADR-178: a streamed tool_calls chunk carries the array in delta.tool_calls
+    // with a null finish_reason (the following stop chunk carries "tool_calls").
+    let fp = fingerprint_for_model("m");
+    let tc = r#"[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]"#;
+    let json = build_openai_tool_calls_chunk("chatcmpl-x", "m", &fp, tc, "cloud", 0);
+    let v = parse(&json).unwrap();
+    let choice = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .unwrap();
+    assert!(
+        matches!(choice.get("finish_reason"), Some(JsonValue::Null)),
+        "finish_reason must be null on the tool_calls delta: {json}"
+    );
+    let delta = choice.get("delta").unwrap();
+    assert!(delta.get("tool_calls").is_some(), "delta must carry tool_calls: {json}");
+    assert!(parse(&json).is_ok());
+}
+
+#[test]
 fn test_stream_chunks_share_model() {
     let fp = fingerprint_for_model("phi3");
     let chunks = [

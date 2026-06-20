@@ -1171,6 +1171,27 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   round-up `Retry-After`); only the gate ordering changed. Zero new dependencies; 1 test (an
   anonymous flood does not consume the bucket; the authenticated client is still admitted).
 
+- **ADR-178 Streaming responses carry `tool_calls` (ADR-177 follow-up).**
+  Socratic probe of the ADR-177 fix: "Tool calling works for buffered requests now —
+  but most agent frameworks stream. The streaming callback is `FnMut(&str)`, fed only
+  `delta.content`. Where do the `delta.tool_calls` fragments go?" Nowhere — they were
+  dropped, so a streaming tool request produced a content-only (usually empty) stream
+  with no tool call: the exact ADR-177 defect, one layer down. Two sites were affected:
+  the live stream and the cached-stream replay (`write_cached_stream` ignored
+  `hit.tool_calls`). Fix: (1) a new `OpenAiStreamEvent::ToolCallDelta` surfaces
+  `delta.tool_calls` fragments; (2) a `ToolCallAccumulator` merges them by `index`
+  (id/type/name from the first fragment that carries them, `arguments` strings
+  concatenated); (3) `read_sse_body` now returns an `SseStreamResult` struct carrying
+  `content`, `usage`, and the accumulated `tool_calls`, and the local streaming path
+  accumulates the same way; (4) the empty-stream guard now passes when there is a tool
+  call but no text; (5) the proxy emits the assembled `tool_calls` as one delta chunk
+  (`build_openai_tool_calls_chunk`) before a stop chunk whose `finish_reason` is
+  `"tool_calls"`, on both the live and cached-replay paths. The whole array arrives in
+  a single delta — spec-valid, and simpler than re-chunking the fragments. Scope:
+  OpenAI-compatible only (Anthropic tool-use remains the ADR-177 follow-up). Zero new
+  dependencies. 634 tests pass (4 new: accumulator merge/empty; `ToolCallDelta` parsed;
+  `read_sse_body` accumulates; tool_calls chunk shape).
+
 - **ADR-177 Tool/function definitions are forwarded to the backend (IMP-10 completed).**
   Socratic probe of the IMP-10 promise — "detect `tools`/`tool_choice` → escalate and
   *pass through unchanged*": "`CompletionRequest` stores only `has_tools: bool`. Neither

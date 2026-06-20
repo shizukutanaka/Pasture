@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Streaming responses carry tool_calls (ADR-178)
+
+- ADR-177 fixed tool calling for buffered requests, but the streaming path fed the
+  callback only `delta.content`, dropping `delta.tool_calls` fragments — so streaming
+  tool requests (the common agent case) produced an empty stream with no tool call.
+  The cached-stream replay had the same gap (`tool_calls` ignored).  Now a
+  `ToolCallAccumulator` merges streamed tool-call fragments by index, `read_sse_body`
+  returns them in an `SseStreamResult`, and the proxy emits the assembled array as one
+  delta chunk followed by a stop chunk with `finish_reason:"tool_calls"` — on both the
+  live and cached-replay paths.  OpenAI-compatible only (Anthropic remains a follow-up).
+  4 new tests.  634 tests.  (ADR-178)
+
 ### Added — Tool/function calling is forwarded to the backend (ADR-177)
 
 - IMP-10 detected `tools`/`tool_choice` and escalated to the stronger model, but the

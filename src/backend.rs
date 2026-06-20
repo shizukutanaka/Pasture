@@ -661,6 +661,7 @@ impl Backend for OpenAiCompatBackend {
         let body = Provider::OpenAI.build_body_stream(&shaped);
         let mut content = String::new();
         let mut stream_usage: Option<(u64, u64)> = None;
+        let mut tool_acc = crate::cloud::ToolCallAccumulator::default();
         http_post_streaming(
             &self.host,
             self.port,
@@ -676,11 +677,16 @@ impl Backend for OpenAiCompatBackend {
                     Some(crate::cloud::OpenAiStreamEvent::Usage(p, c)) => {
                         stream_usage = Some((p, c));
                     }
+                    Some(crate::cloud::OpenAiStreamEvent::ToolCallDelta(frag)) => {
+                        tool_acc.push(&frag); // accumulate streamed tool_calls (ADR-178)
+                    }
                     _ => {}
                 }
             },
         )?;
-        if content.is_empty() {
+        let tool_calls = tool_acc.finish();
+        // A pure tool-call stream has empty content but a tool_calls array (ADR-178).
+        if content.is_empty() && tool_calls.is_none() {
             return Err(BackendError::Protocol("empty stream".to_string()));
         }
         // Use actual usage from the stream; fall back to estimate only if the
@@ -694,7 +700,7 @@ impl Backend for OpenAiCompatBackend {
             model: self.model.clone(),
             prompt_tokens,
             completion_tokens,
-            tool_calls: None,
+            tool_calls,
         })
     }
 
