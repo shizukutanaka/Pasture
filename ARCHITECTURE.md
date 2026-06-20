@@ -1725,3 +1725,26 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   path's `Err(e)` arm does the same before writing the SSE error frame. Zero new dependencies;
   4 tests (error span status/attribute in `telemetry.rs`; buffered and streaming paths each emit
   an error span on backend failure).
+
+- **ADR-179 Anthropic tool-use forwarding — ADR-177/178 follow-up.**
+  Socratic probe of the Anthropic tool-calling path: "ADR-177 forwarded tools to OpenAI-compatible
+  backends — does the Anthropic provider work?" Four defects found. (1) `build_body_opts` for
+  Anthropic silently dropped `sampling.tools` — the tool definitions never appeared in the request
+  body. (2) `parse_response` for Anthropic required `content[0].text`, so a tool_use response
+  (content[0].type = "tool_use") hit `"missing content[0].text"` and errored. (3)
+  `parse_anthropic_stream_line` only handled `text_delta`; `content_block_start` (carries tool
+  id/name) and `input_json_delta` (carries argument fragments) were silently `None` — the
+  `ToolCallAccumulator` never received any data. (4) `build_body_stream` unconditionally appended
+  `stream_options:{include_usage:true}` for all providers; Anthropic rejects this field with 400.
+  Fix: (1) new `translate_tools_to_anthropic()` maps the OpenAI `{type,function:{name,description,
+  parameters}}` schema to Anthropic's `{name,description,input_schema}` — called from
+  `build_body_opts` when `sampling.tools` is set. (2) `parse_response` now walks the content array,
+  collecting `text` blocks into the content string and `tool_use` blocks into an OpenAI-format
+  `tool_calls` array (input object JSON-stringified as arguments). (3) `parse_anthropic_stream_line`
+  handles `content_block_start` with `type=tool_use` → `ToolCallDelta` (id/name/index) and
+  `content_block_delta` with `type=input_json_delta` → `ToolCallDelta` (escaped partial_json
+  fragment); the existing `ToolCallAccumulator` (ADR-178) assembles them provider-agnostically.
+  (4) `build_body_stream` and `HttpsCloudBackend::stream_complete` now branch on provider: OpenAI
+  keeps `stream_options`; Anthropic gets only `stream:true`. `tool_choice` translation to
+  Anthropic's `{type:auto/any/tool}` enum is a follow-up (ADR-180). Zero new dependencies;
+  10 new tests; 644 total.

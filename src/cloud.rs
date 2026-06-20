@@ -137,6 +137,10 @@ impl Provider {
                         .collect();
                     extra.push_str(&format!(",\"stop_sequences\":[{}]", items.join(",")));
                 }
+                // Translate OpenAI tool definitions to Anthropic format (ADR-179).
+                if let Some(tools) = &req.sampling.tools {
+                    extra.push_str(&translate_tools_to_anthropic(tools));
+                }
                 format!(
                     "{{\"model\":\"{}\",\"max_tokens\":{max_tokens}{},\"messages\":[{}]{}}}",
                     escape_string(&req.model),
@@ -149,13 +153,21 @@ impl Provider {
     }
 
     /// Like `build_body` but with `"stream": true` for SSE streaming.
+    /// For OpenAI, also requests a final usage chunk via `stream_options.include_usage`
+    /// (ADR-173). For Anthropic, that field is invalid — usage arrives naturally in
+    /// `message_delta`; adding it would cause a 400 error (ADR-179).
     pub fn build_body_stream(self, req: &CompletionRequest) -> String {
         let mut s = self.build_body(req);
-        // Insert the stream flag and request a final usage chunk so
-        // stream_complete can log actual token counts (ADR-173).
         debug_assert!(s.ends_with('}'));
         s.pop();
-        s.push_str(",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+        match self {
+            Provider::OpenAI => {
+                s.push_str(",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+            }
+            Provider::Anthropic => {
+                s.push_str(",\"stream\":true}");
+            }
+        }
         s
     }
 
@@ -227,18 +239,53 @@ impl Provider {
                 Ok((content, tool_calls, p, c))
             }
             Provider::Anthropic => {
-                let content = v
+                // Walk the content array; collect text blocks and tool_use blocks
+                // separately (ADR-179). A tool-use response may have no text block.
+                let content_arr = v
                     .get("content")
                     .and_then(JsonValue::as_array)
-                    .and_then(|a| a.first())
-                    .and_then(|b| b.get("text"))
-                    .and_then(|t| t.as_str())
-                    .ok_or_else(|| BackendError::Protocol("missing content[0].text".into()))?
-                    .to_string();
+                    .ok_or_else(|| BackendError::Protocol("missing content array".into()))?;
+                let mut text_parts: Vec<&str> = Vec::new();
+                let mut tool_items: Vec<String> = Vec::new();
+                for block in content_arr {
+                    match block.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                text_parts.push(t);
+                            }
+                        }
+                        Some("tool_use") => {
+                            let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            // Anthropic input is a parsed object; re-serialise to a
+                            // JSON string for OpenAI's arguments field (ADR-179).
+                            let args = block
+                                .get("input")
+                                .map(|i| i.to_json_string())
+                                .unwrap_or_else(|| "{}".to_string());
+                            tool_items.push(format!(
+                                "{{\"id\":\"{}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
+                                escape_string(id),
+                                escape_string(name),
+                                escape_string(&args)
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                let content = text_parts.join("");
+                let tool_calls = if tool_items.is_empty() {
+                    None
+                } else {
+                    Some(format!("[{}]", tool_items.join(",")))
+                };
+                if content.is_empty() && tool_calls.is_none() {
+                    return Err(BackendError::Protocol(
+                        "missing content[0].text and no tool_use".into(),
+                    ));
+                }
                 let (p, c) = usage(&v, "input_tokens", "output_tokens");
-                // Anthropic tool-use forwarding is a follow-up (ADR-177): its
-                // tools schema and tool_use blocks differ from OpenAI's.
-                Ok((content, None, p, c))
+                Ok((content, tool_calls, p, c))
             }
         }
     }
@@ -393,21 +440,60 @@ impl ToolCallAccumulator {
 }
 
 /// Parse one SSE `data:` line from an Anthropic Messages streaming response.
-/// Text arrives as `content_block_delta` events; `message_stop` signals the end.
-/// Token usage is split across two events (ADR-175): `message_start` carries
-/// `message.usage.input_tokens`, and the final `message_delta` carries the
-/// cumulative `usage.output_tokens`. Each is surfaced as a partial `Usage`
-/// event (the other field 0) and merged by the caller.
+/// Text arrives as `content_block_delta` events with `delta.type="text_delta"`;
+/// `message_stop` signals the end. Token usage is split across two events
+/// (ADR-175): `message_start` carries `message.usage.input_tokens`, and the
+/// final `message_delta` carries `usage.output_tokens`.
+///
+/// Tool-use streaming (ADR-179): `content_block_start` with
+/// `content_block.type="tool_use"` carries the call id and name; subsequent
+/// `content_block_delta` events with `delta.type="input_json_delta"` carry
+/// `partial_json` fragments. Both are emitted as `ToolCallDelta` events
+/// (OpenAI-shaped index-keyed delta arrays) so `ToolCallAccumulator` can
+/// assemble them provider-agnostically.
 pub fn parse_anthropic_stream_line(line: &str) -> Option<OpenAiStreamEvent> {
     let data = line.trim().strip_prefix("data:")?.trim();
     let v = parse(data).ok()?;
     match v.get("type").and_then(|t| t.as_str()) {
-        Some("content_block_delta") => v
-            .get("delta")
-            .and_then(|d| d.get("text"))
-            .and_then(|t| t.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| OpenAiStreamEvent::Delta(s.to_string())),
+        // content_block_start with tool_use → emit ToolCallDelta with id + name
+        // so ToolCallAccumulator seeds the slot (ADR-179).
+        Some("content_block_start") => {
+            let block = v.get("content_block")?;
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                return None; // text blocks have no delta-level signal here
+            }
+            let idx = v.get("index").and_then(json_u64).unwrap_or(0);
+            let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let frag = format!(
+                "[{{\"index\":{idx},\"id\":\"{}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"\"}}}}]",
+                escape_string(id),
+                escape_string(name)
+            );
+            Some(OpenAiStreamEvent::ToolCallDelta(frag))
+        }
+        Some("content_block_delta") => {
+            let delta = v.get("delta")?;
+            let idx = v.get("index").and_then(json_u64).unwrap_or(0);
+            match delta.get("type").and_then(|t| t.as_str()) {
+                Some("text_delta") => delta
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| OpenAiStreamEvent::Delta(s.to_string())),
+                // input_json_delta: partial_json is a raw JSON fragment; escape it
+                // into an arguments string delta for ToolCallAccumulator (ADR-179).
+                Some("input_json_delta") => {
+                    let partial = delta.get("partial_json").and_then(|v| v.as_str()).unwrap_or("");
+                    let frag = format!(
+                        "[{{\"index\":{idx},\"function\":{{\"arguments\":\"{}\"}}}}]",
+                        escape_string(partial)
+                    );
+                    Some(OpenAiStreamEvent::ToolCallDelta(frag))
+                }
+                _ => None,
+            }
+        }
         // message_start.message.usage.input_tokens — prompt tokens (output is a
         // placeholder here, filled by the later message_delta).
         Some("message_start") => {
@@ -585,6 +671,39 @@ fn find_crlf2(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// Translate an OpenAI-format `tools` array to Anthropic's schema (ADR-179).
+/// OpenAI: `[{"type":"function","function":{"name","description","parameters":{...}}}]`
+/// Anthropic: `[{"name","description","input_schema":{...}}]`
+/// Returns a comma-prefixed `,"tools":[...]` fragment or empty if no valid tools.
+fn translate_tools_to_anthropic(tools: &JsonValue) -> String {
+    let Some(arr) = tools.as_array() else {
+        return String::new();
+    };
+    let items: Vec<String> = arr
+        .iter()
+        .filter_map(|t| {
+            let func = t.get("function")?;
+            let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = func.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            // OpenAI `parameters` → Anthropic `input_schema` (same JSON Schema object).
+            let schema_json = func
+                .get("parameters")
+                .map(|s| s.to_json_string())
+                .unwrap_or_else(|| "{\"type\":\"object\"}".to_string());
+            Some(format!(
+                "{{\"name\":\"{}\",\"description\":\"{}\",\"input_schema\":{}}}",
+                escape_string(name),
+                escape_string(desc),
+                schema_json
+            ))
+        })
+        .collect();
+    if items.is_empty() {
+        return String::new();
+    }
+    format!(",\"tools\":[{}]", items.join(","))
+}
+
 fn usage(v: &JsonValue, pk: &str, ck: &str) -> (u64, u64) {
     let u = v.get("usage");
     let get = |key: &str| {
@@ -747,13 +866,21 @@ mod transport {
         ) -> Result<CompletionResponse, BackendError> {
             let host = self.provider.host();
             let path = self.provider.path();
-            // build_body_opts + stream + stream_options.include_usage so the
-            // backend sends a final usage chunk (ADR-173); cache_control hints
-            // apply here too (IMP-18).
+            // build_body_opts + stream flag; OpenAI also gets stream_options so
+            // the backend sends a final usage chunk (ADR-173); Anthropic already
+            // sends usage in message_delta and rejects stream_options (ADR-179).
+            // cache_control hints apply here too (IMP-18).
             let mut body = self.provider.build_body_opts(req, self.cache_control);
             debug_assert!(body.ends_with('}'));
             body.pop();
-            body.push_str(",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+            match self.provider {
+                Provider::OpenAI => {
+                    body.push_str(",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+                }
+                Provider::Anthropic => {
+                    body.push_str(",\"stream\":true}");
+                }
+            }
             let body = body;
             let mut header_lines = String::new();
             for (k, v) in self.provider.headers(&self.api_key) {
@@ -889,6 +1016,133 @@ mod tests {
         assert_eq!(c, "hi there");
         assert_eq!(tc, None);
         assert_eq!((p, comp), (7, 2));
+    }
+
+    #[test]
+    fn test_parse_anthropic_response_tool_use() {
+        // ADR-179: a pure tool_use response has no text block; tool_calls must
+        // be extracted and serialised in OpenAI format.
+        let body = r#"{"content":[{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"location":"SF"}}],"usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let (c, tc, p, comp) = Provider::Anthropic.parse_response(body).unwrap();
+        assert_eq!(c, "", "no text block → empty content");
+        let tc = tc.expect("tool_calls must be extracted");
+        assert!(tc.contains("\"name\":\"get_weather\""), "{tc}");
+        assert!(tc.contains("\"id\":\"toolu_01\""), "{tc}");
+        assert!(tc.contains("\"type\":\"function\""), "{tc}");
+        // input is re-serialised as the arguments JSON string
+        assert!(tc.contains("location"), "{tc}");
+        assert_eq!((p, comp), (10, 5));
+    }
+
+    #[test]
+    fn test_parse_anthropic_response_mixed_text_and_tool_use() {
+        // ADR-179: a mixed response has both text and tool_use blocks.
+        let body = r#"{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_02","name":"search","input":{"q":"rust"}}],"usage":{"input_tokens":8,"output_tokens":6}}"#;
+        let (c, tc, _p, _comp) = Provider::Anthropic.parse_response(body).unwrap();
+        assert_eq!(c, "Let me check.");
+        let tc = tc.expect("tool_calls present in mixed response");
+        assert!(tc.contains("\"name\":\"search\""), "{tc}");
+    }
+
+    #[test]
+    fn test_anthropic_body_translates_tools_to_anthropic_format() {
+        // ADR-179: when sampling.tools is set, the Anthropic body must contain
+        // "input_schema" (Anthropic format), not "parameters" (OpenAI format).
+        let mut r = req();
+        r.sampling.tools = Some(crate::json::parse(
+            r#"[{"type":"function","function":{"name":"get_weather","description":"Get the weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}}]"#,
+        ).unwrap());
+        let b = Provider::Anthropic.build_body(&r);
+        assert!(b.contains("\"input_schema\""), "Anthropic format uses input_schema, not parameters: {b}");
+        assert!(!b.contains("\"parameters\""), "parameters must be renamed to input_schema: {b}");
+        assert!(b.contains("\"name\":\"get_weather\""), "{b}");
+        assert!(b.contains("\"description\":\"Get the weather\""), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
+    }
+
+    #[test]
+    fn test_anthropic_body_no_tools_when_absent() {
+        // ADR-179: no tools in sampling → no tools field in Anthropic body.
+        let b = Provider::Anthropic.build_body(&req());
+        assert!(!b.contains("\"tools\""), "{b}");
+    }
+
+    #[test]
+    fn test_build_body_stream_anthropic_no_stream_options() {
+        // ADR-179: Anthropic rejects stream_options; only "stream":true should be added.
+        let b = Provider::Anthropic.build_body_stream(&req());
+        assert!(b.contains("\"stream\":true"), "{b}");
+        assert!(!b.contains("stream_options"), "stream_options is OpenAI-only: {b}");
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
+    }
+
+    #[test]
+    fn test_build_body_stream_openai_still_includes_stream_options() {
+        // ADR-179: OpenAI path must not regress — it still needs stream_options.include_usage.
+        let b = Provider::OpenAI.build_body_stream(&req());
+        assert!(b.contains("\"stream\":true"), "{b}");
+        assert!(b.contains("\"stream_options\""), "{b}");
+        assert!(b.contains("\"include_usage\":true"), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
+    }
+
+    #[test]
+    fn test_parse_anthropic_stream_line_tool_use_start() {
+        // ADR-179: content_block_start with tool_use emits a ToolCallDelta with id+name.
+        let line = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{}}}"#;
+        match parse_anthropic_stream_line(line) {
+            Some(OpenAiStreamEvent::ToolCallDelta(frag)) => {
+                assert!(frag.contains("\"name\":\"get_weather\""), "{frag}");
+                assert!(frag.contains("\"id\":\"toolu_01\""), "{frag}");
+                assert!(frag.contains("\"index\":0"), "{frag}");
+                assert!(crate::json::parse(&frag).is_ok(), "valid JSON: {frag}");
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_anthropic_stream_line_input_json_delta() {
+        // ADR-179: content_block_delta with input_json_delta emits a ToolCallDelta
+        // with the partial_json fragment as the arguments value.
+        let line = r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"loc"}}"#;
+        match parse_anthropic_stream_line(line) {
+            Some(OpenAiStreamEvent::ToolCallDelta(frag)) => {
+                assert!(frag.contains("\"arguments\""), "{frag}");
+                assert!(frag.contains("\"index\":0"), "{frag}");
+                assert!(crate::json::parse(&frag).is_ok(), "valid JSON: {frag}");
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_anthropic_stream_line_text_block_start_ignored() {
+        // ADR-179: content_block_start with type=text yields None (text arrives in delta).
+        let line = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+        assert_eq!(parse_anthropic_stream_line(line), None);
+    }
+
+    #[test]
+    fn test_read_sse_body_anthropic_tool_use_stream() {
+        // ADR-179: full Anthropic tool-use SSE stream assembles tool_calls correctly.
+        let resp = "HTTP/1.1 200 OK\r\n\r\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"get_weather\",\"input\":{}}}\n\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"location\\\"\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\": \\\"SF\\\"}\" }}\n\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":15}}\n\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
+        let r = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
+        assert_eq!(r.content, "", "pure tool_use has empty text content");
+        let tc = r.tool_calls.expect("tool_calls accumulated from Anthropic stream");
+        assert!(tc.contains("\"name\":\"get_weather\""), "{tc}");
+        assert!(tc.contains("\"id\":\"toolu_01\""), "{tc}");
+        // arguments: the two partial_json fragments concatenated
+        assert!(tc.contains("location"), "{tc}");
+        assert_eq!(r.usage, Some((20, 15)), "usage from message_start+message_delta");
     }
 
     #[test]

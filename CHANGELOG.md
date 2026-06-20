@@ -5,6 +5,28 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Anthropic tool-use forwarding (ADR-179)
+
+- ADR-177/178 delivered tool calling for OpenAI-compatible backends, but the
+  Anthropic provider had four distinct defects.  (1) `build_body_opts` silently
+  dropped `sampling.tools` — tool definitions never reached the Anthropic API.
+  (2) `parse_response` required `content[0].text`, so a `tool_use` response
+  (common for Anthropic's Claude 3+ models) errored with "missing content[0].text"
+  instead of extracting the tool call.  (3) `parse_anthropic_stream_line` ignored
+  `content_block_start` (carries tool id/name) and `input_json_delta` events,
+  so the `ToolCallAccumulator` never received any fragments on the Anthropic
+  streaming path.  (4) `build_body_stream` unconditionally appended
+  `stream_options:{include_usage:true}` — an OpenAI-only field that causes
+  Anthropic to return 400 on every streaming request.
+  
+  Now: `translate_tools_to_anthropic()` maps the OpenAI tools schema
+  (`parameters`) to Anthropic's (`input_schema`); `parse_response` walks the
+  content array and extracts both `text` and `tool_use` blocks; streaming
+  `content_block_start` and `input_json_delta` events are emitted as
+  `ToolCallDelta` events accumulated by the existing `ToolCallAccumulator`;
+  `stream_options` is suppressed for Anthropic.  `tool_choice` translation
+  is a follow-up (ADR-180).  10 new tests.  644 tests.  (ADR-179)
+
 ### Added — Streaming responses carry tool_calls (ADR-178)
 
 - ADR-177 fixed tool calling for buffered requests, but the streaming path fed the
