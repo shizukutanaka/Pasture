@@ -5,6 +5,23 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Spike-detector average resets on UTC day rollover (ADR-185)
+
+- The daily token budget resets at UTC midnight (ADR-155), but the spike
+  detector's running average did not.  The spike check compares each request
+  against `cloud_token_sum / cloud_request_count`, and those counters
+  accumulated for the entire lifetime of the process — an all-time average, not
+  a recent one.  Stale history never decayed: early outliers permanently skewed
+  the average, so a large-but-legitimate prompt late in a long session might
+  never trip the spike, and a long quiet history made the detector hair-trigger.
+
+  `roll_budget_day_if_needed()` already zeroes `today_cloud_tokens` on a strict
+  UTC-day advance (backward-clock-safe CAS); it now also zeroes the two spike
+  counters, so the spike half of the IMP-26 guard is day-scoped like the budget
+  half.  No new state (no ring buffer / EWMA); deterministic and std-only.
+  Cold-start already bypasses the spike check, so the post-reset state is the
+  well-tested cold path.  1 new test.  660 tests.  (ADR-185)
+
 ### Fixed — Token estimation counts tool definitions / `tool_calls` (ADR-184)
 
 - The token-estimate fallback (used for the cost log and budget/spike guard

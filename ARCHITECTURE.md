@@ -1816,3 +1816,21 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   unaffected: actual counts still take precedence, this only improves the fallback. Also cleaned
   three pre-existing clippy warnings (ADR-181 `finish_reason_for(&hit)`/`(&r)` double-refs, a test
   needless borrow). Zero new dependencies; 1 new test; 659 total.
+
+- **ADR-185 Spike-detector running average resets on UTC day rollover.**
+  Socratic probe of the IMP-26 budget/spike guard from the long-running-process angle: "the daily
+  token budget resets at UTC midnight (ADR-155), but does the spike detector's average reset with
+  it?" It did not. The spike check compares each request against `cloud_token_sum /
+  cloud_request_count`, but those two counters accumulated for the entire lifetime of the process —
+  an all-time average, not a recent one. Two failure modes: the average is dominated by stale
+  history and never decays, so a few early outliers permanently skew it and a genuinely
+  large-but-legitimate prompt late in a long session may never trip the spike; symmetrically, a long
+  quiet history of small requests pins the average low and makes the detector hair-trigger. The
+  daily budget half of the IMP-26 guard is already day-scoped (ADR-155); the spike half should share
+  the same window so the two age consistently. The fix reuses the single existing reset point:
+  `roll_budget_day_if_needed()` already zeroes `today_cloud_tokens` when the UTC day strictly
+  advances (gated by the backward-clock-safe CAS); it now also zeroes `cloud_token_sum` and
+  `cloud_request_count`. No rolling-window ring buffer or EWMA state — deterministic, std-only,
+  inheriting ADR-155's backward-clock safety (a backward step still cannot reset it). Cold-start
+  (`count == 0`) already bypasses the spike check, so the post-reset state is the well-tested cold
+  path. Zero new dependencies; 1 new test; 660 total.

@@ -1176,6 +1176,12 @@ impl Proxy {
                 .is_ok()
         {
             self.today_cloud_tokens.store(0, Ordering::Relaxed);
+            // ADR-185: reset spike-detector history so the average stays day-scoped.
+            // Without this, cloud_token_sum / cloud_request_count accumulate for the
+            // lifetime of the process — stale history skews the average, making the
+            // detector unresponsive to genuine spikes late in a long-running session.
+            self.cloud_token_sum.store(0, Ordering::Relaxed);
+            self.cloud_request_count.store(0, Ordering::Relaxed);
         }
     }
 

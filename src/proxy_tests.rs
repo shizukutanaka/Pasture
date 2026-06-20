@@ -3873,6 +3873,45 @@ fn test_spike_only_budget_off_gauge_tracks_actual_not_phantom_reservation() {
     let _ = std::fs::remove_file(&log);
 }
 
+// ── ADR-185 spike counters reset on UTC day rollover ─────────────────────────
+
+#[test]
+fn test_spike_counters_reset_on_day_rollover() {
+    // ADR-185: cloud_token_sum and cloud_request_count must be zeroed when the UTC
+    // day advances, just like today_cloud_tokens.  Without this, the running average
+    // used by the spike detector accumulates for the lifetime of the process —
+    // stale history can make the detector permanently blind or over-sensitive.
+    let log = tmp_log();
+    // budget=0 (disabled), spike_factor=50 — spike-only mode.
+    let p = proxy_with(true, true, 5, &log).with_budget(0, "local-only", 50, "/dev/null");
+
+    // Seed stale lifetime totals that look like days of accumulated history.
+    p.cloud_token_sum.store(1_000_000, Ordering::Relaxed);
+    p.cloud_request_count.store(2_000, Ordering::Relaxed);
+    // Anchor budget_day to epoch day 0 so the next request triggers a rollover.
+    p.budget_day.store(0, Ordering::Relaxed);
+
+    // model:"cloud" forces Route::Cloud; cold start (count reset to 0 by rollover)
+    // bypasses the spike check so the request completes normally.
+    let body = r#"{"model":"cloud","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = p.handle_chat(body).expect("cloud request must succeed after rollover");
+    assert!(
+        resp.contains("\"x_pasture_route\":\"cloud\""),
+        "must route cloud after rollover: {resp}"
+    );
+
+    // After the rollover the stale totals are gone; the new count is exactly 1
+    // (this request) and the token sum is only what MockBackend reported for
+    // this single request (estimate_tokens("hi") + estimate_tokens("cloud-reply")).
+    let count = p.cloud_request_count.load(Ordering::Relaxed);
+    let sum = p.cloud_token_sum.load(Ordering::Relaxed);
+    let expected_sum = crate::routing::estimate_tokens("hi") as u64
+        + crate::routing::estimate_tokens("cloud-reply") as u64;
+    assert_eq!(count, 1, "spike count must be 1 (reset + this request), was {count}");
+    assert_eq!(sum, expected_sum, "spike sum must be only this request's tokens (stale 1_000_000 must be gone), was {sum}");
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── ADR-164 budget release saturates at 0 across a UTC day rollover ───────────
 
 #[test]
