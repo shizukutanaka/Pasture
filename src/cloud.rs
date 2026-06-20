@@ -67,9 +67,16 @@ impl Provider {
                     .messages
                     .iter()
                     .map(|m| {
-                        // For role:"tool" result messages, tool_call_id is required by
-                        // the OpenAI API (ADR-182). Emit it as a top-level field when present.
-                        if let Some(tid) = &m.tool_call_id {
+                        if let Some(tc) = &m.tool_calls_json {
+                            // role:"assistant" with a prior tool call — content is
+                            // null and tool_calls carries the array (ADR-183).
+                            format!(
+                                "{{\"role\":\"{}\",\"content\":null,\"tool_calls\":{}}}",
+                                escape_string(&m.role),
+                                tc
+                            )
+                        } else if let Some(tid) = &m.tool_call_id {
+                            // role:"tool" result: tool_call_id required (ADR-182).
                             format!(
                                 "{{\"role\":\"{}\",\"tool_call_id\":\"{}\",\"content\":\"{}\"}}",
                                 escape_string(&m.role),
@@ -104,17 +111,45 @@ impl Provider {
                         system_parts.push(m.content.as_str());
                     } else if m.role == "tool" {
                         // Translate OpenAI role:"tool" result messages to Anthropic's
-                        // tool_result format (ADR-182). Anthropic requires these to be
-                        // wrapped as role:"user" with a tool_result content block.
-                        let tool_use_id = m
-                            .tool_call_id
-                            .as_deref()
-                            .unwrap_or(""); // id required; omitting is better than a 400
+                        // tool_result format (ADR-182).
+                        let tool_use_id = m.tool_call_id.as_deref().unwrap_or("");
                         conv_msgs.push(format!(
                             "{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{}\"}}]}}",
                             escape_string(tool_use_id),
                             escape_string(&m.content)
                         ));
+                    } else if m.role == "assistant" {
+                        if let Some(tc_json) = &m.tool_calls_json {
+                            // Translate OpenAI tool_calls array in an assistant message
+                            // to Anthropic's content:[{type:tool_use,...}] form (ADR-183).
+                            let blocks = translate_openai_tool_calls_to_anthropic_blocks(tc_json);
+                            if blocks.is_empty() {
+                                conv_msgs.push(format!(
+                                    "{{\"role\":\"assistant\",\"content\":\"{}\"}}",
+                                    escape_string(&m.content)
+                                ));
+                            } else {
+                                // Include any text content alongside the tool_use blocks.
+                                let mut parts: Vec<String> = Vec::new();
+                                if !m.content.is_empty() {
+                                    parts.push(format!(
+                                        "{{\"type\":\"text\",\"text\":\"{}\"}}",
+                                        escape_string(&m.content)
+                                    ));
+                                }
+                                parts.extend(blocks);
+                                conv_msgs.push(format!(
+                                    "{{\"role\":\"assistant\",\"content\":[{}]}}",
+                                    parts.join(",")
+                                ));
+                            }
+                        } else {
+                            conv_msgs.push(format!(
+                                "{{\"role\":\"{}\",\"content\":\"{}\"}}",
+                                escape_string(&m.role),
+                                escape_string(&m.content)
+                            ));
+                        }
                     } else {
                         conv_msgs.push(format!(
                             "{{\"role\":\"{}\",\"content\":\"{}\"}}",
@@ -700,6 +735,42 @@ fn emit_sse_lines(
 
 fn find_crlf2(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Translate an OpenAI `tool_calls` array from an assistant message into a list of
+/// Anthropic `tool_use` content block JSON strings (ADR-183).
+/// OpenAI: `[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{...}"}}]`
+/// Anthropic: `[{"type":"tool_use","id":"call_1","name":"f","input":{...}}]`
+/// The `arguments` string (JSON-stringified object) is parsed back to an object for `input`.
+/// Returns an empty vec if the JSON is malformed or the array is empty.
+fn translate_openai_tool_calls_to_anthropic_blocks(tool_calls_json: &str) -> Vec<String> {
+    let Ok(arr_val) = parse(tool_calls_json) else {
+        return Vec::new();
+    };
+    let Some(arr) = arr_val.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|tc| {
+            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let func = tc.get("function")?;
+            let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            // `arguments` is a JSON-stringified object; parse it back so Anthropic
+            // receives a proper object in `input` (not a string).
+            let args_str = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+            let input_json = if let Ok(parsed) = parse(args_str) {
+                parsed.to_json_string()
+            } else {
+                "{}".to_string() // malformed args → safe fallback
+            };
+            Some(format!(
+                "{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"{}\",\"input\":{}}}",
+                escape_string(id),
+                escape_string(name),
+                input_json
+            ))
+        })
+        .collect()
 }
 
 /// Translate an OpenAI `tool_choice` value to Anthropic's `tool_choice` object (ADR-180).
@@ -1609,6 +1680,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 role: "tool".to_string(),
                 content: "72°F".to_string(),
                 tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
             },
         ];
         let b = Provider::OpenAI.build_body(&r);
@@ -1632,6 +1704,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 role: "tool".to_string(),
                 content: "72°F".to_string(),
                 tool_call_id: Some("toolu_01".to_string()),
+                ..Default::default()
             },
         ];
         let b = Provider::Anthropic.build_body(&r);
@@ -1649,5 +1722,57 @@ data: {\"type\":\"message_stop\"}\n\n";
         // ADR-182 regression: ordinary user/assistant messages must NOT gain tool_call_id.
         let b = Provider::OpenAI.build_body(&req());
         assert!(!b.contains("tool_call_id"), "{b}");
+    }
+
+    // ---- ADR-183 tests ----
+
+    #[test]
+    fn test_openai_body_emits_tool_calls_for_assistant_history() {
+        // ADR-183: assistant message with tool_calls_json → "content":null,"tool_calls":[...]
+        let mut r = req();
+        r.messages = vec![
+            crate::backend::Message {
+                role: "user".to_string(),
+                content: "What's the weather?".to_string(),
+                ..Default::default()
+            },
+            crate::backend::Message {
+                role: "assistant".to_string(),
+                content: "".to_string(),
+                tool_calls_json: Some(r#"[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"loc\":\"SF\"}"}}]"#.to_string()),
+                ..Default::default()
+            },
+        ];
+        let b = Provider::OpenAI.build_body(&r);
+        assert!(b.contains("\"content\":null"), "content must be null for tool-call assistant: {b}");
+        assert!(b.contains("\"tool_calls\":["), "{b}");
+        assert!(b.contains("get_weather"), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
+    }
+
+    #[test]
+    fn test_anthropic_body_translates_assistant_tool_calls_to_tool_use_blocks() {
+        // ADR-183: Anthropic needs content:[{type:tool_use,...}] for assistant tool-call history.
+        let mut r = req();
+        r.messages = vec![
+            crate::backend::Message {
+                role: "user".to_string(),
+                content: "What's the weather?".to_string(),
+                ..Default::default()
+            },
+            crate::backend::Message {
+                role: "assistant".to_string(),
+                content: "".to_string(),
+                tool_calls_json: Some(r#"[{"id":"toolu_01","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"SF\"}"}}]"#.to_string()),
+                ..Default::default()
+            },
+        ];
+        let b = Provider::Anthropic.build_body(&r);
+        assert!(b.contains("\"type\":\"tool_use\""), "{b}");
+        assert!(b.contains("\"id\":\"toolu_01\""), "{b}");
+        assert!(b.contains("\"name\":\"get_weather\""), "{b}");
+        // arguments should be parsed back to an object (not a string)
+        assert!(b.contains("\"location\""), "{b}");
+        assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
     }
 }

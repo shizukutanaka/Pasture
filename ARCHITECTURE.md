@@ -1781,6 +1781,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   construction sites use `..Default::default()`. `parse_request` extracts the field. The OpenAI
   and Ollama body builders emit it when present; the Anthropic builder translates `role:'tool'` to
   `{"role":"user","content":[{"type":"tool_result","tool_use_id":"...","content":"..."}]}`.
-  Follow-up ADR-183: the assistant message carrying prior `tool_calls` in the history lacks that
-  array when forwarded (only `content:""` is sent), which strict providers may reject. Zero new
-  dependencies; 4 new tests; 655 total.
+  Zero new dependencies; 4 new tests; 655 total.
+
+- **ADR-183 Multi-turn tool calling: assistant `tool_calls` history round-trip.**
+  Socratic probe of the ADR-182 follow-up: "what happens when the client sends back the full
+  conversation history including the assistant message that originally contained `tool_calls`?"
+  Two failures: (1) `extract_message_content` errored on `content:null` (the standard form for
+  a tool-call assistant message), rejecting `parse_request` for any multi-turn history; (2) the
+  `tool_calls` array on the assistant message was silently dropped — OpenAI returns 400 without
+  it; Anthropic requires it as `content:[{type:"tool_use",...}]` blocks.
+  Fix: `extract_message_content` returns `Ok("")` for `JsonValue::Null` (missing content still
+  errors for user/system messages, preserving backwards compatibility). `Message` gains
+  `tool_calls_json: Option<String>`; `parse_request` extracts it from assistant messages;
+  OpenAI/Ollama body builders emit `"content":null,"tool_calls":[...]`; the Anthropic builder
+  emits the matching `tool_use` content blocks via `translate_openai_tool_calls_to_anthropic_blocks`.
+  The pseudonymization pipeline carries `tool_calls_json` through untouched.
+  Zero new dependencies; 7 new tests; 658 total.

@@ -22,6 +22,11 @@ pub struct Message {
     /// Required by OpenAI when forwarding tool-result turns; mapped to
     /// `tool_use_id` in the Anthropic `tool_result` block.
     pub tool_call_id: Option<String>,
+    /// The `tool_calls` array from a `role:"assistant"` message that called a
+    /// tool (ADR-183). Stored as the raw JSON array string from the incoming
+    /// request; forwarded verbatim to OpenAI/Ollama and translated to Anthropic's
+    /// `content:[{type:tool_use,...}]` form.
+    pub tool_calls_json: Option<String>,
 }
 
 /// A normalised chat-completion request.
@@ -424,9 +429,15 @@ impl OllamaBackend {
             .messages
             .iter()
             .map(|m| {
-                // Ollama /api/chat accepts tool_call_id for tool-result messages
-                // (same format as OpenAI) (ADR-182).
-                if let Some(tid) = &m.tool_call_id {
+                if let Some(tc) = &m.tool_calls_json {
+                    // role:"assistant" with prior tool calls — same format as OpenAI (ADR-183).
+                    format!(
+                        "{{\"role\":\"{}\",\"content\":null,\"tool_calls\":{}}}",
+                        escape_string(&m.role),
+                        tc
+                    )
+                } else if let Some(tid) = &m.tool_call_id {
+                    // Ollama /api/chat accepts tool_call_id for tool-result messages (ADR-182).
                     format!(
                         "{{\"role\":\"{}\",\"tool_call_id\":\"{}\",\"content\":\"{}\"}}",
                         escape_string(&m.role),

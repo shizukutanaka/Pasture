@@ -745,9 +745,16 @@ impl Proxy {
     /// with 400 rather than silently dropped: Pasture is a text-routing proxy and
     /// must not answer a vision request as if the image were absent.
     fn extract_message_content(m: &JsonValue) -> Result<String, ProxyError> {
-        let c = m
-            .get("content")
-            .ok_or_else(|| ProxyError::BadRequest("message missing 'content'".to_string()))?;
+        // content:null is valid for tool-call assistant messages (ADR-183).
+        let c = match m.get("content") {
+            Some(JsonValue::Null) => return Ok(String::new()),
+            None => {
+                return Err(ProxyError::BadRequest(
+                    "message missing 'content'".to_string(),
+                ))
+            }
+            Some(v) => v,
+        };
         match c {
             JsonValue::Str(s) => Ok(s.clone()),
             JsonValue::Array(parts) => {
@@ -805,13 +812,19 @@ impl Proxy {
                 .unwrap_or("user")
                 .to_string();
             let content = Self::extract_message_content(m)?;
-            // Carry tool_call_id for role:"tool" result messages so the backend
-            // can enforce OpenAI's requirement and Anthropic's translation (ADR-182).
+            // Carry tool_call_id for role:"tool" result messages (ADR-182).
             let tool_call_id = m
                 .get("tool_call_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            parsed.push(Message { role, content, tool_call_id });
+            // Carry tool_calls from role:"assistant" messages (ADR-183): the
+            // array must be round-tripped to the backend so multi-turn agent
+            // conversations preserve the model's prior tool-call context.
+            let tool_calls_json = m
+                .get("tool_calls")
+                .filter(|tc| matches!(tc, JsonValue::Array(a) if !a.is_empty()))
+                .map(|tc| tc.to_json_string());
+            parsed.push(Message { role, content, tool_call_id, tool_calls_json });
         }
         if parsed.is_empty() {
             return Err(ProxyError::BadRequest("no messages provided".to_string()));

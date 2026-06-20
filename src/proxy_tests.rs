@@ -4212,3 +4212,18 @@ fn test_parse_request_extracts_tool_call_id() {
     assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_1"), "tool_call_id must be preserved");
     assert_eq!(tool_msg.content, "72°F");
 }
+
+#[test]
+fn test_parse_request_extracts_tool_calls_from_assistant_message() {
+    // ADR-183: parse_request must preserve tool_calls from assistant messages in history.
+    let body = r#"{"model":"m","messages":[
+        {"role":"user","content":"What's the weather?"},
+        {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"call_1","content":"72°F"}
+    ]}"#;
+    let req = Proxy::parse_request(body).unwrap();
+    let asst = req.messages.iter().find(|m| m.role == "assistant").unwrap();
+    assert!(asst.tool_calls_json.is_some(), "assistant tool_calls must be preserved");
+    let tc = asst.tool_calls_json.as_ref().unwrap();
+    assert!(tc.contains("get_weather"), "{tc}");
+}

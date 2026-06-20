@@ -5,6 +5,23 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Multi-turn tool calling: assistant `tool_calls` history (ADR-183)
+
+- Assistant messages with `content:null` and a `tool_calls` array (the
+  standard shape the client sends back in the second turn) were rejected at
+  parse time because `extract_message_content` errored on `JsonValue::Null`.
+  Even if they had parsed, the `tool_calls` array was silently dropped, causing
+  every backend to reject the request (OpenAI: 400 missing `tool_calls`;
+  Anthropic: 422 wrong schema).  This made the standard two-step agent loop
+  impossible when the full conversation history was included.
+
+  Now `extract_message_content` returns `Ok("")` for `content:null` (missing
+  content still errors for user/system messages — unchanged).  `Message`
+  carries `tool_calls_json: Option<String>`; `parse_request` extracts it from
+  assistant messages; OpenAI/Ollama body builders emit `"content":null,
+  "tool_calls":[...]`; the Anthropic builder emits the matching
+  `content:[{type:"tool_use",...}]` blocks.  7 new tests.  658 tests.  (ADR-183)
+
 ### Fixed — Multi-turn tool calling: `tool_call_id` forwarding (ADR-182)
 
 - `Message` struct only stored `role` and `content`, so `tool_call_id` from
@@ -13,12 +30,11 @@ Format follows Keep a Changelog; versioning follows SemVer.
   `role:"user"` with a `tool_result` content block (and rejects `role:"tool"`
   entirely).  Both failures made the second turn of every tool-calling agent
   loop impossible through Pasture.
-  
+
   Now `Message` carries `tool_call_id: Option<String>`; `parse_request`
   extracts it; OpenAI and Ollama body builders emit it; the Anthropic builder
-  translates `role:"tool"` to the `tool_result` format.  Follow-up (ADR-183):
-  assistant messages with prior `tool_calls` in the history are forwarded
-  without the array.  4 new tests.  655 tests.  (ADR-182)
+  translates `role:"tool"` to the `tool_result` format.  4 new tests.
+  (ADR-182)
 
 ### Fixed — OTel span `finish_reason` for tool-call responses (ADR-181)
 

@@ -32,6 +32,9 @@ pub fn pseudonymize_messages(messages: &[Message]) -> (Vec<Message>, Mapping) {
             role: m.role.clone(),
             content: replace_in_text(&m.content, &mut ctx),
             tool_call_id: m.tool_call_id.clone(),
+            // tool_calls_json is structured tool-call data, not user text, so it
+            // does not need pseudonymization and is carried through unchanged.
+            tool_calls_json: m.tool_calls_json.clone(),
         })
         .collect();
     (result, ctx.mapping)
