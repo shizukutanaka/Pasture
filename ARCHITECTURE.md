@@ -1878,3 +1878,25 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   same flag) — strictly the safe direction; non-PII tool requests route identically. Both buffered
   and streaming paths are covered (both go through `classify_and_decide`). Zero new dependencies;
   2 new tests; 663 total.
+
+- **ADR-188 Pseudonymizer scrubs PII in tool-call argument JSON strings.**
+  Socratic probe of the `PASTURE_ALLOW_SENSITIVE_CLOUD + PASTURE_PSEUDONYMIZE` mode (the opted-in
+  masked-cloud path, where the pseudonymizer promises to scrub PII before the request leaves):
+  "ADR-187 keeps requests with PII in `tool_calls_json` *local* by default — but when the user opts
+  in to masked-cloud mode, does the pseudonymizer actually scrub it?" It did not.
+  `pseudonymize_messages` only applied `replace_in_text` to `m.content`; `tool_calls_json` was
+  cloned unchanged with an incorrect comment ("not user text, so it does not need
+  pseudonymization") — written before ADR-182/183 established these fields can carry PII, and
+  invalidated by ADR-187. Even using `replace_in_text` directly on the raw JSON would have failed:
+  `replace_in_text` is a whitespace tokenizer, and inside compact JSON like
+  `{"email":"alice@example.com"}` there is no whitespace — the email is embedded in a single token
+  surrounded by `{\"email\":\"` and `\"}`; the email detector never fires. A JSON-string-aware
+  walker is necessary. New `replace_in_json_strings`: walks every `"…"` literal, decodes escape
+  sequences, **recursively descends** into strings that start with `{`/`[` (handling the
+  `arguments` field, which is itself JSON-encoded JSON), and applies `replace_in_text` to the
+  innermost decoded string content where values are now whitespace-delimited. Re-encodes with the
+  existing `crate::json::escape_string`. The shared-token property (same PII in `content` and
+  `tool_calls_json` gets the same `<EMAIL_1>` token) follows from sharing a single `Ctx` across the
+  whole message. The restore path (`restore(resp.content, mapping)`) is unchanged: it replaces
+  tokens in the text response, which works regardless of where the tokens were introduced.
+  Zero new dependencies; 5 new tests; 668 total.

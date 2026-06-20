@@ -5,6 +5,26 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Pseudonymizer scrubs PII in tool-call argument JSON (ADR-188)
+
+- When `PASTURE_PSEUDONYMIZE=1` (masked-cloud mode), the pseudonymizer only
+  processed message `content`; `tool_calls_json` was cloned unchanged.  PII in
+  tool-call arguments (e.g. `{"email":"alice@example.com"}` passed to a
+  `send_email` tool) therefore reached the cloud provider unmasked — defeating
+  the whole purpose of pseudonymization.  The old `replace_in_text` whitespace
+  tokenizer could not have fixed this even if applied directly: inside compact
+  JSON there is no whitespace, so the email is embedded in one large token and
+  never matched.
+
+  New `replace_in_json_strings` walks every `"…"` literal in the JSON, decodes
+  escape sequences, **recursively descends** into strings that start with `{`
+  or `[` (handling the `arguments` field, which is itself JSON-encoded JSON),
+  and then applies `replace_in_text` to the innermost decoded values.  The same
+  PII value appearing in both message content and tool-call arguments shares one
+  stable token (single `Ctx`), so `restore()` recovers it from either site.
+  Benign (non-PII) arguments pass through un-modified.  5 new tests.  668
+  tests.  (ADR-188)
+
 ### Fixed — Privacy classifier scans tool-call arguments (ADR-187)
 
 - Sensitivity was decided by `classify(routing_text())`, which joins only

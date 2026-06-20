@@ -32,9 +32,17 @@ pub fn pseudonymize_messages(messages: &[Message]) -> (Vec<Message>, Mapping) {
             role: m.role.clone(),
             content: replace_in_text(&m.content, &mut ctx),
             tool_call_id: m.tool_call_id.clone(),
-            // tool_calls_json is structured tool-call data, not user text, so it
-            // does not need pseudonymization and is carried through unchanged.
-            tool_calls_json: m.tool_calls_json.clone(),
+            // ADR-188: tool_calls_json may carry PII in model-generated arguments
+            // (e.g. {"email":"alice@example.com"} passed to a send_email tool).
+            // The whitespace tokenizer used by replace_in_text cannot find values
+            // inside compact JSON strings, so we use a JSON-string-aware walker
+            // that decodes each "…" value, pseudonymizes the decoded text (or
+            // recursively descends into nested JSON), and re-encodes. The
+            // tool_call_id is server-generated and never carries user PII.
+            tool_calls_json: m
+                .tool_calls_json
+                .as_deref()
+                .map(|tc| replace_in_json_strings(tc, &mut ctx)),
         })
         .collect();
     (result, ctx.mapping)
@@ -192,6 +200,66 @@ fn trim_punct(s: &str) -> &str {
     s.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '<' | '>' | '[' | ']'))
 }
 
+/// Walk every JSON string literal in `json`, decode it, pseudonymize the
+/// decoded content (recursing into nested JSON-encoded strings such as the
+/// tool-call `arguments` field), and re-encode. Non-string characters
+/// (braces, colons, numbers, `true`/`false`/`null`) are passed through
+/// verbatim. Handles `\"` and `\\` escape sequences; unknown escapes are
+/// copied literally.
+///
+/// This lets the pseudonymizer reach PII inside compact JSON like
+/// `{"email":"alice@example.com"}` where the whitespace tokenizer in
+/// `replace_in_text` cannot, because there is no whitespace to split on.
+fn replace_in_json_strings(json: &str, ctx: &mut Ctx) -> String {
+    let chars: Vec<char> = json.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(json.len() + 32);
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] != '"' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Opening quote — scan to the closing unescaped quote, decoding escapes.
+        out.push('"');
+        i += 1;
+        let mut decoded = String::new();
+        while i < len {
+            match chars[i] {
+                '\\' if i + 1 < len => {
+                    let esc = chars[i + 1];
+                    match esc {
+                        '"'  => { decoded.push('"');  i += 2; }
+                        '\\' => { decoded.push('\\'); i += 2; }
+                        'n'  => { decoded.push('\n'); i += 2; }
+                        't'  => { decoded.push('\t'); i += 2; }
+                        'r'  => { decoded.push('\r'); i += 2; }
+                        _    => { decoded.push('\\'); decoded.push(esc); i += 2; }
+                    }
+                }
+                '"' => break,
+                c   => { decoded.push(c); i += 1; }
+            }
+        }
+        // Recurse if the decoded value itself looks like a JSON object/array
+        // (e.g. the `arguments` field stores JSON-encoded JSON).  Otherwise
+        // use the whitespace tokenizer for plain text values.
+        let replaced = if decoded.trim_start().starts_with(['{', '[']) {
+            replace_in_json_strings(&decoded, ctx)
+        } else {
+            replace_in_text(&decoded, ctx)
+        };
+        out.push_str(&crate::json::escape_string(&replaced));
+        if i < len {
+            out.push('"'); // closing quote
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Replace PII in `text` token by token, preserving original whitespace.
 fn replace_in_text(text: &str, ctx: &mut Ctx) -> String {
     let mut out = String::with_capacity(text.len() + 32);
@@ -342,6 +410,108 @@ mod tests {
         let (out, _) = pseudonymize_messages(&msgs);
         assert_eq!(out[0].role, "system");
         assert!(out[0].content.contains("<EMAIL_1>"));
+    }
+
+    // ── ADR-188: tool_calls_json pseudonymization ─────────────────────────────
+
+    fn tool_call_msg(content: &str, tc_json: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            tool_calls_json: Some(tc_json.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_tool_calls_email_in_arguments_pseudonymized() {
+        // ADR-188: an email in a tool-call argument (nested JSON-encoded string)
+        // must be replaced — the whitespace tokenizer alone cannot find it inside
+        // compact `{"email":"alice@example.com"}`.
+        let tc = r#"[{"id":"c1","function":{"name":"send","arguments":"{\"email\":\"alice@example.com\"}"}}]"#;
+        let msgs = vec![tool_call_msg("", tc)];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        assert!(
+            tc_out.contains("<EMAIL_1>"),
+            "email in tool-call arg must be pseudonymized: {tc_out}"
+        );
+        assert!(
+            !tc_out.contains("alice@example.com"),
+            "raw email must not remain in tool_calls_json: {tc_out}"
+        );
+        // mapping must contain the real value for restore().
+        assert!(
+            mapping.iter().any(|(v, _)| v == "alice@example.com"),
+            "mapping must hold the original email for restore: {mapping:?}"
+        );
+    }
+
+    #[test]
+    fn test_tool_calls_ip_in_arguments_pseudonymized() {
+        // IP address in compact JSON arguments must be replaced.
+        let tc = r#"[{"function":{"name":"connect","arguments":"{\"host\":\"192.168.1.100\"}"}}]"#;
+        let msgs = vec![tool_call_msg("", tc)];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        assert!(tc_out.contains("<IP_1>"), "IP must be pseudonymized: {tc_out}");
+        assert!(!tc_out.contains("192.168.1.100"), "raw IP must not remain: {tc_out}");
+    }
+
+    #[test]
+    fn test_tool_calls_token_maps_back_via_restore() {
+        // The token placed in tool_calls_json must survive restore() so the
+        // cloud response that echoes the token can be de-anonymized.
+        let tc = r#"[{"function":{"arguments":"{\"email\":\"alice@example.com\"}"}}]"#;
+        let msgs = vec![tool_call_msg("", tc)];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let cloud_response = format!("sent to {}", out[0].tool_calls_json.as_deref().unwrap());
+        let restored = restore(&cloud_response, &mapping);
+        assert!(
+            restored.contains("alice@example.com"),
+            "restore must recover original from cloud response: {restored}"
+        );
+    }
+
+    #[test]
+    fn test_tool_calls_benign_arguments_unchanged() {
+        // A tool call with no PII must pass through without modification.
+        let tc = r#"[{"function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}}]"#;
+        let msgs = vec![tool_call_msg("", tc)];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        // JSON may be reformatted by re-encode but must not change PII-free values.
+        assert!(!tc_out.contains("<EMAIL"), "no email token for benign args: {tc_out}");
+        assert!(mapping.is_empty(), "no mapping entries for benign args");
+    }
+
+    #[test]
+    fn test_tool_calls_same_email_in_content_and_args_shares_token() {
+        // The same PII value appearing in both message content and a tool-call
+        // argument must share a stable token across the full request (so restore
+        // can use a single mapping entry to fix both).
+        let email = "shared@example.com";
+        let tc = format!(
+            r#"[{{"function":{{"arguments":"{{\"to\":\"{email}\"}}"}}}}"#
+        );
+        let msgs = vec![Message {
+            role: "assistant".to_string(),
+            content: format!("sending to {email}"),
+            tool_calls_json: Some(tc),
+            ..Default::default()
+        }];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        assert!(
+            out[0].content.contains("<EMAIL_1>"),
+            "email in content must be replaced: {}",
+            out[0].content
+        );
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        assert!(
+            tc_out.contains("<EMAIL_1>"),
+            "same email in tool-call arg must use the same token: {tc_out}"
+        );
+        assert_eq!(mapping.len(), 1, "one mapping entry for the shared email");
     }
 
     #[test]
