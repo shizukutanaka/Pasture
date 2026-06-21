@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Access log records real status for rejected streaming requests (ADR-192)
+
+- The streaming branch logged `status:200` to the access log **before** running
+  the stream handler — but that handler can reject with 400 (injection block),
+  429 (budget block), or 502/503 (routing/backend errors) before any SSE byte.
+  Those rejections were all silently logged as 200, hiding them from anyone
+  auditing the access log.  `stream_chat_to_socket` now returns the effective
+  HTTP status and the dispatch loop logs it; a mid-stream disconnect is still
+  logged as 200 (the headers were sent).  Buffered logging unchanged.  2 new
+  tests.  676 tests.  (ADR-192)
+
 ### Fixed — Injection-guard flag mode annotates streaming responses (ADR-191)
 
 - In `flag` mode the buffered path adds `x_pasture_injection_flag:<label>` to the

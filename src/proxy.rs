@@ -2184,8 +2184,17 @@ impl Proxy {
                     Ok(req) if req.stream => {
                         // SSE is a long-lived stream; always close the connection afterwards.
                         let include_usage = Self::parse_include_usage(&body);
-                        access_log!(200u16); // SSE header sent before streaming; log TTFB
-                        self.stream_chat_to_socket(stream, &req, &te(), include_usage)?;
+                        // Log the ACTUAL status (ADR-192): 200 once the stream starts, or the
+                        // rejection status when the guard/router/budget rejects before any SSE
+                        // byte. A mid-stream I/O error (client disconnect after the 200 headers)
+                        // is still logged as 200, matching the bytes already sent.
+                        match self.stream_chat_to_socket(stream, &req, &te(), include_usage) {
+                            Ok(status) => access_log!(status),
+                            Err(e) => {
+                                access_log!(200u16);
+                                return Err(e);
+                            }
+                        }
                         return Ok(());
                     }
                     Ok(req) => wr_result!(self.complete_buffered(&req)),
@@ -2313,13 +2322,18 @@ impl Proxy {
     /// Stream a completion to the socket as Server-Sent Events (IMP-7).
     /// Note: cascade is not applied to streaming requests (the local answer
     /// cannot be un-sent); the routed backend streams directly.
+    ///
+    /// Returns the effective HTTP status (ADR-192): `200` once the SSE stream has
+    /// started, or the rejection status (`400`/`429`/`502`/`503`) when the guard,
+    /// router, or budget rejects the request before any SSE byte — so the access
+    /// log records what the client actually received, not a hardcoded `200`.
     fn stream_chat_to_socket(
         &self,
         sock: &mut std::net::TcpStream,
         req: &CompletionRequest,
         cors: &str,
         include_usage: bool,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<u16> {
         // Injection guard for streaming (IMP-20): block mode can still reject before
         // the stream starts; flag mode surfaces the label to the client on a leading
         // SSE chunk (ADR-191), matching the buffered path's x_pasture_injection_flag.
@@ -2330,13 +2344,14 @@ impl Proxy {
             {
                 if self.injection_guard == "block" {
                     let msg = format!("request blocked by injection guard: {label}");
-                    return write_response(
+                    write_response(
                         sock,
                         400,
                         &build_error_response(&msg, "invalid_request_error"),
                         cors,
                         false,
-                    );
+                    )?;
+                    return Ok(400);
                 }
                 eprintln!("pasture: injection_flag:{label} (flag mode, stream proceeds)");
                 Some(label)
@@ -2355,13 +2370,15 @@ impl Proxy {
         let (decision, sensitive) = match self.classify_and_decide(req) {
             Ok(pair) => pair,
             Err(e) => {
-                return write_response(
+                let s = e.status();
+                write_response(
                     sock,
-                    e.status(),
+                    s,
                     &build_error_response(e.message(), e.kind()),
                     cors,
                     false,
-                );
+                )?;
+                return Ok(s);
             }
         };
         // OTel span (IMP-23): started before the cache checks so a cache hit is
@@ -2386,9 +2403,10 @@ impl Proxy {
             let hit = cache.lock().ok().and_then(|mut g| g.get(key));
             if let Some(hit) = hit {
                 self.emit_cache_hit_span(&mut otel_span, &hit, "cache");
-                return self.write_cached_stream(
+                self.write_cached_stream(
                     sock, cors, &hit, "cache", include_usage, injection_label.as_deref(),
-                );
+                )?;
+                return Ok(200);
             }
         }
         // Semantic cache (IMP-12) + difficulty signal (IMP-14) via the shared
@@ -2398,14 +2416,15 @@ impl Proxy {
         let (decided_route, query_embedding) =
             match self.embedding_step(req, decision.route, sensitive, &mut otel_span) {
                 EmbeddingStep::SemanticHit(hit) => {
-                    return self.write_cached_stream(
+                    self.write_cached_stream(
                         sock,
                         cors,
                         &hit,
                         "semantic_cache",
                         include_usage,
                         injection_label.as_deref(),
-                    );
+                    )?;
+                    return Ok(200);
                 }
                 EmbeddingStep::Proceed { route, embedding } => (route, embedding),
             };
@@ -2415,25 +2434,29 @@ impl Proxy {
         let (route, budget_reserved) = match self.apply_budget_guard(req, decided_route) {
             Ok(r) => r,
             Err(e) => {
-                return write_response(
+                let s = e.status();
+                write_response(
                     sock,
-                    e.status(),
+                    s,
                     &build_error_response(e.message(), e.kind()),
                     cors,
                     false,
-                );
+                )?;
+                return Ok(s);
             }
         };
         let backend = match self.backend_for(route) {
             Ok(b) => b,
             Err(e) => {
-                return write_response(
+                let s = e.status();
+                write_response(
                     sock,
-                    e.status(),
+                    s,
                     &build_error_response(e.message(), e.kind()),
                     cors,
                     false,
-                );
+                )?;
+                return Ok(s);
             }
         };
 
@@ -2629,7 +2652,8 @@ impl Proxy {
         if let Some(e) = io_err {
             return Err(e);
         }
-        sock.write_all(b"data: [DONE]\n\n")
+        sock.write_all(b"data: [DONE]\n\n")?;
+        Ok(200)
     }
 }
 

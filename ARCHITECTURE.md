@@ -1954,3 +1954,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   both paths (rejects before the stream starts); only the advisory annotation was missing. SPEC.md
   §7.2 is now true for both paths with no spec change. Buffered, off, and block behaviour are
   unchanged. Zero new dependencies; 2 new tests; 674 total.
+
+- **ADR-192 Access log records the real HTTP status for rejected streaming requests.**
+  Socratic probe of the access log for buffered/streaming parity, continuing ADR-191's observability
+  lens: "the buffered path logs the actual response status via the `wr!`/`wr_result!` macros, but the
+  streaming branch calls `access_log!(200u16)` *before* `stream_chat_to_socket` runs — is that 200
+  always correct?" No. The streaming handler has four pre-stream rejection paths that write a
+  non-200 status and return: injection-guard block (400), routing error (503/502), budget block
+  (429), and backend-unavailable (502/503). In each, the client received an error but the access log
+  recorded 200 — a silent observability defect hiding guard/budget rejections of streaming clients
+  from anyone auditing the log. The buffered path never had this because its status flows through the
+  `wr!` macros. The fix changes `stream_chat_to_socket` to return `io::Result<u16>` (the effective
+  status): each rejection path returns its real status, cache replays and the normal stream return
+  200, and the dispatch loop logs the returned value. A mid-stream I/O error (client disconnect after
+  the 200 headers) is still logged as 200, matching the bytes already sent. A side benefit: the
+  logged duration for a successful stream is now the full request time, not the near-zero pre-stream
+  time. Buffered logging is unchanged. Zero new dependencies; 2 new tests; 676 total.
