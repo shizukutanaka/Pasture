@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Stats count semantic-cache hits as cache (ADR-195)
+
+- The cost-log summary (`pasture stats`, `GET /v1/stats`, `GET /metrics`)
+  buckets routes into local/cloud/cache, but semantic-cache hits are logged
+  with route `"semantic_cache"` — which had no bucket, so they inflated `total`
+  without landing anywhere.  With the semantic cache (`PASTURE_SEMANTIC_CACHE`)
+  enabled, the invariant `total = local + cloud + cache` broke and `cache_rate`
+  undercounted.  `fold_record` now folds `"semantic_cache"` into the `cache`
+  bucket (a semantic hit is a zero-cost, no-backend cache hit).  Deployments
+  without the semantic cache are unaffected.  1 new test.  680 tests.  (ADR-195)
+
 ### Fixed — Release budget pre-reservation on buffered cloud failure (ADR-194)
 
 - `apply_budget_guard` pre-reserves estimated tokens on the `today_cloud_tokens`

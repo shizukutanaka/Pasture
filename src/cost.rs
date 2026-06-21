@@ -249,7 +249,12 @@ pub fn fold_record(s: &mut CostSummary, r: &LoggedRecord) {
     match r.route.as_str() {
         "local" => s.local += 1,
         "cloud" => s.cloud += 1,
-        "cache" => s.cache += 1,
+        // Both the exact-match ("cache") and semantic ("semantic_cache", ADR-150)
+        // caches serve a request without a backend call at zero cost, so both count
+        // toward the `cache` bucket (ADR-195). Otherwise a semantic-cache hit would
+        // inflate `total` without landing in any bucket, breaking the invariant
+        // total = local + cloud + cache and undercounting `cache_rate`.
+        "cache" | "semantic_cache" => s.cache += 1,
         _ => {}
     }
     s.prompt_tokens += r.prompt_tokens;
@@ -478,6 +483,32 @@ mod tests {
         let s = summarize(&[]);
         assert_eq!(s.total, 0);
         assert_eq!(s.cloud_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_summarize_counts_semantic_cache_as_cache() {
+        // ADR-195: a "semantic_cache" route record must count toward the `cache`
+        // bucket, not vanish into `total` only. Otherwise total != local+cloud+cache
+        // and cache_rate undercounts. One exact + one semantic hit + one cloud.
+        let mk = |route: &str| LoggedRecord {
+            ts_secs: 0,
+            route: route.into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cost_usd: 0.0,
+            logprob: None,
+        };
+        let recs = vec![mk("cache"), mk("semantic_cache"), mk("cloud"), mk("local")];
+        let s = summarize(&recs);
+        assert_eq!(s.total, 4);
+        assert_eq!(s.cache, 2, "exact + semantic hits both count as cache");
+        // Invariant: every record lands in exactly one bucket.
+        assert_eq!(
+            s.local + s.cloud + s.cache,
+            s.total,
+            "total must equal local + cloud + cache"
+        );
+        assert!((s.cache_rate() - 0.5).abs() < 1e-9, "2/4 cache hits");
     }
 
     #[test]

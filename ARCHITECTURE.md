@@ -2006,3 +2006,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   saturates at 0 (ADR-164), and `budget_reserved_outer` is non-zero only when the budget is active
   and the route was cloud, so the change is a no-op in every other case. Zero new dependencies;
   1 new test; 679 total.
+
+- **ADR-195 Cost-log summary counts semantic-cache hits in the cache bucket.**
+  Socratic probe of the cost-log aggregation feeding `stats` / `/v1/stats` / `/metrics`: "`fold_record`
+  increments `total` for every record but buckets only `local`/`cloud`/`cache` — what route labels
+  actually get logged?" The semantic cache returns `route_label="semantic_cache"` (ADR-150) on both
+  the buffered (`run_completion`) and streaming (`write_cached_stream`) paths, and `log_cost` writes
+  `route="semantic_cache"`. But `fold_record` had no arm for it, so it fell through `_ => {}`: a
+  semantic-cache hit incremented `total` without landing in `local`, `cloud`, *or* `cache`. This
+  silently broke the invariant `total = local + cloud + cache` whenever the semantic cache (IMP-12)
+  was enabled and hit, and made `cache_rate = cache/total` undercount true cache effectiveness —
+  understating exactly the feature the user enabled. A semantic-cache hit is a cache hit by every
+  meaningful definition (no backend call, zero cost), so the fix folds `"semantic_cache"` into the
+  `cache` arm. `fold_record` is shared by `summarize` and the incremental metrics cache
+  (IMP-32/ADR-151), so the one-line change corrects every consumer at once. The raw log still keeps
+  the two route labels distinct for anyone wanting the finer split. Zero new dependencies; 1 new
+  test; 680 total.
