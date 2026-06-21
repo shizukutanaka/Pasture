@@ -394,19 +394,33 @@ pub fn looks_like_jwt(token: &str) -> bool {
 /// Detect a credit-card-like number anywhere in the text: a run of digits
 /// (with optional spaces/hyphens) of length 13..=19 that passes the Luhn check.
 pub fn contains_credit_card(text: &str) -> bool {
+    !credit_card_spans(text).is_empty()
+}
+
+/// Byte ranges of Luhn-valid 13–19 digit credit-card numbers, where the number
+/// may contain internal space/hyphen separators. The end of each span is the
+/// byte just after the final digit, so trailing separators are not included.
+/// Shared by `contains_credit_card` (any hit → sensitive) and the pseudonymizer
+/// (mask each span with a `<CARD_n>` token, ADR-196) so card detection has a
+/// single source of truth.
+pub fn credit_card_spans(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
+    let mut spans = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
         if c.is_ascii_digit() {
-            // Consume a maximal digit/sep run.
+            // Consume a maximal digit/sep run, tracking the end of the last digit
+            // so a trailing separator is excluded from the reported span.
             let mut digits: Vec<u8> = Vec::new();
             let mut j = i;
+            let mut last_digit_end = i;
             while j < bytes.len() {
                 let cj = bytes[j];
                 if cj.is_ascii_digit() {
                     digits.push(cj - b'0');
                     j += 1;
+                    last_digit_end = j;
                 } else if cj == b' ' || cj == b'-' {
                     j += 1;
                 } else {
@@ -414,14 +428,14 @@ pub fn contains_credit_card(text: &str) -> bool {
                 }
             }
             if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
-                return true;
+                spans.push((i, last_digit_end));
             }
             i = j;
         } else {
             i += 1;
         }
     }
-    false
+    spans
 }
 
 fn luhn_valid(digits: &[u8]) -> bool {

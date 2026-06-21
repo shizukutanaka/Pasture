@@ -2022,3 +2022,22 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   (IMP-32/ADR-151), so the one-line change corrects every consumer at once. The raw log still keeps
   the two route labels distinct for anyone wanting the finer split. Zero new dependencies; 1 new
   test; 680 total.
+
+- **ADR-196 Pseudonymizer masks Luhn-valid credit-card numbers.**
+  Socratic probe of the pseudonymizer's category coverage versus the classifier's: "`classify()`
+  detects email, ip, credit_card, phone, api_key, jwt, …; the pseudonymizer masks only email, IP,
+  phone, api_key. With `PASTURE_ALLOW_SENSITIVE_CLOUD=1` + `PASTURE_PSEUDONYMIZE=1` — a user
+  explicitly saying *send sensitive content to cloud but mask the PII* — what happens to a credit
+  card?" It reached the cloud **raw**: `process_token` had no card check, and even a naive per-token
+  check would miss the common separator form (`4111 1111 1111 1111`) which spans four whitespace
+  tokens the tokenizer never reassembles. Credit cards are among the highest-stakes PII and the
+  classifier already detects them, so the gap violated the explicit expectation of a user who
+  enabled both flags. The fix extracts the classifier's detection as a shared
+  `privacy::credit_card_spans` (single source of truth; `contains_credit_card` becomes
+  `!spans.is_empty()`, behaviour-preserving) and adds a whole-text `mask_credit_cards` pre-pass to
+  the pseudonymizer that runs before the per-token loop — so both the no-separator and separator
+  forms are masked with stable `<CARD_n>` tokens, in message content and tool-call arguments alike,
+  and round-trip through `restore()`. Non-card numbers, IPs, and phones are not falsely masked
+  (different lengths/separators); a rare 13–15 digit Luhn-valid phone masking as a card is the safe
+  direction. Other unmasked categories (jwt, pem_key, url_credential, env_secret) remain documented
+  best-effort gaps. Zero new dependencies; 3 new tests; 683 total.

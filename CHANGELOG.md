@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Pseudonymizer masks credit-card numbers (ADR-196)
+
+- The pseudonymizer masked email/IP/phone/API-key but **not** credit cards,
+  while the classifier detects them.  With `PASTURE_ALLOW_SENSITIVE_CLOUD=1`
+  + `PASTURE_PSEUDONYMIZE=1` (a user opting to send sensitive content to cloud
+  *with PII masked*), a Luhn-valid credit card reached the cloud raw — including
+  the separator form (`4111 1111 1111 1111`) that spans multiple tokens.  A new
+  whole-text pre-pass masks cards with `<CARD_n>` in message content and
+  tool-call arguments, restored in the response.  Card detection is now shared
+  (`privacy::credit_card_spans`) between the classifier and pseudonymizer.
+  3 new tests.  683 tests.  (ADR-196)
+
 ### Fixed — Stats count semantic-cache hits as cache (ADR-195)
 
 - The cost-log summary (`pasture stats`, `GET /v1/stats`, `GET /metrics`)

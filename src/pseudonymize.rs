@@ -8,9 +8,9 @@
 //! servers.
 //!
 //! **Security caveat:** pseudonymization catches the PII patterns Pasture
-//! already detects (email, IPv4, phone, API-key prefixes). It is NOT a
-//! guarantee that no other sensitive information is sent — use `local_only`
-//! mode for hard guarantees.
+//! already detects (email, IPv4/IPv6, phone, API-key prefixes, and Luhn-valid
+//! credit-card numbers — ADR-196). It is NOT a guarantee that no other
+//! sensitive information is sent — use `local_only` mode for hard guarantees.
 //!
 //! Privacy invariant (I5): the replacement mapping lives only in memory for
 //! the duration of the request and is never logged.
@@ -128,6 +128,7 @@ struct Ctx {
     ip_n: usize,
     phone_n: usize,
     key_n: usize,
+    card_n: usize,
 }
 
 impl Ctx {
@@ -138,6 +139,7 @@ impl Ctx {
             ip_n: 0,
             phone_n: 0,
             key_n: 0,
+            card_n: 0,
         }
     }
 
@@ -150,6 +152,7 @@ impl Ctx {
             "EMAIL" => { self.email_n += 1; self.email_n }
             "IP" => { self.ip_n += 1; self.ip_n }
             "PHONE" => { self.phone_n += 1; self.phone_n }
+            "CARD" => { self.card_n += 1; self.card_n }
             _ => { self.key_n += 1; self.key_n }
         };
         let tok = format!("<{}_{}>", category, n);
@@ -260,8 +263,36 @@ fn replace_in_json_strings(json: &str, ctx: &mut Ctx) -> String {
     out
 }
 
+/// Mask credit-card numbers with `<CARD_n>` tokens (ADR-196). Cards are handled
+/// by a whole-text pre-pass, not the per-token loop, because a card may contain
+/// space/hyphen separators (`4111 1111 1111 1111`) and so span multiple
+/// whitespace tokens that the tokenizer would never reassemble. The classifier
+/// already flags cards as sensitive; this masks them so they do not reach the
+/// cloud raw under `allow_sensitive_cloud` + `pseudonymize`. Stable per value
+/// (the same card reuses one token) via the shared `Ctx`.
+fn mask_credit_cards(text: &str, ctx: &mut Ctx) -> String {
+    let spans = crate::privacy::credit_card_spans(text);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (start, end) in spans {
+        out.push_str(&text[last..start]);
+        let tok = ctx.token_for(&text[start..end], "CARD");
+        out.push_str(&tok);
+        last = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Replace PII in `text` token by token, preserving original whitespace.
 fn replace_in_text(text: &str, ctx: &mut Ctx) -> String {
+    // Card pre-pass first: replaces multi-token card numbers with `<CARD_n>`,
+    // which the per-token loop below then passes through untouched.
+    let masked = mask_credit_cards(text, ctx);
+    let text = masked.as_str();
     let mut out = String::with_capacity(text.len() + 32);
     let bytes = text.as_bytes();
     let len = text.len();
@@ -398,6 +429,57 @@ mod tests {
         let msgs = vec![msg("my key is sk-abcdefghijklmnopqrstuvwxyz123456")];
         let (out, _) = pseudonymize_messages(&msgs);
         assert!(out[0].content.contains("<KEY_1>"), "{}", out[0].content);
+    }
+
+    #[test]
+    fn test_credit_card_is_pseudonymized_and_restored() {
+        // ADR-196: a Luhn-valid card (4111 1111 1111 1111, the standard Visa test
+        // number) must be masked before reaching the cloud and restored after.
+        // No-separator and space-separated forms both mask.
+        for card in ["4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111"] {
+            let msgs = vec![msg(&format!("charge {card} now"))];
+            let (out, mapping) = pseudonymize_messages(&msgs);
+            assert!(
+                out[0].content.contains("<CARD_1>"),
+                "card {card:?} must be masked: {}",
+                out[0].content
+            );
+            assert!(
+                !out[0].content.contains(card),
+                "raw card {card:?} must not remain: {}",
+                out[0].content
+            );
+            // Surrounding words are preserved and the value round-trips on restore.
+            assert!(out[0].content.starts_with("charge "));
+            assert!(out[0].content.ends_with(" now"));
+            let restored = restore(&out[0].content, &mapping);
+            assert!(restored.contains(card), "card must restore: {restored}");
+        }
+    }
+
+    #[test]
+    fn test_non_card_digits_not_masked() {
+        // A short or non-Luhn digit run must not be masked as a card.
+        let msgs = vec![msg("order 12345 and ref 4111111111111112")]; // 2nd fails Luhn
+        let (out, _) = pseudonymize_messages(&msgs);
+        assert!(!out[0].content.contains("<CARD"), "no card token: {}", out[0].content);
+        assert!(out[0].content.contains("12345"), "short number preserved");
+    }
+
+    #[test]
+    fn test_credit_card_in_tool_call_arguments_masked() {
+        // ADR-196 + ADR-188: a card inside tool-call argument JSON is masked too.
+        let tc = r#"[{"function":{"name":"charge","arguments":"{\"card\":\"4111111111111111\"}"}}]"#;
+        let msgs = vec![Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls_json: Some(tc.to_string()),
+            ..Default::default()
+        }];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        assert!(tc_out.contains("<CARD_1>"), "card in tool args must mask: {tc_out}");
+        assert!(!tc_out.contains("4111111111111111"), "raw card must not remain: {tc_out}");
     }
 
     #[test]
