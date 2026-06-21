@@ -1160,6 +1160,29 @@ impl Proxy {
         }
     }
 
+    /// Emit an error OTel span for a request that failed or was rejected *after*
+    /// the span was started (ADR-143/193): mark `status=error`, record the message
+    /// and route, finish, and append. No-op when tracing is off or no span exists.
+    /// Shared by the backend-failure paths and the budget-block / backend-unavailable
+    /// rejection paths so no started span is ever silently dropped.
+    fn emit_error_span(
+        &self,
+        otel_span: &mut Option<crate::telemetry::Span>,
+        route: Route,
+        error: &str,
+    ) {
+        if let (Some(span), Some(log_path)) = (otel_span.as_mut(), self.otel_log.as_deref()) {
+            span.status = "error";
+            span.error_message = Some(error.to_string());
+            span.route = route.as_str();
+            span.system = self.otel_system_for(route);
+            span.finish();
+            if let Err(w) = span.append_to(log_path) {
+                eprintln!("pasture: otel log write failed: {w}");
+            }
+        }
+    }
+
     fn backend_for(&self, route: Route) -> Result<&dyn Backend, ProxyError> {
         match route {
             Route::Local => self.local.as_deref(),
@@ -1461,7 +1484,16 @@ impl Proxy {
         // budget or spike detection is configured. Sensitive content was excluded
         // from cloud routing above (privacy), so this check runs on non-sensitive
         // cloud-bound requests only. Shared with the streaming path.
-        let (planned_route, budget_reserved_outer) = self.apply_budget_guard(req, planned_route)?;
+        let (planned_route, budget_reserved_outer) =
+            match self.apply_budget_guard(req, planned_route) {
+                Ok(v) => v,
+                Err(e) => {
+                    // ADR-193: a budget "block" rejection (429) must emit an error
+                    // span too, not drop the span the `?` shortcut used to discard.
+                    self.emit_error_span(&mut otel_span, planned_route, &e.to_string());
+                    return Err(e);
+                }
+            };
 
         // Pseudonymization (IMP-19): replace PII with opaque tokens before
         // sending to the cloud. Only applied to cloud-bound, non-sensitive
@@ -1503,18 +1535,7 @@ impl Proxy {
             Err(e) => {
                 // ADR-143: emit error span so backend failures are visible in
                 // the trace log, not silently dropped.
-                if let (Some(span), Some(log_path)) =
-                    (otel_span.as_mut(), self.otel_log.as_deref())
-                {
-                    span.status = "error";
-                    span.error_message = Some(e.to_string());
-                    span.route = planned_route.as_str();
-                    span.system = self.otel_system_for(planned_route);
-                    span.finish();
-                    if let Err(w) = span.append_to(log_path) {
-                        eprintln!("pasture: otel log write failed: {w}");
-                    }
-                }
+                self.emit_error_span(&mut otel_span, planned_route, &e.to_string());
                 return Err(e);
             }
         };
@@ -2435,6 +2456,9 @@ impl Proxy {
             Ok(r) => r,
             Err(e) => {
                 let s = e.status();
+                // ADR-193: emit the error span before the early return so a budget
+                // "block" rejection is traced, not silently dropped.
+                self.emit_error_span(&mut otel_span, decided_route, &e.to_string());
                 write_response(
                     sock,
                     s,
@@ -2449,6 +2473,9 @@ impl Proxy {
             Ok(b) => b,
             Err(e) => {
                 let s = e.status();
+                // ADR-193: trace a backend-unavailable rejection too (mirrors the
+                // buffered path, where the completion_result error arm emits a span).
+                self.emit_error_span(&mut otel_span, route, &e.to_string());
                 write_response(
                     sock,
                     s,
@@ -2629,18 +2656,7 @@ impl Proxy {
                 }
                 // ADR-143: emit error span so streaming backend failures are
                 // visible in the trace log rather than silently dropped.
-                if let (Some(span), Some(log_path)) =
-                    (otel_span.as_mut(), self.otel_log.as_deref())
-                {
-                    span.status = "error";
-                    span.error_message = Some(e.to_string());
-                    span.route = route_label;
-                    span.system = self.otel_system_for(route);
-                    span.finish();
-                    if let Err(w) = span.append_to(log_path) {
-                        eprintln!("pasture: otel log write failed: {w}");
-                    }
-                }
+                self.emit_error_span(&mut otel_span, route, &e.to_string());
                 if io_err.is_none() {
                     let err = sse_frame(&build_error_response(&e.to_string(), "upstream_error"));
                     if let Err(e2) = sock.write_all(err.as_bytes()) {

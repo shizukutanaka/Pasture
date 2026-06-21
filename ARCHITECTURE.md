@@ -1970,3 +1970,20 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   the 200 headers) is still logged as 200, matching the bytes already sent. A side benefit: the
   logged duration for a successful stream is now the full request time, not the near-zero pre-stream
   time. Buffered logging is unchanged. Zero new dependencies; 2 new tests; 676 total.
+
+- **ADR-193 OTel error spans for budget-block and backend-unavailable rejections.**
+  Socratic probe continuing ADR-191/192's observability lens: "ADR-143 emits an OTel error span when
+  a backend *fails* — but does a request *rejected* after the span is started also get traced, or is
+  the span silently dropped?" The span is started early (buffered `run_completion`; streaming
+  `stream_chat_to_socket`), but three rejection paths returned without finalising it: the buffered
+  budget block (`apply_budget_guard(...)?` propagated the `BudgetExceeded` error *past* the only
+  error-span block, which sat in the later `completion_result` match), the streaming budget-block
+  early return, and the streaming backend-unavailable early return. Net effect: a 429 budget
+  rejection was invisible in the trace log on both paths and a 502/503 backend-unavailable was
+  invisible on the streaming path — the exact silent-drop ADR-143 set out to prevent, at a different
+  point in the request. New `emit_error_span(&mut otel_span, route, error)` helper centralises the
+  `status=error` + message + route + system + finish + append sequence; the two existing duplicated
+  blocks were refactored onto it, and it is now also called at the three rejection points. A started
+  span is therefore always finalised — error on failure/rejection, normal on success. Default builds
+  (tracing off) are unaffected; the refactored blocks emit byte-identical output. Zero new
+  dependencies; 2 new tests; 678 total.

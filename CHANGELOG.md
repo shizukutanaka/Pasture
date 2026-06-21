@@ -5,6 +5,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — OTel error spans for budget/backend rejections (ADR-193)
+
+- ADR-143 emits an OTel error span when a backend *fails*, but a request
+  *rejected* after the span was started silently dropped the span: the buffered
+  budget block (the `?` shortcut bypassed the error-span block), the streaming
+  budget block, and the streaming backend-unavailable early return.  A 429
+  budget rejection was invisible in the trace log on both paths, and a 502/503
+  backend-unavailable was invisible on the streaming path.  A new
+  `emit_error_span` helper (which also de-duplicates the two existing blocks)
+  now finalises a started span at every rejection/failure point.  2 new tests.
+  678 tests.  (ADR-193)
+
 ### Fixed — Access log records real status for rejected streaming requests (ADR-192)
 
 - The streaming branch logged `status:200` to the access log **before** running

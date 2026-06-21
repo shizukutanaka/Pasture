@@ -4402,6 +4402,59 @@ fn test_streaming_error_emits_otel_error_span() {
 }
 
 #[test]
+fn test_buffered_budget_block_emits_otel_error_span() {
+    // ADR-193: a budget "block" rejection (429) must emit an OTel error span too,
+    // not silently drop the span the `?` shortcut used to discard before the
+    // backend-failure error arm.
+    let cost_log = tmp_log();
+    let otel = tmp_log();
+    let p = proxy_with(true, true, 5, &cost_log)
+        .with_budget(1, "block", 0, "/dev/null")
+        .with_otel_log(Some(otel.clone()));
+    p.today_cloud_tokens.store(100, Ordering::Relaxed); // over the budget of 1
+    let body = r#"{"model":"cloud","messages":[{"role":"user","content":"hi"}]}"#;
+    let err = p.handle_chat(body);
+    assert!(
+        matches!(err, Err(ProxyError::BudgetExceeded(_))),
+        "budget block must reject: {err:?}"
+    );
+    let content = std::fs::read_to_string(&otel).unwrap_or_default();
+    assert!(
+        content.contains("\"status\":\"error\""),
+        "budget block must emit an error span: {content:?}"
+    );
+    assert!(
+        content.contains("\"pasture.error\""),
+        "error span must carry pasture.error: {content:?}"
+    );
+    let _ = std::fs::remove_file(&cost_log);
+    let _ = std::fs::remove_file(&otel);
+}
+
+#[test]
+fn test_streaming_budget_block_emits_otel_error_span() {
+    // ADR-193: the streaming budget-block early return must emit an error span
+    // (it previously dropped the started span). Also cross-checks ADR-192: the
+    // access/HTTP status is 429, not 200.
+    let cost_log = tmp_log();
+    let otel = tmp_log();
+    let p = proxy_with(true, true, 5, &cost_log)
+        .with_budget(1, "block", 0, "/dev/null")
+        .with_otel_log(Some(otel.clone()));
+    p.today_cloud_tokens.store(100, Ordering::Relaxed);
+    let body = r#"{"model":"cloud","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, _sse) = roundtrip(p, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 429, "streaming budget block returns 429 (ADR-192)");
+    let content = std::fs::read_to_string(&otel).unwrap_or_default();
+    assert!(
+        content.contains("\"status\":\"error\""),
+        "streaming budget block must emit an error span: {content:?}"
+    );
+    let _ = std::fs::remove_file(&cost_log);
+    let _ = std::fs::remove_file(&otel);
+}
+
+#[test]
 fn test_finish_reason_for_stop_when_no_tool_calls() {
     // ADR-181: plain completion → "stop"
     let resp = CompletionResponse { content: "hi".into(), model: "m".into(), prompt_tokens: 1, completion_tokens: 1, tool_calls: None };
