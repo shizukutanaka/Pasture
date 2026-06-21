@@ -3405,6 +3405,34 @@ fn test_budget_exceeded_block_returns_429() {
 }
 
 #[test]
+fn test_buffered_cloud_failure_releases_budget_reservation() {
+    // ADR-194: when a cloud completion fails entirely (no local fallback), the
+    // pre-reservation made by apply_budget_guard must be released — otherwise the
+    // today_cloud_tokens gauge is permanently inflated by a phantom reservation
+    // for a request that never completed. The buffered error arm previously
+    // returned without rolling back (the streaming path already released, ADR-163).
+    let cost_log = tmp_log();
+    let engine = RoutingEngine::new(0, false, true); // threshold 0 → cloud; no local backend
+    let p = Proxy::new(
+        engine,
+        None,
+        Some(Box::new(AlwaysFailBackend) as Box<dyn Backend>),
+        &cost_log,
+    )
+    .with_budget(1_000_000, "warn", 0, "/dev/null"); // budget active but not exceeded
+    p.today_cloud_tokens.store(0, Ordering::Relaxed);
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let err = p.handle_chat(body);
+    assert!(err.is_err(), "cloud failure with no local fallback must error");
+    let after = p.today_cloud_tokens.load(Ordering::Relaxed);
+    assert_eq!(
+        after, 0,
+        "budget reservation must be released on cloud failure, gauge left at {after}"
+    );
+    let _ = std::fs::remove_file(&cost_log);
+}
+
+#[test]
 fn test_budget_not_exceeded_allows_cloud() {
     // Plenty of budget remaining → cloud request should go through normally.
     let log = tmp_log();

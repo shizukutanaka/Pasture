@@ -1533,6 +1533,13 @@ impl Proxy {
         let (mut resp, route, logprob, cascade_reserved) = match completion_result {
             Ok(v) => v,
             Err(e) => {
+                // ADR-194: release the budget pre-reservation — the cloud completion
+                // failed with no fallback, so the tokens apply_budget_guard reserved
+                // must not stay on the daily gauge (mirrors the streaming path's
+                // rollback, ADR-163; release saturates at 0 per ADR-164).
+                if budget_reserved_outer > 0 {
+                    self.release_cloud_tokens(budget_reserved_outer);
+                }
                 // ADR-143: emit error span so backend failures are visible in
                 // the trace log, not silently dropped.
                 self.emit_error_span(&mut otel_span, planned_route, &e.to_string());
@@ -2473,6 +2480,12 @@ impl Proxy {
             Ok(b) => b,
             Err(e) => {
                 let s = e.status();
+                // ADR-194: release any budget pre-reservation before the early return
+                // (invariant: every return after apply_budget_guard reserved tokens
+                // must roll them back, ADR-163/164).
+                if budget_reserved > 0 {
+                    self.release_cloud_tokens(budget_reserved);
+                }
                 // ADR-193: trace a backend-unavailable rejection too (mirrors the
                 // buffered path, where the completion_result error arm emits a span).
                 self.emit_error_span(&mut otel_span, route, &e.to_string());

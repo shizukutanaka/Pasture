@@ -5,6 +5,19 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Release budget pre-reservation on buffered cloud failure (ADR-194)
+
+- `apply_budget_guard` pre-reserves estimated tokens on the `today_cloud_tokens`
+  gauge (ADR-163).  The buffered path released that reservation on success and
+  on fallback-to-local, but **not** when a cloud completion failed entirely
+  (cloud + fallback both fail, no local) — the error arm returned without rolling
+  back, so the phantom reservation stayed on the gauge.  Over repeated transient
+  cloud failures the gauge drifts up and can eventually self-block the cloud
+  route for the rest of the UTC day.  The buffered error arm now releases the
+  reservation (the streaming path already did); the streaming backend-unavailable
+  early return was hardened with the same release.  1 new test.  679 tests.
+  (ADR-194)
+
 ### Fixed — OTel error spans for budget/backend rejections (ADR-193)
 
 - ADR-143 emits an OTel error span when a backend *fails*, but a request

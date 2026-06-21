@@ -1987,3 +1987,22 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   span is therefore always finalised — error on failure/rejection, normal on success. Default builds
   (tracing off) are unaffected; the refactored blocks emit byte-identical output. Zero new
   dependencies; 2 new tests; 678 total.
+
+- **ADR-194 Release the budget pre-reservation when a buffered cloud completion fails.**
+  Socratic probe continuing the rejection-path consistency lens (ADR-192/193): "`apply_budget_guard`
+  pre-reserves estimated tokens on the `today_cloud_tokens` gauge (ADR-163); the success path
+  reconciles via `log_cost` and the fallback-to-local path releases in `log_cost` — but what happens
+  to the reservation when the cloud completion fails *entirely* (cloud + fallback both fail, no
+  local)?" The buffered `run_completion` error arm (the same arm ADR-143/193 use to emit the error
+  span) returned `Err` *without* releasing `budget_reserved_outer`, so the estimated tokens of a
+  request that never completed stayed on the daily gauge permanently. Over repeated transient cloud
+  failures the gauge drifts upward and eventually blocks the cloud route for the rest of the UTC day
+  — a self-inflicted denial of the cloud backend. The streaming path already released on backend
+  failure (ADR-163), so this was a buffered/streaming asymmetry as well as a real leak; confirmed by
+  temporarily disabling the fix (gauge left at 17 instead of 0). The fix adds
+  `release_cloud_tokens(budget_reserved_outer)` to the buffered error arm and, defensively, the same
+  release to the streaming backend-unavailable early return added in ADR-193 — upholding the
+  invariant that every early return after a reservation rolls it back. `release_cloud_tokens`
+  saturates at 0 (ADR-164), and `budget_reserved_outer` is non-zero only when the budget is active
+  and the route was cloud, so the change is a no-op in every other case. Zero new dependencies;
+  1 new test; 679 total.
