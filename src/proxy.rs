@@ -1056,6 +1056,7 @@ impl Proxy {
         hit: &CompletionResponse,
         route_label: &'static str,
         include_usage: bool,
+        injection_label: Option<&str>,
     ) -> std::io::Result<()> {
         write_sse_headers(sock, cors)?;
         let id = next_completion_id();
@@ -1064,6 +1065,14 @@ impl Proxy {
         // Capture once so every chunk in this stream shares the same created
         // timestamp, matching the OpenAI contract (ADR-170).
         let created = unix_now();
+        // Surface the injection-guard flag first (ADR-191), even for a cache hit,
+        // so streaming flag-mode matches the buffered path's annotation.
+        if let Some(label) = injection_label {
+            let frame = sse_frame(&build_openai_injection_chunk(
+                &id, &model, &fp, route_label, label, created,
+            ));
+            sock.write_all(frame.as_bytes())?;
+        }
         if !hit.content.is_empty() {
             let frame =
                 sse_frame(&build_openai_chunk(&id, &model, &fp, &hit.content, route_label, None, created));
@@ -2312,8 +2321,9 @@ impl Proxy {
         include_usage: bool,
     ) -> std::io::Result<()> {
         // Injection guard for streaming (IMP-20): block mode can still reject before
-        // the stream starts; flag mode logs but cannot annotate mid-stream chunks.
-        if self.injection_guard != "off" {
+        // the stream starts; flag mode surfaces the label to the client on a leading
+        // SSE chunk (ADR-191), matching the buffered path's x_pasture_injection_flag.
+        let injection_label: Option<String> = if self.injection_guard != "off" {
             let text = req.routing_text();
             if let crate::guard::InjectionRisk::Flag(label) =
                 crate::guard::classify_injection(&text)
@@ -2329,8 +2339,13 @@ impl Proxy {
                     );
                 }
                 eprintln!("pasture: injection_flag:{label} (flag mode, stream proceeds)");
+                Some(label)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         // Apply the configured prompt framing (system prompt, then date/OS context)
         // so a stream:true request behaves like a buffered one (ADR-149). Done after
         // the injection guard (which scans the original request, as the buffered
@@ -2371,7 +2386,9 @@ impl Proxy {
             let hit = cache.lock().ok().and_then(|mut g| g.get(key));
             if let Some(hit) = hit {
                 self.emit_cache_hit_span(&mut otel_span, &hit, "cache");
-                return self.write_cached_stream(sock, cors, &hit, "cache", include_usage);
+                return self.write_cached_stream(
+                    sock, cors, &hit, "cache", include_usage, injection_label.as_deref(),
+                );
             }
         }
         // Semantic cache (IMP-12) + difficulty signal (IMP-14) via the shared
@@ -2387,6 +2404,7 @@ impl Proxy {
                         &hit,
                         "semantic_cache",
                         include_usage,
+                        injection_label.as_deref(),
                     );
                 }
                 EmbeddingStep::Proceed { route, embedding } => (route, embedding),
@@ -2462,6 +2480,16 @@ impl Proxy {
         // `otel_span` was started above (before the cache checks); it is filled with
         // system/route/usage and appended on success below.
         let mut io_err: Option<std::io::Error> = None;
+        // Surface the injection-guard flag on a leading chunk (ADR-191), matching the
+        // buffered path's x_pasture_injection_flag and the cached-stream path above.
+        if let Some(label) = injection_label.as_deref() {
+            let frame = sse_frame(&build_openai_injection_chunk(
+                &id, &model, &fp, route_label, label, created,
+            ));
+            if let Err(e) = sock.write_all(frame.as_bytes()) {
+                io_err = Some(e);
+            }
+        }
         let resp = backend.stream_complete(req, &mut |delta| {
             if io_err.is_some() {
                 return;
@@ -3098,6 +3126,26 @@ pub fn build_openai_chunk(
     format!(
         "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"choices\":[{{\"index\":0,\"delta\":{delta_field},\"logprobs\":null,\"finish_reason\":{finish_field}}}]}}",
         escape_string(model)
+    )
+}
+
+/// Build a leading streaming chunk that surfaces the injection-guard label to the
+/// client in flag mode (ADR-191), mirroring the buffered response's top-level
+/// `x_pasture_injection_flag`. Empty delta, `finish_reason:null`; the content
+/// chunks follow. Emitted once, as the first data frame after the SSE headers, so
+/// a streaming client can detect a flagged request exactly like a buffered one.
+pub fn build_openai_injection_chunk(
+    id: &str,
+    model: &str,
+    fingerprint: &str,
+    route_label: &str,
+    label: &str,
+    created: u64,
+) -> String {
+    format!(
+        "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{}\",\"system_fingerprint\":\"{fingerprint}\",\"x_pasture_route\":\"{route_label}\",\"x_pasture_injection_flag\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"logprobs\":null,\"finish_reason\":null}}]}}",
+        escape_string(model),
+        escape_string(label)
     )
 }
 

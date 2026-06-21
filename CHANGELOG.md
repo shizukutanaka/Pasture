@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Injection-guard flag mode annotates streaming responses (ADR-191)
+
+- In `flag` mode the buffered path adds `x_pasture_injection_flag:<label>` to the
+  response, but the streaming path only logged to stderr — so a streaming client
+  could not tell a flagged request from a clean one (and it contradicted SPEC
+  §7.2).  Streaming flag mode now emits a leading SSE chunk carrying the flag (a
+  top-level field beside the existing `x_pasture_route`), on the backend-stream,
+  exact-cache, and semantic-cache paths.  `block` mode was already correct in
+  both paths.  Buffered/off/block behaviour unchanged.  2 new tests.  674 tests.
+  (ADR-191)
+
 ### Docs + Tests — SPEC.md brought current; drift-guard test (ADR-190)
 
 - `SPEC.md` had drifted well behind the implementation: it omitted **21**

@@ -1936,3 +1936,21 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   budget/spike, §7.2 injection guard, §9.1 OTel, §12 tool-calling (ADR-177…189), §13
   pseudonymization, and a refreshed §14 conformance. Std-only (reads `config.rs` via `include_str!`,
   SPEC.md via `CARGO_MANIFEST_DIR`); zero runtime cost; zero new deps; 2 new tests; 672 total.
+
+- **ADR-191 Injection-guard flag mode annotates the streaming response, not just buffered.**
+  Socratic probe of the injection guard (IMP-20) for buffered/streaming parity — the same asymmetry
+  class the project has repeatedly closed (ADR-147 cache, ADR-149 framing, ADR-189 tool_calls
+  restore): "the buffered path annotates a flagged request with `x_pasture_injection_flag` in the
+  response JSON, and SPEC.md §7.2 says flag mode annotates the response — does the streaming path do
+  the same?" It did not. The streaming guard only did `eprintln!`, and a code comment claimed it
+  "cannot annotate mid-stream chunks" — but streaming chunks already carry a non-standard top-level
+  `x_pasture_route` field, so an `x_pasture_injection_flag` field is equally feasible. A streaming
+  client in flag mode therefore could not distinguish a flagged request from a clean one, while a
+  buffered client could — a silent divergence and a mismatch with the spec written in ADR-190.
+  New `build_openai_injection_chunk()` emits a leading empty-delta chunk carrying the flag; the
+  streaming guard captures the label into `injection_label: Option<String>` and emits it as the first
+  SSE data frame on all three emission paths (backend stream, exact cache, semantic cache —
+  `write_cached_stream` gained an `injection_label` parameter). `block` mode was already correct in
+  both paths (rejects before the stream starts); only the advisory annotation was missing. SPEC.md
+  §7.2 is now true for both paths with no spec change. Buffered, off, and block behaviour are
+  unchanged. Zero new dependencies; 2 new tests; 674 total.
