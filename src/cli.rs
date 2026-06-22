@@ -83,6 +83,122 @@ pub fn route_decision_text(engine: &RoutingEngine, text: &str, forced: Option<Ro
     }
 }
 
+/// Rich routing preview for `pasture route <text>` (ADR-201).
+///
+/// Mirrors the fields returned by HTTP `POST /v1/route` so CLI and HTTP are in
+/// parity. Budget/spike state is derived from the cost log (best-effort; the
+/// live proxy uses in-memory atomics seeded from the same log at startup).
+///
+/// Parameters:
+/// - `today_tokens`: cloud tokens recorded today (from `cost::today_cloud_tokens`).
+/// - `cloud_count`:  cloud requests logged today (spike avg denominator).
+/// - `cloud_sum`:    total tokens on those cloud requests (spike avg numerator).
+pub fn route_preview_text(
+    engine: &RoutingEngine,
+    config: &Config,
+    text: &str,
+    forced: Option<Route>,
+    today_tokens: u64,
+    cloud_count: u64,
+    cloud_sum: u64,
+) -> String {
+    let report = crate::privacy::classify(text);
+    let decision = match engine.decide_with_sensitivity(text, forced, report.is_sensitive()) {
+        Ok(d) => d,
+        Err(e) => return format!("error: {e}"),
+    };
+
+    let est_input = crate::routing::estimate_tokens(text) as u64;
+    let est_total = crate::routing::estimate_total_tokens(text, None) as u64;
+    let est_output = est_total.saturating_sub(est_input);
+
+    let (in_price, out_price) = config.cloud_price_per_1m;
+    let cost_usd = if decision.route == Route::Cloud {
+        (est_input as f64 * in_price + est_output as f64 * out_price) / 1_000_000.0
+    } else {
+        0.0
+    };
+
+    // Read-only budget/spike check — same logic as Proxy::budget_spike_preview,
+    // but driven by cost-log data rather than in-memory atomics.
+    let budget_note: Option<String> = if decision.route == Route::Cloud {
+        let spike_hit = config.spike_factor > 0
+            && cloud_count > 0
+            && est_total > 0
+            && {
+                let avg = cloud_sum / cloud_count;
+                avg > 0 && est_total > config.spike_factor.saturating_mul(avg)
+            };
+        let budget_hit =
+            config.budget_daily_tokens > 0 && today_tokens >= config.budget_daily_tokens;
+
+        if spike_hit || budget_hit {
+            let reason = if spike_hit {
+                let avg = cloud_sum / cloud_count;
+                format!(
+                    "spike: {est_total} predicted > {}×avg {avg}",
+                    config.spike_factor
+                )
+            } else {
+                format!(
+                    "daily budget: {today_tokens}/{} tokens used",
+                    config.budget_daily_tokens
+                )
+            };
+            let action = match config.budget_action.as_str() {
+                "block" => "would be blocked (429)",
+                "warn" => "proceeds with warning",
+                _ => "would redirect to local",
+            };
+            Some(format!("{action} — {reason}"))
+        } else if config.budget_daily_tokens > 0 {
+            Some(format!(
+                "within budget ({today_tokens}/{} tokens used today)",
+                config.budget_daily_tokens
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut out = String::new();
+    if report.is_sensitive() {
+        out.push_str(&format!("sensitive: yes [{}]\n", report.categories.join(", ")));
+    } else {
+        out.push_str("sensitive: no\n");
+    }
+    out.push_str(&format!("route:     {}\n", decision.route.as_str()));
+    out.push_str(&format!("reason:    {}\n", decision.reason));
+    out.push_str(&format!("threshold: {} tokens\n", engine.threshold()));
+    out.push_str(&format!(
+        "estimated: {est_input} in, ~{est_total} predicted total\n"
+    ));
+    if decision.route == Route::Cloud {
+        if in_price > 0.0 || out_price > 0.0 {
+            out.push_str(&format!(
+                "cost:      ${cost_usd:.6} (${in_price:.2}/${out_price:.2} per 1M in/out)\n"
+            ));
+        } else {
+            out.push_str("cost:      (no price configured — set PASTURE_CLOUD_PRICE_PER_1M)\n");
+        }
+    } else {
+        out.push_str("cost:      $0.000000 (local — no charge)\n");
+    }
+    match &budget_note {
+        Some(note) => out.push_str(&format!("budget:    {note}\n")),
+        None if config.budget_daily_tokens == 0 && decision.route == Route::Cloud => {
+            out.push_str("budget:    not configured\n");
+        }
+        None => {}
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Format the hardware profile for display (testable).
 pub fn hardware_text(p: &HardwareProfile) -> String {
     let gpu = match &p.gpu {
@@ -173,32 +289,57 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// `pasture route <text>`: dry-run the routing decision for a prompt,
-/// showing sensitivity, chosen route, reason, and the active threshold.
+/// `pasture route <text>`: dry-run the routing decision for a prompt.
+///
+/// Shows sensitivity, route, reason, threshold, token estimates, cost, and
+/// budget status — matching the fields returned by HTTP `POST /v1/route`
+/// (ADR-201: CLI/HTTP parity).
 fn run_route(config: &Config, rest: &[String]) -> i32 {
     let pos = positional(rest);
     let Some(text) = pos.first() else {
         eprintln!("usage: pasture route <text> [--local|--cloud]");
         return 2;
     };
-    // Dry-run shows the full rule logic, assuming both backends present.
+    // Dry-run assumes both backends present (same as before).
     let profile = HardwareProfile::detect();
     let engine = make_engine(&profile, config, true);
-    let report = crate::privacy::classify(text);
-    if report.is_sensitive() {
-        println!("sensitive: yes [{}]", report.categories.join(", "));
-    } else {
-        println!("sensitive: no");
-    }
-    match engine.decide_with_sensitivity(text, parse_route_flag(rest), report.is_sensitive()) {
-        Ok(d) => println!(
-            "route: {}\nreason: {}\nthreshold: {} tokens",
-            d.route.as_str(),
-            d.reason,
-            engine.threshold()
-        ),
-        Err(e) => println!("error: {e}"),
-    }
+
+    // Derive budget/spike state from the cost log (best-effort; live proxy uses
+    // in-memory atomics seeded from the same source at startup).
+    let today = crate::cost::today_start_secs();
+    let (today_tokens, cloud_count, cloud_sum) =
+        match crate::cost::read_log(&config.cost_log_path) {
+            Ok(records) => {
+                let today_recs: Vec<_> = records
+                    .iter()
+                    .filter(|r| r.ts_secs >= today && r.route == "cloud")
+                    .collect();
+                let today_tokens: u64 = today_recs
+                    .iter()
+                    .map(|r| r.prompt_tokens + r.completion_tokens)
+                    .sum();
+                let cloud_count = today_recs.len() as u64;
+                let cloud_sum: u64 = today_recs
+                    .iter()
+                    .map(|r| r.prompt_tokens + r.completion_tokens)
+                    .sum();
+                (today_tokens, cloud_count, cloud_sum)
+            }
+            Err(_) => (0, 0, 0),
+        };
+
+    println!(
+        "{}",
+        route_preview_text(
+            &engine,
+            config,
+            text,
+            parse_route_flag(rest),
+            today_tokens,
+            cloud_count,
+            cloud_sum,
+        )
+    );
     0
 }
 
@@ -1623,5 +1764,127 @@ mod tests {
         use crate::i18n::Lang;
         let txt = connect_text(Lang::Ja, "cursor", "http://x/v1").unwrap();
         assert!(txt.contains("http://x/v1"));
+    }
+
+    // --- route_preview_text tests (ADR-201) ---
+
+    fn preview_engine() -> RoutingEngine {
+        RoutingEngine::new(300, true, true)
+    }
+
+    fn base_config() -> Config {
+        Config::default()
+    }
+
+    #[test]
+    fn test_route_preview_local_shows_token_estimate() {
+        let engine = preview_engine();
+        let cfg = base_config();
+        // Short text → local; must show token estimate and $0 cost line.
+        let out = route_preview_text(&engine, &cfg, "hi", None, 0, 0, 0);
+        assert!(out.contains("route:     local"), "{out}");
+        assert!(out.contains("estimated:"), "{out}");
+        assert!(out.contains("cost:      $0.000000 (local"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_cloud_shows_no_price_hint() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.cloud_price_per_1m = (0.0, 0.0);
+        // Force cloud so we see the cost line regardless of text length.
+        let out = route_preview_text(&engine, &cfg, "hi", Some(Route::Cloud), 0, 0, 0);
+        assert!(out.contains("route:     cloud"), "{out}");
+        assert!(out.contains("no price configured"), "{out}");
+        assert!(out.contains("budget:    not configured"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_cloud_with_price() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.cloud_price_per_1m = (1.0, 5.0);
+        let out = route_preview_text(&engine, &cfg, "hi", Some(Route::Cloud), 0, 0, 0);
+        assert!(out.contains("cost:      $"), "{out}");
+        assert!(out.contains("$1.00/$5.00 per 1M"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_budget_within() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.budget_daily_tokens = 10_000;
+        cfg.budget_action = "block".to_string();
+        let out = route_preview_text(&engine, &cfg, "hi", Some(Route::Cloud), 500, 2, 1000);
+        assert!(out.contains("within budget"), "{out}");
+        assert!(out.contains("500/10000"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_budget_exceeded_block() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.budget_daily_tokens = 1_000;
+        cfg.budget_action = "block".to_string();
+        // today_tokens already at limit
+        let out = route_preview_text(&engine, &cfg, "hi", Some(Route::Cloud), 1_000, 1, 1000);
+        assert!(out.contains("would be blocked"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_budget_exceeded_redirect() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.budget_daily_tokens = 1_000;
+        cfg.budget_action = "local-only".to_string();
+        let out = route_preview_text(&engine, &cfg, "hi", Some(Route::Cloud), 1_200, 1, 1200);
+        assert!(out.contains("would redirect to local"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_spike_detected() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.spike_factor = 5;
+        cfg.budget_action = "local-only".to_string();
+        // avg = 100 tokens; spike_factor=5 → threshold 500.  Predicted total for
+        // a 800-token text is ~1200 (> 500) → spike.
+        let long_text = "word ".repeat(800);
+        let out = route_preview_text(
+            &engine,
+            &cfg,
+            &long_text,
+            Some(Route::Cloud),
+            0,
+            10,   // cloud_count
+            1000, // cloud_sum → avg = 100
+        );
+        assert!(out.contains("spike:"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_sensitive_shown() {
+        let engine = preview_engine();
+        let cfg = base_config();
+        let out = route_preview_text(
+            &engine,
+            &cfg,
+            "my password is hunter2",
+            None,
+            0,
+            0,
+            0,
+        );
+        assert!(out.contains("sensitive: yes"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_no_budget_line_for_local() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        // Even with budget configured, a local route should not print a budget line.
+        cfg.budget_daily_tokens = 5_000;
+        let out = route_preview_text(&engine, &cfg, "hi", Some(Route::Local), 0, 0, 0);
+        assert!(!out.contains("budget:"), "{out}");
     }
 }
