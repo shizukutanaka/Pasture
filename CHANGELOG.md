@@ -5,6 +5,16 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Fixed — Pseudonymizer masks JWT bearer tokens (ADR-197)
+
+- Continuing ADR-196: the pseudonymizer also ignored JWTs (`eyJ…`), which the
+  classifier detects.  Under `PASTURE_ALLOW_SENSITIVE_CLOUD=1` +
+  `PASTURE_PSEUDONYMIZE=1` a JWT — an auth credential — reached the cloud raw.
+  A JWT is a single token, so it now masks as `<JWT_n>` in `process_token`
+  (like an API key), in message content and tool-call arguments, restored in
+  the response.  `pem_key`/`url_credential`/`env_secret` remain documented
+  best-effort gaps.  2 new tests.  685 tests.  (ADR-197)
+
 ### Fixed — Pseudonymizer masks credit-card numbers (ADR-196)
 
 - The pseudonymizer masked email/IP/phone/API-key but **not** credit cards,

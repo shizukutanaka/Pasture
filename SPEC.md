@@ -418,7 +418,8 @@ Pasture proxies the full OpenAI tool-calling loop across both providers, end to 
 When `PASTURE_PSEUDONYMIZE=1`, **cloud-bound** requests have detected PII replaced with
 stable opaque tokens before they leave the machine, and the cloud response has the
 tokens restored to the original values. Categories: `<EMAIL_n>`, `<IP_n>` (v4+v6),
-`<PHONE_n>`, `<KEY_n>`, `<CARD_n>` (Luhn-valid credit cards, ADR-196). Coverage:
+`<PHONE_n>`, `<KEY_n>`, `<CARD_n>` (Luhn-valid credit cards, ADR-196),
+`<JWT_n>` (ADR-197). Coverage:
 
 - **Message content** — tokenised and restored (buffered + SSE, the latter handling a
   token split across deltas, ADR-168).

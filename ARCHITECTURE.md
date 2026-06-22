@@ -2041,3 +2041,17 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   (different lengths/separators); a rare 13–15 digit Luhn-valid phone masking as a card is the safe
   direction. Other unmasked categories (jwt, pem_key, url_credential, env_secret) remain documented
   best-effort gaps. Zero new dependencies; 3 new tests; 683 total.
+
+- **ADR-197 Pseudonymizer masks JWT bearer tokens.**
+  Direct continuation of ADR-196's classifier-vs-pseudonymizer coverage probe: after credit cards,
+  the next category the classifier detects (jwt, ADR-148) but the pseudonymizer ignored is the JWT
+  bearer token — among the highest-value secrets, since it *is* an auth credential. Under
+  `PASTURE_ALLOW_SENSITIVE_CLOUD=1` + `PASTURE_PSEUDONYMIZE=1` a JWT in a prompt or tool-call
+  argument reached the cloud raw. Unlike credit cards (which can span whitespace and needed the
+  whole-text pre-pass of ADR-196), a JWT is a single whitespace-delimited token, so it slots into
+  `process_token` exactly like an API key — the minimal clean fix. Ordering is safe: the JWT check
+  sits after `api_key` and the two cannot collide (an API key requires a vendor prefix; a JWT's `eyJ`
+  prefix is not one). `looks_like_jwt` is strict (eyJ prefix, three base64url segments, len ≥ 20),
+  so false positives are very unlikely and would over-mask (the safe direction). The remaining
+  unmasked classifier categories (pem_key, url_credential, env_secret) are span/multi-line-based and
+  remain documented best-effort gaps for a later pass. Zero new dependencies; 2 new tests; 685 total.

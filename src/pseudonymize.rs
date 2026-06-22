@@ -8,9 +8,10 @@
 //! servers.
 //!
 //! **Security caveat:** pseudonymization catches the PII patterns Pasture
-//! already detects (email, IPv4/IPv6, phone, API-key prefixes, and Luhn-valid
-//! credit-card numbers — ADR-196). It is NOT a guarantee that no other
-//! sensitive information is sent — use `local_only` mode for hard guarantees.
+//! already detects (email, IPv4/IPv6, phone, API-key prefixes, Luhn-valid
+//! credit-card numbers — ADR-196, and JWTs — ADR-197). It is NOT a guarantee
+//! that no other sensitive information is sent — use `local_only` mode for hard
+//! guarantees.
 //!
 //! Privacy invariant (I5): the replacement mapping lives only in memory for
 //! the duration of the request and is never logged.
@@ -129,6 +130,7 @@ struct Ctx {
     phone_n: usize,
     key_n: usize,
     card_n: usize,
+    jwt_n: usize,
 }
 
 impl Ctx {
@@ -140,6 +142,7 @@ impl Ctx {
             phone_n: 0,
             key_n: 0,
             card_n: 0,
+            jwt_n: 0,
         }
     }
 
@@ -153,6 +156,7 @@ impl Ctx {
             "IP" => { self.ip_n += 1; self.ip_n }
             "PHONE" => { self.phone_n += 1; self.phone_n }
             "CARD" => { self.card_n += 1; self.card_n }
+            "JWT" => { self.jwt_n += 1; self.jwt_n }
             _ => { self.key_n += 1; self.key_n }
         };
         let tok = format!("<{}_{}>", category, n);
@@ -191,6 +195,15 @@ impl Ctx {
         }
         if privacy::looks_like_api_key(inner) {
             let tok = self.token_for(inner, "KEY");
+            return Some(format!("{prefix}{tok}{suffix}"));
+        }
+        if privacy::looks_like_jwt(inner) {
+            // A JWT (`eyJ…`) is a bearer secret the classifier flags (ADR-148);
+            // mask it so it does not reach the cloud raw under allow_sensitive_cloud
+            // + pseudonymize (ADR-197). Single token, so the per-token loop handles
+            // it like an API key. Checked after api_key (no prefix overlap: a JWT
+            // starts with `eyJ`, not a vendor key prefix).
+            let tok = self.token_for(inner, "JWT");
             return Some(format!("{prefix}{tok}{suffix}"));
         }
         None
@@ -480,6 +493,42 @@ mod tests {
         let tc_out = out[0].tool_calls_json.as_deref().unwrap();
         assert!(tc_out.contains("<CARD_1>"), "card in tool args must mask: {tc_out}");
         assert!(!tc_out.contains("4111111111111111"), "raw card must not remain: {tc_out}");
+    }
+
+    #[test]
+    fn test_jwt_is_pseudonymized_and_restored() {
+        // ADR-197: a JWT bearer token must be masked before reaching the cloud and
+        // restored after — it is a single token, handled like an API key.
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dummsignature_abc123";
+        let msgs = vec![msg(&format!("Authorization: Bearer {jwt}"))];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        assert!(
+            out[0].content.contains("<JWT_1>"),
+            "JWT must be masked: {}",
+            out[0].content
+        );
+        assert!(!out[0].content.contains(jwt), "raw JWT must not remain: {}", out[0].content);
+        let restored = restore(&out[0].content, &mapping);
+        assert!(restored.contains(jwt), "JWT must restore: {restored}");
+    }
+
+    #[test]
+    fn test_jwt_in_tool_call_arguments_masked() {
+        // ADR-197 + ADR-188: a JWT inside tool-call argument JSON is masked too.
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJ1IjoieCJ9.sig_value_1234567";
+        let tc = format!(
+            r#"[{{"function":{{"name":"call","arguments":"{{\"token\":\"{jwt}\"}}"}}}}]"#
+        );
+        let msgs = vec![Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls_json: Some(tc),
+            ..Default::default()
+        }];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        assert!(tc_out.contains("<JWT_1>"), "JWT in tool args must mask: {tc_out}");
+        assert!(!tc_out.contains(jwt), "raw JWT must not remain: {tc_out}");
     }
 
     #[test]
