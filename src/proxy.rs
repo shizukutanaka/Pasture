@@ -934,6 +934,24 @@ impl Proxy {
     /// Classify, then decide routing (keeps sensitive content local).
     /// Returns the decision and whether the content was sensitive.
     fn classify_and_decide(&self, req: &CompletionRequest) -> Result<(Decision, bool), ProxyError> {
+        let (decision, report) = self.route_decision(req)?;
+        if report.is_sensitive() {
+            eprintln!(
+                "pasture: sensitive content detected -> keeping local ({} categories)",
+                report.categories.len()
+            );
+        }
+        Ok((decision, report.is_sensitive()))
+    }
+
+    /// Pure routing decision + sensitivity report, with no side effects (no
+    /// logging). Shared by `classify_and_decide` (which adds the stderr notice)
+    /// and the `/v1/route` preview handler (ADR-198), which must compute the same
+    /// decision without running a backend or emitting logs.
+    fn route_decision(
+        &self,
+        req: &CompletionRequest,
+    ) -> Result<(Decision, crate::privacy::SensitivityReport), ProxyError> {
         let text = req.routing_text();
         // Privacy classification scans tool-call arguments too (ADR-187): PII can
         // live solely in tool_calls_json, which routing_text() omits. The routing
@@ -941,12 +959,6 @@ impl Proxy {
         // don't inflate the token-length heuristic.
         let report = crate::privacy::classify(&req.privacy_text());
         let sensitive = report.is_sensitive();
-        if sensitive {
-            eprintln!(
-                "pasture: sensitive content detected -> keeping local ({} categories)",
-                report.categories.len()
-            );
-        }
         // Model-pinned routing: if the client requested a specific model that we
         // recognise, force the route to the matching backend so the backend can
         // honour the exact model name. Sentinels "local" and "cloud" also work.
@@ -968,7 +980,34 @@ impl Proxy {
             .engine
             .decide_full(&text, forced, sensitive, req.has_tools)
             .map_err(|e| ProxyError::Routing(e.to_string()))?;
-        Ok((decision, sensitive))
+        Ok((decision, report))
+    }
+
+    /// Handle `POST /v1/route` (ADR-198): preview the routing decision for a
+    /// chat-completions body **without** calling any backend — no tokens spent,
+    /// no cost logged, nothing sent to a cloud provider. Returns the route,
+    /// reason, sensitivity (category labels only, never values — I3), the
+    /// estimated token count the length heuristic uses, and whether tools were
+    /// detected. Mirrors the CLI `route` command on the HTTP surface.
+    fn handle_route_preview(&self, body: &str) -> Result<String, ProxyError> {
+        let req = Self::parse_request(body)?;
+        let (decision, report) = self.route_decision(&req)?;
+        let estimated = crate::routing::estimate_tokens(&req.routing_text());
+        let categories = report
+            .categories
+            .iter()
+            .map(|c| format!("\"{}\"", escape_string(c)))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(format!(
+            "{{\"object\":\"pasture.route\",\"route\":\"{}\",\"reason\":\"{}\",\"sensitive\":{},\"categories\":[{}],\"estimated_tokens\":{},\"has_tools\":{}}}",
+            decision.route.as_str(),
+            escape_string(&decision.reason),
+            report.is_sensitive(),
+            categories,
+            estimated,
+            req.has_tools,
+        ))
     }
 
     /// Apply the configured prompt framing to a request: the user-defined system
@@ -2239,6 +2278,10 @@ impl Proxy {
                 // moderation; the stub prevents SDK clients that call this endpoint
                 // unconditionally from receiving a 404.
                 wr_result!(Self::handle_moderations(&body));
+            } else if method == "POST" && path.starts_with("/v1/route") {
+                // Routing preview / dry-run (ADR-198): return the route decision
+                // for this body without calling any backend — no cost, no cloud.
+                wr_result!(self.handle_route_preview(&body));
             } else if method == "GET" && path.starts_with("/v1/stats") {
                 wr_result!(self.handle_stats());
             } else if method == "GET" && path.starts_with("/metrics") {

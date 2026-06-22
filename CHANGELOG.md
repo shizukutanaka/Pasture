@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `POST /v1/route` routing preview / dry-run (ADR-198)
+
+- New Pasture-extension endpoint: POST a chat-completions body to `/v1/route`
+  and get the routing decision back — `{route, reason, sensitive, categories,
+  estimated_tokens, has_tools}` — **without calling any backend** (no tokens
+  spent, no cost logged, nothing sent to a cloud provider).  Mirrors the CLI
+  `route` command on the HTTP surface for cost-aware clients, dashboards, and
+  debugging.  PII-free (category labels only, I3); gated by auth + rate limit.
+  The live path and the preview share one `route_decision` helper so they can
+  never disagree.  5 new tests.  690 tests.  (ADR-198)
+
 ### Fixed — Pseudonymizer masks JWT bearer tokens (ADR-197)
 
 - Continuing ADR-196: the pseudonymizer also ignored JWTs (`eyJ…`), which the

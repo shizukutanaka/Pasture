@@ -133,6 +133,17 @@ logged). Implemented by `handle_embeddings` (IMP-8 completion).
 a missing cost log reads as all-zeros. No auth (localhost-default, I5). Implemented by
 `handle_stats` (ADR-038).
 
+### 3.2d `POST /v1/route`
+Routing **preview / dry-run** (ADR-198). Request body: a chat-completions body
+(`messages` required, plus optional `model`/`tools`). Runs the privacy + routing
+decision **without calling any backend** — no tokens spent, no cost logged, nothing
+sent to a cloud provider. Success: `200` with
+`{"object":"pasture.route","route":∈{local,cloud},"reason":<string>,"sensitive":<bool>,`
+`"categories":[<label>…],"estimated_tokens":<n>,"has_tools":<bool>}`. PII-free —
+`categories` carries only labels, never matched values (I3). Subject to the §7
+auth/rate-limit gate (it performs classification work). Mirrors the CLI `route`
+command on the HTTP surface. Implemented by `handle_route_preview`.
+
 ### 3.3 `GET /health`
 `200`, `{"status":"ok"}`.
 

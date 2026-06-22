@@ -784,6 +784,87 @@ fn test_handle_stats_counts_logged_requests() {
     let _ = std::fs::remove_file(&log);
 }
 
+// ── ADR-198 /v1/route routing preview (dry-run) ──────────────────────────────
+
+#[test]
+fn test_route_preview_plain_prompt_is_local() {
+    // A short, benign prompt previews as local with a reason and zero categories.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 100, &log); // high threshold → short stays local
+    let json = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(v.get("object").and_then(|x| x.as_str()), Some("pasture.route"));
+    assert_eq!(v.get("route").and_then(|x| x.as_str()), Some("local"));
+    assert_eq!(v.get("sensitive").and_then(|x| x.as_bool()), Some(false));
+    assert!(v.get("reason").and_then(|x| x.as_str()).is_some(), "reason present");
+    assert!(v.get("estimated_tokens").and_then(|x| x.as_f64()).is_some());
+    // No backend was called: the cost log must not have been written.
+    assert!(
+        std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "route preview must not call a backend or write the cost log"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_route_preview_long_prompt_is_cloud() {
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log); // low threshold → long goes cloud
+    let long = "word ".repeat(40);
+    let body = format!(r#"{{"messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let json = p.handle_route_preview(&body).unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(v.get("route").and_then(|x| x.as_str()), Some("cloud"));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_route_preview_sensitive_is_local_with_categories() {
+    // PII previews as local and reports category labels — never the value (I3).
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log); // low threshold would be cloud but PII wins
+    let body = r#"{"messages":[{"role":"user","content":"email me at alice@example.com please"}]}"#;
+    let json = p.handle_route_preview(body).unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(v.get("route").and_then(|x| x.as_str()), Some("local"));
+    assert_eq!(v.get("sensitive").and_then(|x| x.as_bool()), Some(true));
+    let cats = v.get("categories").and_then(|x| x.as_array()).expect("categories array");
+    assert!(
+        cats.iter().any(|c| c.as_str() == Some("email")),
+        "email category must be reported: {json}"
+    );
+    // The actual PII value must NOT appear anywhere in the preview (I3).
+    assert!(!json.contains("alice@example.com"), "preview must not leak the PII value: {json}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_route_preview_http_endpoint() {
+    // End-to-end over HTTP: POST /v1/route returns 200 with the decision object.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 100, &log);
+    let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, resp) = roundtrip(p, http_post("/v1/route", body));
+    assert_eq!(status, 200);
+    assert!(resp.contains("\"object\":\"pasture.route\""), "{resp}");
+    assert!(resp.contains("\"route\":\"local\""), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_route_preview_detects_tools() {
+    // A tools array is surfaced in the preview's has_tools flag.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 100, &log);
+    let body = r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#;
+    let json = p.handle_route_preview(body).unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(v.get("has_tools").and_then(|x| x.as_bool()), Some(true), "{json}");
+    let _ = std::fs::remove_file(&log);
+}
+
 #[test]
 fn test_stats_incremental_matches_full_reread() {
     // ADR-151: the incrementally-cached summary must equal a fresh full re-read

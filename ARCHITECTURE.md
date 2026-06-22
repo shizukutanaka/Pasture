@@ -2055,3 +2055,19 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   so false positives are very unlikely and would over-mask (the safe direction). The remaining
   unmasked classifier categories (pem_key, url_credential, env_secret) are span/multi-line-based and
   remain documented best-effort gaps for a later pass. Zero new dependencies; 2 new tests; 685 total.
+
+- **ADR-198 New `POST /v1/route` routing preview / dry-run endpoint.**
+  Socratic feature design: "Pasture decides local vs cloud on every request, but a client can only
+  observe that decision via `x_pasture_route` on the actual completion — i.e. *after* paying for
+  inference and committing the prompt to a backend. Is there a way to *preview* the decision without
+  running inference?" Only via the CLI `route` command; the HTTP API had no equivalent. A
+  cost-conscious client, a dashboard, a router-of-routers, or a developer debugging *why* a prompt
+  went cloud all want to ask "where would this go?" without spending tokens or sending the prompt to
+  a cloud provider. The capability already existed in the engine (classify + decide are pure and
+  backend-free) but was unexposed. New `handle_route_preview` returns
+  `{object:pasture.route, route, reason, sensitive, categories, estimated_tokens, has_tools}` with no
+  backend call and no cost-log write; `classify_and_decide` was refactored to share a pure
+  `route_decision` helper so preview and reality compute via the identical path and can never
+  disagree. PII-free (category labels only, I3); gated by auth + rate limit like any `/v1/*` request.
+  Mirrors the CLI `route` command on the HTTP surface (SPEC 3.2d). Zero new dependencies; 5 new
+  tests; 690 total.
