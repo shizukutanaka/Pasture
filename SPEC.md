@@ -138,16 +138,19 @@ Routing **preview / dry-run** (ADR-198). Request body: a chat-completions body
 (`messages` required, plus optional `model`/`tools`). Runs the privacy + routing
 decision **without calling any backend** — no tokens spent, no cost logged, nothing
 sent to a cloud provider. Success: `200` with
-`{"object":"pasture.route","route":∈{local,cloud},"reason":<string>,"sensitive":<bool>,`
-`"categories":[<label>…],"estimated_tokens":<n>,"predicted_output_tokens":<n>,`
+`{"object":"pasture.route","route":∈{local,cloud},"reason":<string>,"budget":<string|null>,`
+`"sensitive":<bool>,"categories":[<label>…],"estimated_tokens":<n>,"predicted_output_tokens":<n>,`
 `"predicted_total_tokens":<n>,"estimated_cost_usd":<f>,"has_tools":<bool>}`.
-`estimated_tokens` is the content-only routing-heuristic value; the predicted
-token fields and `estimated_cost_usd` use `estimation_text` + the IMP-24 output
-prediction priced from `PASTURE_CLOUD_PRICE_PER_1M` (ADR-199), so the dollar
-estimate matches what the budget guard and real bill count (0 for local/cache or
-when no pricing is set). PII-free — `categories` carries only labels, never
-matched values (I3). Subject to the §7 auth/rate-limit gate. Mirrors the CLI
-`route` command. Implemented by `handle_route_preview`.
+`route` is the **effective** route: the IMP-26 budget/spike guard is applied
+read-only (ADR-200), so an over-budget cloud request previews as `local`
+(local-only redirect) or carries a `budget` note (warn / would-be-blocked); the
+guard reserves nothing. `estimated_tokens` is the content-only routing-heuristic
+value; the predicted token fields and `estimated_cost_usd` use `estimation_text`
++ the IMP-24 output prediction priced from `PASTURE_CLOUD_PRICE_PER_1M` (ADR-199),
+and cost is 0 unless the request would actually be served on cloud. PII-free —
+`categories` carries only labels, never matched values (I3). Subject to the §7
+auth/rate-limit gate. Mirrors the CLI `route` command. Implemented by
+`handle_route_preview`.
 
 ### 3.3 `GET /health`
 `200`, `{"status":"ok"}`.

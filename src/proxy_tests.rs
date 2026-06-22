@@ -900,6 +900,79 @@ fn test_route_preview_local_cost_is_zero() {
 }
 
 #[test]
+fn test_route_preview_reflects_budget_local_only_redirect() {
+    // ADR-200: the preview must mirror the budget guard, not just the engine. With
+    // the daily budget exhausted and action=local-only, a would-be-cloud request
+    // previews as LOCAL (matching reality), with a budget note and zero cost — not
+    // "cloud" as the bare routing decision would say.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log) // low thr → engine would pick cloud
+        .with_budget(1, "local-only", 0, "/dev/null")
+        .with_cloud_price(2.50, 10.00);
+    p.today_cloud_tokens.store(100, Ordering::Relaxed); // over the budget of 1
+    let long = "word ".repeat(40);
+    let body = format!(r#"{{"messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let json = p.handle_route_preview(&body).unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(
+        v.get("route").and_then(|x| x.as_str()),
+        Some("local"),
+        "over-budget local-only must preview local: {json}"
+    );
+    assert!(
+        v.get("budget").and_then(|x| x.as_str()).unwrap_or("").contains("redirected to local"),
+        "budget note must explain the redirect: {json}"
+    );
+    assert_eq!(
+        v.get("estimated_cost_usd").and_then(|x| x.as_f64()),
+        Some(0.0),
+        "a redirected-to-local request costs nothing: {json}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_route_preview_budget_warn_proceeds_to_cloud() {
+    // action=warn: over budget but the request still proceeds to cloud, so the
+    // preview stays cloud (with a warn note) and the cost still applies.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log)
+        .with_budget(1, "warn", 0, "/dev/null")
+        .with_cloud_price(2.50, 10.00);
+    p.today_cloud_tokens.store(100, Ordering::Relaxed);
+    let long = "word ".repeat(40);
+    let body = format!(r#"{{"messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let json = p.handle_route_preview(&body).unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(v.get("route").and_then(|x| x.as_str()), Some("cloud"), "{json}");
+    assert!(v.get("budget").and_then(|x| x.as_str()).unwrap_or("").contains("warn"), "{json}");
+    assert!(
+        v.get("estimated_cost_usd").and_then(|x| x.as_f64()).unwrap_or(0.0) > 0.0,
+        "warn still serves cloud, so cost applies: {json}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_route_preview_does_not_reserve_budget() {
+    // ADR-200: the preview must be read-only — running it must not consume any of
+    // the daily token budget (no reservation leak onto the gauge).
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_budget(1_000_000, "local-only", 0, "/dev/null");
+    p.today_cloud_tokens.store(0, Ordering::Relaxed);
+    let long = "word ".repeat(40);
+    let body = format!(r#"{{"messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let _ = p.handle_route_preview(&body).unwrap();
+    let _ = p.handle_route_preview(&body).unwrap();
+    assert_eq!(
+        p.today_cloud_tokens.load(Ordering::Relaxed),
+        0,
+        "preview must not reserve/consume budget tokens"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_stats_incremental_matches_full_reread() {
     // ADR-151: the incrementally-cached summary must equal a fresh full re-read
     // after each append, across multiple scrapes (only new lines are folded).

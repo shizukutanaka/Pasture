@@ -1003,9 +1003,29 @@ impl Proxy {
             crate::routing::estimate_total_tokens(&req.estimation_text(), req.sampling.max_tokens)
                 as u64;
         let predicted_output = predicted_total.saturating_sub(billed_input);
-        // Cost applies only to a cloud route, priced from PASTURE_CLOUD_PRICE_PER_1M
-        // (0 when no pricing is set). Local/cache routes are free.
-        let estimated_cost = if decision.route == Route::Cloud {
+        // Budget/spike guard preview (ADR-200): the routing engine may decide Cloud,
+        // but the IMP-26 guard can redirect it to local (local-only), let it proceed
+        // (warn), or reject it (block) at request time. Reflect that here — read-only,
+        // reserving nothing — so the previewed route and cost match what would really
+        // happen instead of the pre-guard engine decision.
+        let (effective_route, budget_note, serves_cloud) = if decision.route == Route::Cloud
+            && (self.budget_daily_tokens > 0 || self.spike_factor > 0)
+        {
+            match self.budget_spike_preview(predicted_total) {
+                None => (Route::Cloud, None, true),
+                Some(reason) => match self.budget_action.as_str() {
+                    "block" => (Route::Cloud, Some(format!("would be blocked (429): {reason}")), false),
+                    "warn" => (Route::Cloud, Some(format!("over budget, proceeds (warn): {reason}")), true),
+                    _ => (Route::Local, Some(format!("redirected to local: {reason}")), false),
+                },
+            }
+        } else {
+            (decision.route, None, decision.route == Route::Cloud)
+        };
+        // Cost applies only when the request would actually be served on cloud
+        // (priced from PASTURE_CLOUD_PRICE_PER_1M, 0 when unset). A local route, a
+        // local-only redirect, or a block all cost nothing.
+        let estimated_cost = if serves_cloud {
             self.cloud_cost_usd(billed_input, predicted_output)
         } else {
             0.0
@@ -1016,10 +1036,15 @@ impl Proxy {
             .map(|c| format!("\"{}\"", escape_string(c)))
             .collect::<Vec<_>>()
             .join(",");
+        let budget_field = match budget_note {
+            Some(note) => format!("\"{}\"", escape_string(&note)),
+            None => "null".to_string(),
+        };
         Ok(format!(
-            "{{\"object\":\"pasture.route\",\"route\":\"{}\",\"reason\":\"{}\",\"sensitive\":{},\"categories\":[{}],\"estimated_tokens\":{},\"predicted_output_tokens\":{},\"predicted_total_tokens\":{},\"estimated_cost_usd\":{:.6},\"has_tools\":{}}}",
-            decision.route.as_str(),
+            "{{\"object\":\"pasture.route\",\"route\":\"{}\",\"reason\":\"{}\",\"budget\":{},\"sensitive\":{},\"categories\":[{}],\"estimated_tokens\":{},\"predicted_output_tokens\":{},\"predicted_total_tokens\":{},\"estimated_cost_usd\":{:.6},\"has_tools\":{}}}",
+            effective_route.as_str(),
             escape_string(&decision.reason),
+            budget_field,
             report.is_sensitive(),
             categories,
             estimated,
@@ -1338,6 +1363,33 @@ impl Proxy {
                 self.release_cloud_tokens(estimated_tokens);
                 return Some("daily cloud token budget exceeded");
             }
+        }
+        None
+    }
+
+    /// Read-only budget/spike check for the `/v1/route` preview (ADR-200): returns
+    /// the reason the guard *would* override a cloud route, **without** reserving
+    /// tokens or mutating the daily counter. Mirrors `check_budget_and_spike`'s
+    /// conditions exactly — the spike comparison is identical, and the budget test
+    /// uses `load() >= budget` (the same `prev >= budget` predicate, since `prev`
+    /// is the value before the live path's `fetch_add`). Rolls the UTC day first,
+    /// like `budget_snapshot`, so a preview on a fresh day reads 0.
+    fn budget_spike_preview(&self, estimated_tokens: u64) -> Option<&'static str> {
+        self.roll_budget_day_if_needed();
+        if self.spike_factor > 0 && estimated_tokens > 0 {
+            let count = self.cloud_request_count.load(Ordering::Relaxed);
+            if count > 0 {
+                let sum = self.cloud_token_sum.load(Ordering::Relaxed);
+                let avg = sum / count;
+                if avg > 0 && estimated_tokens > self.spike_factor.saturating_mul(avg) {
+                    return Some("spike detected — request exceeds average by spike_factor");
+                }
+            }
+        }
+        if self.budget_daily_tokens > 0
+            && self.today_cloud_tokens.load(Ordering::Relaxed) >= self.budget_daily_tokens
+        {
+            return Some("daily cloud token budget exceeded");
         }
         None
     }

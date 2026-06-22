@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `/v1/route` preview is now budget/spike-aware (ADR-200)
+
+- The `/v1/route` dry-run previewed the routing-engine decision but ignored the
+  IMP-26 budget/spike guard, so an over-budget cloud request previewed as
+  `cloud` (with a cloud cost) while reality routed `local`.  The preview now
+  applies the guard **read-only** (reserving nothing): an over-budget
+  local-only request previews as `local` with a `budget` note and zero cost; a
+  `warn` request stays cloud with a note; a `block` request is flagged.  A new
+  `budget` field explains any override.  Verified read-only by a test asserting
+  the daily counter is untouched.  3 new tests.  695 tests.  (ADR-200)
+
 ### Added — `/v1/route` preview now estimates cost (ADR-199)
 
 - The `/v1/route` dry-run now also returns `predicted_output_tokens`,

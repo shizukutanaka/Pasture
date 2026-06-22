@@ -2084,3 +2084,18 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   the real bill. Cost is 0 for local/cache or when no pricing is set; the original content-only
   `estimated_tokens` (which the routing `reason` references) is unchanged. Zero new dependencies;
   2 new tests; 692 total.
+
+- **ADR-200 Routing preview reflects the budget/spike guard (read-only) so it matches reality.**
+  Continued strengths/weaknesses review of `/v1/route`: after the cost estimate (ADR-199), the
+  remaining gap was that the preview reported the routing-*engine* decision but ignored the IMP-26
+  budget/spike guard, which redirects cloud->local (local-only), proceeds (warn), or rejects (block)
+  at request time. With a daily budget active and exhausted, the preview said `cloud` while reality
+  routed `local` — and quoted a cloud cost the request would never incur, misleading exactly the
+  budget-conscious user the preview exists for. The live `check_budget_and_spike` does a `fetch_add`
+  reservation, which a dry-run must never do, so a dedicated read-only `budget_spike_preview` mirrors
+  the same conditions (spike compare identical; budget test `load() >= budget`) without reserving,
+  and `handle_route_preview` applies the same `budget_action` branching `apply_budget_guard` uses.
+  The preview now returns the *effective* route plus a `budget` note (redirect / warn / would-block),
+  and the cost is 0 unless the request would truly be served on cloud. Read-only is verified by a
+  test that previews repeatedly and asserts `today_cloud_tokens` stays 0. Default/cold-start previews
+  are unchanged. Zero new dependencies; 3 new tests; 695 total.
