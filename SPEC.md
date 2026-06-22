@@ -139,10 +139,15 @@ Routing **preview / dry-run** (ADR-198). Request body: a chat-completions body
 decision **without calling any backend** — no tokens spent, no cost logged, nothing
 sent to a cloud provider. Success: `200` with
 `{"object":"pasture.route","route":∈{local,cloud},"reason":<string>,"sensitive":<bool>,`
-`"categories":[<label>…],"estimated_tokens":<n>,"has_tools":<bool>}`. PII-free —
-`categories` carries only labels, never matched values (I3). Subject to the §7
-auth/rate-limit gate (it performs classification work). Mirrors the CLI `route`
-command on the HTTP surface. Implemented by `handle_route_preview`.
+`"categories":[<label>…],"estimated_tokens":<n>,"predicted_output_tokens":<n>,`
+`"predicted_total_tokens":<n>,"estimated_cost_usd":<f>,"has_tools":<bool>}`.
+`estimated_tokens` is the content-only routing-heuristic value; the predicted
+token fields and `estimated_cost_usd` use `estimation_text` + the IMP-24 output
+prediction priced from `PASTURE_CLOUD_PRICE_PER_1M` (ADR-199), so the dollar
+estimate matches what the budget guard and real bill count (0 for local/cache or
+when no pricing is set). PII-free — `categories` carries only labels, never
+matched values (I3). Subject to the §7 auth/rate-limit gate. Mirrors the CLI
+`route` command. Implemented by `handle_route_preview`.
 
 ### 3.3 `GET /health`
 `200`, `{"status":"ok"}`.

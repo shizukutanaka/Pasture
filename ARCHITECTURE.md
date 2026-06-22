@@ -2071,3 +2071,16 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   disagree. PII-free (category labels only, I3); gated by auth + rate limit like any `/v1/*` request.
   Mirrors the CLI `route` command on the HTTP surface (SPEC 3.2d). Zero new dependencies; 5 new
   tests; 690 total.
+
+- **ADR-199 Routing preview reports predicted output tokens and a dollar cost estimate.**
+  Self-applied strengths/weaknesses review of the `/v1/route` feature (ADR-198): its core audience is
+  the cost-conscious client, yet it answered only "where would this go?" (route) and not "how much
+  would it cost?". It reported `estimated_tokens` (input only), omitting the predicted *output*
+  tokens (cloud cost is output-dominated, IMP-24) and the dollar figure derivable from the
+  already-configured `PASTURE_CLOUD_PRICE_PER_1M`. The machinery existed (`estimate_total_tokens`,
+  `cloud_cost_usd` — both on the live cost/budget path), so the fix is purely additive: the preview
+  now returns `predicted_output_tokens`, `predicted_total_tokens`, and `estimated_cost_usd`, priced
+  over `estimation_text` (tool defs included, ADR-184) so the estimate tracks the budget guard and
+  the real bill. Cost is 0 for local/cache or when no pricing is set; the original content-only
+  `estimated_tokens` (which the routing `reason` references) is unchanged. Zero new dependencies;
+  2 new tests; 692 total.

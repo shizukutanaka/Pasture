@@ -866,6 +866,40 @@ fn test_route_preview_detects_tools() {
 }
 
 #[test]
+fn test_route_preview_cloud_includes_cost_estimate() {
+    // ADR-199: a cloud-routed preview reports predicted output tokens and a dollar
+    // estimate priced from PASTURE_CLOUD_PRICE_PER_1M, so a cost-aware client can
+    // see what the request would cost before spending anything.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 5, &log).with_cloud_price(2.50, 10.00); // low thr → cloud
+    let long = "word ".repeat(40);
+    let body = format!(r#"{{"messages":[{{"role":"user","content":"{long}"}}]}}"#);
+    let json = p.handle_route_preview(&body).unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(v.get("route").and_then(|x| x.as_str()), Some("cloud"));
+    let total = v.get("predicted_total_tokens").and_then(|x| x.as_f64()).unwrap();
+    let out = v.get("predicted_output_tokens").and_then(|x| x.as_f64()).unwrap();
+    assert!(total > 0.0 && out > 0.0, "predicted tokens must be positive: {json}");
+    let cost = v.get("estimated_cost_usd").and_then(|x| x.as_f64()).unwrap();
+    assert!(cost > 0.0, "cloud preview with pricing must estimate a positive cost: {json}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_route_preview_local_cost_is_zero() {
+    // A local route is free even when cloud pricing is configured.
+    let log = tmp_log();
+    let p = proxy_with(true, true, 100, &log).with_cloud_price(2.50, 10.00); // high thr → local
+    let json = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    assert_eq!(v.get("route").and_then(|x| x.as_str()), Some("local"));
+    assert_eq!(v.get("estimated_cost_usd").and_then(|x| x.as_f64()), Some(0.0), "{json}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_stats_incremental_matches_full_reread() {
     // ADR-151: the incrementally-cached summary must equal a fresh full re-read
     // after each append, across multiple scrapes (only new lines are folded).

@@ -992,7 +992,24 @@ impl Proxy {
     fn handle_route_preview(&self, body: &str) -> Result<String, ProxyError> {
         let req = Self::parse_request(body)?;
         let (decision, report) = self.route_decision(&req)?;
+        // `estimated_tokens` is the content-only routing-heuristic value the
+        // `reason` references. The cost/billing prediction uses `estimation_text`
+        // (which includes tool definitions and tool_calls, ADR-184) and the IMP-24
+        // output prediction, so the dollar estimate matches what the budget guard
+        // and the real cloud bill would count.
         let estimated = crate::routing::estimate_tokens(&req.routing_text());
+        let billed_input = crate::routing::estimate_tokens(&req.estimation_text()) as u64;
+        let predicted_total =
+            crate::routing::estimate_total_tokens(&req.estimation_text(), req.sampling.max_tokens)
+                as u64;
+        let predicted_output = predicted_total.saturating_sub(billed_input);
+        // Cost applies only to a cloud route, priced from PASTURE_CLOUD_PRICE_PER_1M
+        // (0 when no pricing is set). Local/cache routes are free.
+        let estimated_cost = if decision.route == Route::Cloud {
+            self.cloud_cost_usd(billed_input, predicted_output)
+        } else {
+            0.0
+        };
         let categories = report
             .categories
             .iter()
@@ -1000,12 +1017,15 @@ impl Proxy {
             .collect::<Vec<_>>()
             .join(",");
         Ok(format!(
-            "{{\"object\":\"pasture.route\",\"route\":\"{}\",\"reason\":\"{}\",\"sensitive\":{},\"categories\":[{}],\"estimated_tokens\":{},\"has_tools\":{}}}",
+            "{{\"object\":\"pasture.route\",\"route\":\"{}\",\"reason\":\"{}\",\"sensitive\":{},\"categories\":[{}],\"estimated_tokens\":{},\"predicted_output_tokens\":{},\"predicted_total_tokens\":{},\"estimated_cost_usd\":{:.6},\"has_tools\":{}}}",
             decision.route.as_str(),
             escape_string(&decision.reason),
             report.is_sensitive(),
             categories,
             estimated,
+            predicted_output,
+            predicted_total,
+            estimated_cost,
             req.has_tools,
         ))
     }

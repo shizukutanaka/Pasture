@@ -5,6 +5,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — `/v1/route` preview now estimates cost (ADR-199)
+
+- The `/v1/route` dry-run now also returns `predicted_output_tokens`,
+  `predicted_total_tokens`, and `estimated_cost_usd` — a complete pre-flight
+  cost preview for the cost-conscious client, with zero spend and zero data
+  egress.  Token/cost prediction reuses the live billing path (`estimation_text`
+  + IMP-24 output prediction priced from `PASTURE_CLOUD_PRICE_PER_1M`), so the
+  estimate tracks the budget guard and the real bill; it is 0 for local/cache
+  routes or when no pricing is set.  The original `estimated_tokens` is
+  unchanged.  2 new tests.  692 tests.  (ADR-199)
+
 ### Added — `POST /v1/route` routing preview / dry-run (ADR-198)
 
 - New Pasture-extension endpoint: POST a chat-completions body to `/v1/route`
