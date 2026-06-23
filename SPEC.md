@@ -211,7 +211,9 @@ returns at the first match (I4):
 3. **Availability.** none ⇒ `503` (`NoBackendAvailable`); only one present ⇒ that one.
 4. **Hard signals** (only if `code_to_cloud`): route **cloud** if any of —
    code fences; reasoning markers (EN/JA); strict-format/code-gen markers (EN/JA);
-   `≥3` question marks; `≥4` math symbols; **`has_tools`** (IMP-10).
+   `≥3` question marks; `≥3` **distinct** math symbol types (ADR-208, e.g. `^`,
+   `+`, `=` together — a single repeated type such as `/` in a URL does not
+   trigger); **`has_tools`** (IMP-10).
 5. **Length.** `estimate_tokens(text) ≥ threshold` ⇒ **cloud**, else **local**.
 
 **Token estimation:** script-aware (ADR-022). CJK/Hangul/fullwidth ≈ 1 token/char;

@@ -76,10 +76,10 @@ impl std::error::Error for RoutingError {}
 /// implementation: whitespace inflation and digit under-counting
 /// (arXiv:2509.05486 "The Token Tax"; IMP-22).
 pub fn estimate_tokens(text: &str) -> usize {
-    let mut dense = 0usize;  // CJK / Hangul / kana / Thai / Devangari / emoji
+    let mut dense = 0usize; // CJK / Hangul / kana / Thai / Devangari / emoji
     let mut digits = 0usize; // ASCII 0-9: ~0.5 tok/char
-    let mut latin = 0usize;  // letters, punctuation: ~0.25 tok/char
-    // whitespace (spaces, tabs, newlines) contributes 0 tokens
+    let mut latin = 0usize; // letters, punctuation: ~0.25 tok/char
+                            // whitespace (spaces, tabs, newlines) contributes 0 tokens
     for c in text.chars() {
         if is_dense_script(c) {
             dense += 1;
@@ -249,9 +249,19 @@ pub fn question_count(text: &str) -> usize {
     text.chars().filter(|&c| c == '?' || c == '？').count()
 }
 
-/// True when the text is math-heavy (>= 4 mathematical symbols).
+/// True when the text is math-heavy: at least 3 *distinct* mathematical
+/// symbol types are present (ADR-208). The old approach counted total
+/// occurrences (≥ 4), which caused false positives on any URL with 4+
+/// path segments (`https://a.com/b/c/d/e` has 5 `/` characters → old code
+/// returned true, routing all URL-containing prompts to cloud). Counting
+/// *distinct* types instead (unique members of MATH_CHARS that appear at all)
+/// preserves detection of genuine math while making a single repeated
+/// character type (like path `/`) unable to trigger the signal alone.
+/// A threshold of 3 distinct types ensures `a^2 + b^2 = c^2` still routes
+/// to cloud while `https://host/a/b/c?x=1` (only `/` and `=`, 2 types)
+/// does not.
 pub fn looks_mathy(text: &str) -> bool {
-    text.chars().filter(|c| MATH_CHARS.contains(c)).count() >= 4
+    MATH_CHARS.iter().filter(|&&c| text.contains(c)).count() >= 3
 }
 
 /// Skill-detection markers for summarisation requests (EN + JA).
@@ -663,7 +673,10 @@ mod tests {
                     afternoon while the farmer watches from his porch and sips tea";
         let input = estimate_tokens(text);
         let out = estimate_output_tokens(text, input, None);
-        assert!(out < input, "summary output ({out}) must be smaller than input ({input})");
+        assert!(
+            out < input,
+            "summary output ({out}) must be smaller than input ({input})"
+        );
     }
 
     #[test]
@@ -688,7 +701,10 @@ mod tests {
         let text = "write a very long detailed essay ".repeat(50);
         let input = estimate_tokens(&text);
         let capped = estimate_output_tokens(&text, input, Some(32));
-        assert!(capped <= 32, "prediction ({capped}) must respect max_tokens=32");
+        assert!(
+            capped <= 32,
+            "prediction ({capped}) must respect max_tokens=32"
+        );
     }
 
     #[test]
@@ -697,7 +713,10 @@ mod tests {
         let text = "write a function:\n```\nfn f(){}\n```\n".repeat(2000);
         let input = estimate_tokens(&text);
         let out = estimate_output_tokens(&text, input, None);
-        assert!(out <= 4096, "uncapped prediction ({out}) must respect the 4096 ceiling");
+        assert!(
+            out <= 4096,
+            "uncapped prediction ({out}) must respect the 4096 ceiling"
+        );
     }
 
     #[test]
@@ -706,7 +725,10 @@ mod tests {
         let text = "explain quantum entanglement to a curious beginner";
         let input = estimate_tokens(text);
         let total = estimate_total_tokens(text, None);
-        assert!(total > input, "total ({total}) must exceed input-only ({input})");
+        assert!(
+            total > input,
+            "total ({total}) must exceed input-only ({input})"
+        );
         assert_eq!(
             total,
             input + estimate_output_tokens(text, input, None),
@@ -931,8 +953,20 @@ mod tests {
 
     #[test]
     fn test_looks_mathy() {
-        assert!(looks_mathy("x = a + b * c / d ^ 2"));
-        assert!(!looks_mathy("a normal sentence"));
+        // Genuine math expressions (3+ distinct math-char types) route to cloud.
+        assert!(looks_mathy("x = a + b * c / d ^ 2")); // =,+,*,/,^ = 5 types
+        assert!(looks_mathy("a^2 + b^2 = c^2")); // ^,+,= = 3 types
+        assert!(looks_mathy("∑x = π * r^2")); // ∑,=,π,*,^ = 5 types
+        assert!(!looks_mathy("a normal sentence")); // 0 types
+
+        // ADR-208: a single character type repeated many times must NOT trigger
+        // the math signal (was the root cause of URL false positives).
+        assert!(!looks_mathy("https://api.example.com/v1/models/list")); // only '/'
+        assert!(!looks_mathy("KEY=value&OTHER=stuff&MORE=data&LAST=x")); // only '='
+                                                                         // URL with both '/' and '=' is still only 2 types → not math.
+        assert!(!looks_mathy("https://host/path?key=value&x=1"));
+        // Simple assignment and arithmetic: 2 types, not enough to be math.
+        assert!(!looks_mathy("x = y + z")); // =,+ = 2 types
     }
 
     #[test]
@@ -1027,14 +1061,20 @@ mod tests {
 
     #[test]
     fn test_detect_skill_summarize() {
-        assert_eq!(detect_skill("please summarize this document"), Some("summarize"));
+        assert_eq!(
+            detect_skill("please summarize this document"),
+            Some("summarize")
+        );
         assert_eq!(detect_skill("tl;dr please"), Some("summarize"));
         assert_eq!(detect_skill("要約してください"), Some("summarize"));
     }
 
     #[test]
     fn test_detect_skill_translate() {
-        assert_eq!(detect_skill("translate this to Japanese"), Some("translate"));
+        assert_eq!(
+            detect_skill("translate this to Japanese"),
+            Some("translate")
+        );
         assert_eq!(detect_skill("翻訳してください"), Some("translate"));
     }
 
