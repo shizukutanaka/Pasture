@@ -138,18 +138,19 @@ pub fn classify(text: &str) -> SensitivityReport {
     if text.split_whitespace().any(looks_like_email) {
         categories.push("email");
     }
-    if text.split_whitespace().any(|t| looks_like_ipv4(t) || looks_like_ipv6(t)) {
+    if text
+        .split_whitespace()
+        .any(|t| looks_like_ipv4(t) || looks_like_ipv6(t))
+    {
         categories.push("ip");
     }
     if contains_credit_card(text) {
         categories.push("credit_card");
     }
-    if text.split_whitespace().any(looks_like_phone) {
+    if text.split_whitespace().any(looks_like_phone) || contains_intl_phone(text) {
         categories.push("phone");
     }
-    if text.split_whitespace().any(looks_like_api_key)
-        || contains_embedded_api_key(text)
-    {
+    if text.split_whitespace().any(looks_like_api_key) || contains_embedded_api_key(text) {
         categories.push("api_key");
     }
     if text.split_whitespace().any(looks_like_jwt) {
@@ -298,8 +299,7 @@ pub fn env_secret_spans(text: &str) -> Vec<(usize, usize)> {
         // Advance past this line + the newline character (\n or nothing at EOF).
         line_start += line.len();
         if line_start < text.len()
-            && (text.as_bytes()[line_start] == b'\n'
-                || text.as_bytes()[line_start] == b'\r')
+            && (text.as_bytes()[line_start] == b'\n' || text.as_bytes()[line_start] == b'\r')
         {
             // Skip \r\n or \n
             if text.as_bytes()[line_start] == b'\r'
@@ -408,7 +408,10 @@ pub fn looks_like_phone(token: &str) -> bool {
 /// they are valid inside prefixes (`ghp_`, `glpat-`, `xoxb-`) and JWT segments.
 fn trim_token_delimiters(token: &str) -> &str {
     token.trim_matches(|c: char| {
-        matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '`' | '<' | '>')
+        matches!(
+            c,
+            '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '`' | '<' | '>'
+        )
     })
 }
 
@@ -447,10 +450,7 @@ pub fn contains_embedded_api_key(text: &str) -> bool {
                     .unwrap_or(true);
             if preceding_ok {
                 let after = &haystack[pos + prefix.len()..];
-                let non_ws = after
-                    .chars()
-                    .take_while(|c| !c.is_whitespace())
-                    .count();
+                let non_ws = after.chars().take_while(|c| !c.is_whitespace()).count();
                 if non_ws >= 12 {
                     return true;
                 }
@@ -530,6 +530,61 @@ pub fn credit_card_spans(text: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+/// Detect an international (`+`-prefixed) phone number anywhere in the text,
+/// including the space- or hyphen-separated form that spans multiple whitespace
+/// tokens (e.g. `+1 555 123 4567`). The classifier and the per-token
+/// pseudonymizer both split on whitespace before calling `looks_like_phone`, so
+/// the space-allowing branch of that function is unreachable for a number whose
+/// groups are space-separated; this whitespace-agnostic scan closes that gap
+/// (ADR-207).
+pub fn contains_intl_phone(text: &str) -> bool {
+    !phone_spans(text).is_empty()
+}
+
+/// Byte ranges of international (`+`-prefixed) phone numbers, where the number
+/// may contain internal space/hyphen/paren separators. Each span starts at the
+/// `+` and ends just after the final digit, so trailing separators are excluded.
+/// The digit-count window (8..=15) mirrors `looks_like_phone`'s international
+/// branch, so detection has a single source of truth; the only difference is
+/// that this scan is whitespace-agnostic and therefore catches the
+/// `+1 555 123 4567` form the per-token path cannot (ADR-207). Shared by
+/// `contains_intl_phone` (any hit → sensitive) and the pseudonymizer (mask each
+/// span with a `<PHONE_n>` token).
+pub fn phone_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            // Consume a maximal phone-char run after the '+', tracking the end of
+            // the last digit so trailing separators are excluded from the span.
+            let mut digit_count = 0usize;
+            let mut j = i + 1;
+            let mut last_digit_end = i; // no digit yet
+            while j < bytes.len() {
+                let cj = bytes[j];
+                if cj.is_ascii_digit() {
+                    digit_count += 1;
+                    j += 1;
+                    last_digit_end = j;
+                } else if matches!(cj, b' ' | b'-' | b'(' | b')') {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            // Same window as looks_like_phone's '+<country><number>' branch.
+            if (8..=15).contains(&digit_count) {
+                spans.push((i, last_digit_end));
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
 fn luhn_valid(digits: &[u8]) -> bool {
     let mut sum = 0u32;
     let mut alt = false;
@@ -589,9 +644,7 @@ mod tests {
         assert!(looks_like_ipv6("2001:db8::1"));
         assert!(looks_like_ipv6("fe80::1"));
         assert!(looks_like_ipv6("::1"));
-        assert!(looks_like_ipv6(
-            "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
-        ));
+        assert!(looks_like_ipv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334"));
         // Wrapped in URL-authority brackets and trailing punctuation.
         assert!(looks_like_ipv6("[2001:db8::1]"));
         assert!(looks_like_ipv6("2001:db8::1,"));
@@ -632,6 +685,48 @@ mod tests {
         assert!(looks_like_phone("+1-415-555-0100"));
         assert!(!looks_like_phone("12345"));
         assert!(!looks_like_phone("+12"));
+    }
+
+    #[test]
+    fn test_intl_phone_with_spaces_detected() {
+        // ADR-207: a space-separated international number spans multiple
+        // whitespace tokens, so split_whitespace + looks_like_phone misses it.
+        // The whitespace-agnostic phone_spans scan must flag it as sensitive.
+        let spaced = "call me at +1 555 123 4567 tomorrow";
+        // Regression guard: the per-token path alone does NOT catch it…
+        assert!(
+            !spaced.split_whitespace().any(looks_like_phone),
+            "per-token path is expected to miss the spaced form (that is the bug)"
+        );
+        // …but classify() now does, via contains_intl_phone.
+        assert!(
+            classify(spaced).categories.contains(&"phone"),
+            "spaced international phone must be classified sensitive"
+        );
+        assert!(contains_intl_phone(spaced));
+        // The span starts at '+' and ends after the last digit.
+        let spans = phone_spans(spaced);
+        assert_eq!(spans.len(), 1, "exactly one phone span: {spans:?}");
+        let (s, e) = spans[0];
+        assert_eq!(&spaced[s..e], "+1 555 123 4567");
+    }
+
+    #[test]
+    fn test_intl_phone_span_excludes_trailing_separator() {
+        // A trailing space/paren after the last digit must not be in the span.
+        let spans = phone_spans("ph: +44 20 7946 0958 .");
+        assert_eq!(spans.len(), 1);
+        let (s, e) = spans[0];
+        assert_eq!(&"ph: +44 20 7946 0958 ."[s..e], "+44 20 7946 0958");
+    }
+
+    #[test]
+    fn test_intl_phone_negatives() {
+        // Too few digits after '+' (the existing 8..=15 window), and a bare '+'.
+        assert!(phone_spans("version +2 release").is_empty());
+        assert!(phone_spans("a + b = c").is_empty());
+        // 16+ digits exceeds the window (consistent with looks_like_phone).
+        assert!(phone_spans("+1234567890123456").is_empty());
     }
 
     #[test]
@@ -720,23 +815,29 @@ mod tests {
     #[test]
     fn test_api_key_slack_xapp_and_huggingface() {
         // Slack App-Level Token (Socket Mode, xapp- prefix, real format is ~70 chars)
-        assert!(looks_like_api_key("xapp-1-A01BCDEF234-5678901234-abcdefgh0123456789abcdef0"));
+        assert!(looks_like_api_key(
+            "xapp-1-A01BCDEF234-5678901234-abcdefgh0123456789abcdef0"
+        ));
         // Shorter xapp- tokens below the minimum length threshold must not false-positive
         assert!(!looks_like_api_key("xapp-short"));
         // HuggingFace access tokens: hf_ + 37 chars typical
         assert!(looks_like_api_key("hf_abcdefghijklmnopqrstuvwxyz0123456"));
         assert!(!looks_like_api_key("hf_tiny"));
         // classify() propagates both
-        assert!(classify("use this token: xapp-1-A01BCDEF234-5678901234-abcdef01234567890")
-            .categories
-            .contains(&"api_key"));
-        assert!(classify("HUGGINGFACE_TOKEN=hf_abcdefghijklmnopqrstuvwxyz0123456")
-            .categories
-            .contains(&"env_secret"));
+        assert!(
+            classify("use this token: xapp-1-A01BCDEF234-5678901234-abcdef01234567890")
+                .categories
+                .contains(&"api_key")
+        );
+        assert!(
+            classify("HUGGINGFACE_TOKEN=hf_abcdefghijklmnopqrstuvwxyz0123456")
+                .categories
+                .contains(&"env_secret")
+        );
     }
 
     #[test]
-    fn test_api_key_with_surrounding_punctuation(){
+    fn test_api_key_with_surrounding_punctuation() {
         // ADR-099: a key quoted in JSON or wrapped in prose punctuation must
         // still be detected. Previously a leading quote/paren broke starts_with,
         // letting a quoted credential leak to the cloud undetected.

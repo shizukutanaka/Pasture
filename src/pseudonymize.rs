@@ -8,11 +8,12 @@
 //! servers.
 //!
 //! **Security caveat:** pseudonymization catches the PII patterns Pasture
-//! already detects (email, IPv4/IPv6, phone, API-key prefixes, Luhn-valid
-//! credit-card numbers — ADR-196, JWTs — ADR-197, URL-embedded credentials
-//! and env-var secret values — ADR-203, complete PEM private-key blocks —
-//! ADR-204). It is NOT a guarantee that no other sensitive information is sent
-//! — use `local_only` mode for hard guarantees.
+//! already detects (email, IPv4/IPv6, phone — including `+`-prefixed
+//! international numbers that span whitespace, ADR-207 — API-key prefixes,
+//! Luhn-valid credit-card numbers — ADR-196, JWTs — ADR-197, URL-embedded
+//! credentials and env-var secret values — ADR-203, complete PEM private-key
+//! blocks — ADR-204). It is NOT a guarantee that no other sensitive information
+//! is sent — use `local_only` mode for hard guarantees.
 //!
 //! Privacy invariant (I5): the replacement mapping lives only in memory for
 //! the duration of the request and is never logged.
@@ -384,6 +385,16 @@ fn mask_credit_cards(text: &str, ctx: &mut Ctx) -> String {
     apply_spans(text, crate::privacy::credit_card_spans(text), ctx, "CARD")
 }
 
+/// Mask international (`+`-prefixed) phone numbers with `<PHONE_n>` tokens
+/// (ADR-207). Like credit cards, a number written `+1 555 123 4567` spans
+/// several whitespace tokens, so the per-token loop (which calls
+/// `looks_like_phone` on each fragment) cannot reassemble it. A whitespace-
+/// agnostic span pre-pass closes that gap. Single-token domestic forms
+/// (`090-1234-5678`) keep flowing through the per-token loop.
+fn mask_phones(text: &str, ctx: &mut Ctx) -> String {
+    apply_spans(text, crate::privacy::phone_spans(text), ctx, "PHONE")
+}
+
 /// Mask URL-embedded credentials (`user:password` in `scheme://user:pass@host`)
 /// with `<URL_n>` tokens (ADR-203). The scheme and host are preserved; only the
 /// userinfo part is replaced, so `https://user:hunter2@host` becomes
@@ -415,12 +426,16 @@ fn mask_pem_keys(text: &str, ctx: &mut Ctx) -> String {
 fn replace_in_text(text: &str, ctx: &mut Ctx) -> String {
     // Pre-passes in order of specificity:
     //  1. Credit-card numbers (may span whitespace, ADR-196)
-    //  2. URL-embedded credentials (ADR-203)
-    //  3. Env-var secret values (ADR-203)
-    //  4. PEM private-key blocks (multi-line, ADR-204)
+    //  2. International phone numbers (`+1 555 123 4567`, span whitespace, ADR-207)
+    //  3. URL-embedded credentials (ADR-203)
+    //  4. Env-var secret values (ADR-203)
+    //  5. PEM private-key blocks (multi-line, ADR-204)
     // Each pass chains its output into the next; the per-token loop then handles
-    // the remaining single-token PII (email, IP, phone, API key, JWT).
+    // the remaining single-token PII (email, IP, domestic phone, API key, JWT).
+    // Cards and phones are disjoint: a card span starts with a digit, a phone
+    // span with '+', so the two pre-passes never contend for the same bytes.
     let masked = mask_credit_cards(text, ctx);
+    let masked = mask_phones(&masked, ctx);
     let masked = mask_url_credentials(&masked, ctx);
     let masked = mask_env_secrets(&masked, ctx);
     let masked = mask_pem_keys(&masked, ctx);
@@ -1301,5 +1316,76 @@ mod tests {
         );
         assert!(c.contains("<IP_1>"), "first IP tokenized: {c}");
         assert!(c.contains("<IP_2>"), "second IP tokenized: {c}");
+    }
+
+    // ── ADR-207: international phone numbers spanning whitespace ───────────────
+
+    #[test]
+    fn test_intl_phone_with_spaces_masked_and_restored() {
+        // ADR-207: `+1 555 123 4567` spans four whitespace tokens, so the
+        // per-token loop alone cannot mask it. The phone_spans pre-pass must.
+        let msgs = vec![msg("reach me at +1 555 123 4567 anytime")];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<PHONE_1>"), "spaced phone must be masked: {c}");
+        assert!(
+            !c.contains("555 123"),
+            "raw phone digits must not remain: {c}"
+        );
+        assert!(c.starts_with("reach me at "), "prefix preserved: {c}");
+        assert!(c.ends_with(" anytime"), "suffix preserved: {c}");
+        let restored = restore(c, &mapping);
+        assert!(
+            restored.contains("+1 555 123 4567"),
+            "phone must restore intact: {restored}"
+        );
+    }
+
+    #[test]
+    fn test_domestic_phone_still_masked_by_per_token_loop() {
+        // The single-token domestic form must keep working (per-token path),
+        // and must NOT be double-counted by the phone pre-pass (no '+').
+        let msgs = vec![msg("携帯は 090-1234-5678 です")];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<PHONE_1>"), "domestic phone masked: {c}");
+        assert!(!c.contains("090-1234-5678"), "raw domestic phone gone: {c}");
+    }
+
+    #[test]
+    fn test_intl_phone_in_tool_call_arguments_masked() {
+        // ADR-207 + ADR-188: a spaced international phone inside tool-call JSON
+        // is masked too (the JSON walker hands the decoded value to the same
+        // pre-pass chain).
+        let tc = r#"[{"function":{"name":"sms","arguments":"{\"to\":\"+1 555 123 4567\"}"}}]"#;
+        let msgs = vec![Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls_json: Some(tc.to_string()),
+            ..Default::default()
+        }];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        assert!(
+            tc_out.contains("<PHONE_1>"),
+            "phone in tool args must mask: {tc_out}"
+        );
+        assert!(
+            !tc_out.contains("555 123"),
+            "raw phone must not remain: {tc_out}"
+        );
+    }
+
+    #[test]
+    fn test_card_and_intl_phone_coexist() {
+        // A card (digit-anchored) and a phone (+-anchored) in the same text are
+        // masked independently by their disjoint pre-passes.
+        let msgs = vec![msg("card 4111 1111 1111 1111 phone +1 555 123 4567")];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<CARD_1>"), "card masked: {c}");
+        assert!(c.contains("<PHONE_1>"), "phone masked: {c}");
+        assert!(!c.contains("4111"), "raw card gone: {c}");
+        assert!(!c.contains("555 123"), "raw phone gone: {c}");
     }
 }

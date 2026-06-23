@@ -444,7 +444,9 @@ Pasture proxies the full OpenAI tool-calling loop across both providers, end to 
 When `PASTURE_PSEUDONYMIZE=1`, **cloud-bound** requests have detected PII replaced with
 stable opaque tokens before they leave the machine, and the cloud response has the
 tokens restored to the original values. Categories: `<EMAIL_n>`, `<IP_n>` (v4+v6),
-`<PHONE_n>`, `<KEY_n>`, `<CARD_n>` (Luhn-valid credit cards, ADR-196),
+`<PHONE_n>` (domestic single-token forms via the per-token loop; `+`-prefixed
+international numbers that span whitespace such as `+1 555 123 4567` via a span
+pre-pass, ADR-207), `<KEY_n>`, `<CARD_n>` (Luhn-valid credit cards, ADR-196),
 `<JWT_n>` (ADR-197), `<URL_n>` (userinfo in `scheme://user:pass@host`, ADR-203),
 `<ENV_n>` (secret value in `KEY=value` / `export KEY=value` assignments, ADR-203),
 `<PEM_n>` (complete PEM private-key block, header + body + footer, ADR-204).
