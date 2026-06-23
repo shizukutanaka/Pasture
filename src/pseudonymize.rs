@@ -52,9 +52,17 @@ pub fn pseudonymize_messages(messages: &[Message]) -> (Vec<Message>, Mapping) {
 
 /// Restore opaque tokens in a response string to the original PII values.
 /// Tokens that don't appear in the mapping are left as-is.
+///
+/// Tokens are replaced longest-first (ADR-205) to prevent the prefix-collision
+/// where `<EMAIL_1>` (9 chars) is a prefix of `<EMAIL_10>` (10 chars): if we
+/// replaced shorter tokens first, every `<EMAIL_10>` in the text would become
+/// `alice@example.com0>` (corrupted). Sorting by descending token length makes
+/// `<EMAIL_10>` match before `<EMAIL_1>` so both restore cleanly.
 pub fn restore(text: &str, mapping: &[(String, String)]) -> String {
     let mut out = text.to_string();
-    for (original, token) in mapping {
+    let mut sorted: Vec<&(String, String)> = mapping.iter().collect();
+    sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    for (original, token) in sorted {
         out = out.replace(token.as_str(), original.as_str());
     }
     out
@@ -132,9 +140,9 @@ struct Ctx {
     key_n: usize,
     card_n: usize,
     jwt_n: usize,
-    url_n: usize,  // ADR-203: URL-embedded credentials
-    env_n: usize,  // ADR-203: env-var secret values
-    pem_n: usize,  // ADR-204: PEM private-key blocks
+    url_n: usize, // ADR-203: URL-embedded credentials
+    env_n: usize, // ADR-203: env-var secret values
+    pem_n: usize, // ADR-204: PEM private-key blocks
 }
 
 impl Ctx {
@@ -159,15 +167,42 @@ impl Ctx {
             return tok.clone();
         }
         let n = match category {
-            "EMAIL" => { self.email_n += 1; self.email_n }
-            "IP" => { self.ip_n += 1; self.ip_n }
-            "PHONE" => { self.phone_n += 1; self.phone_n }
-            "CARD" => { self.card_n += 1; self.card_n }
-            "JWT" => { self.jwt_n += 1; self.jwt_n }
-            "URL" => { self.url_n += 1; self.url_n }
-            "ENV" => { self.env_n += 1; self.env_n }
-            "PEM" => { self.pem_n += 1; self.pem_n }
-            _ => { self.key_n += 1; self.key_n }
+            "EMAIL" => {
+                self.email_n += 1;
+                self.email_n
+            }
+            "IP" => {
+                self.ip_n += 1;
+                self.ip_n
+            }
+            "PHONE" => {
+                self.phone_n += 1;
+                self.phone_n
+            }
+            "CARD" => {
+                self.card_n += 1;
+                self.card_n
+            }
+            "JWT" => {
+                self.jwt_n += 1;
+                self.jwt_n
+            }
+            "URL" => {
+                self.url_n += 1;
+                self.url_n
+            }
+            "ENV" => {
+                self.env_n += 1;
+                self.env_n
+            }
+            "PEM" => {
+                self.pem_n += 1;
+                self.pem_n
+            }
+            _ => {
+                self.key_n += 1;
+                self.key_n
+            }
         };
         let tok = format!("<{}_{}>", category, n);
         self.mapping.push((original.to_string(), tok.clone()));
@@ -223,7 +258,12 @@ impl Ctx {
 /// Strip leading/trailing punctuation that wraps a token but is not part
 /// of the value (e.g. `"user@example.com"` → `user@example.com`).
 fn trim_punct(s: &str) -> &str {
-    s.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '<' | '>' | '[' | ']'))
+    s.trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | ',' | ';' | '(' | ')' | '<' | '>' | '[' | ']'
+        )
+    })
 }
 
 /// Walk every JSON string literal in `json`, decode it, pseudonymize the
@@ -257,16 +297,38 @@ fn replace_in_json_strings(json: &str, ctx: &mut Ctx) -> String {
                 '\\' if i + 1 < len => {
                     let esc = chars[i + 1];
                     match esc {
-                        '"'  => { decoded.push('"');  i += 2; }
-                        '\\' => { decoded.push('\\'); i += 2; }
-                        'n'  => { decoded.push('\n'); i += 2; }
-                        't'  => { decoded.push('\t'); i += 2; }
-                        'r'  => { decoded.push('\r'); i += 2; }
-                        _    => { decoded.push('\\'); decoded.push(esc); i += 2; }
+                        '"' => {
+                            decoded.push('"');
+                            i += 2;
+                        }
+                        '\\' => {
+                            decoded.push('\\');
+                            i += 2;
+                        }
+                        'n' => {
+                            decoded.push('\n');
+                            i += 2;
+                        }
+                        't' => {
+                            decoded.push('\t');
+                            i += 2;
+                        }
+                        'r' => {
+                            decoded.push('\r');
+                            i += 2;
+                        }
+                        _ => {
+                            decoded.push('\\');
+                            decoded.push(esc);
+                            i += 2;
+                        }
                     }
                 }
                 '"' => break,
-                c   => { decoded.push(c); i += 1; }
+                c => {
+                    decoded.push(c);
+                    i += 1;
+                }
             }
         }
         // Recurse if the decoded value itself looks like a JSON object/array
@@ -467,15 +529,26 @@ mod tests {
         let msgs = vec![msg("alice@example.com and alice@example.com again")];
         let (out, mapping) = pseudonymize_messages(&msgs);
         let count = out[0].content.matches("<EMAIL_1>").count();
-        assert_eq!(count, 2, "same email should use the same token: {}", out[0].content);
-        assert_eq!(mapping.len(), 1, "only one mapping entry for the same value");
+        assert_eq!(
+            count, 2,
+            "same email should use the same token: {}",
+            out[0].content
+        );
+        assert_eq!(
+            mapping.len(),
+            1,
+            "only one mapping entry for the same value"
+        );
     }
 
     #[test]
     fn test_benign_text_unchanged() {
         let msgs = vec![msg("what is the capital of France?")];
         let (out, mapping) = pseudonymize_messages(&msgs);
-        assert_eq!(out[0].content, msgs[0].content, "benign text must not change");
+        assert_eq!(
+            out[0].content, msgs[0].content,
+            "benign text must not change"
+        );
         assert!(mapping.is_empty(), "no mapping for benign text");
     }
 
@@ -484,7 +557,10 @@ mod tests {
         let text = "  hello  world  ";
         let msgs = vec![msg(text)];
         let (out, _) = pseudonymize_messages(&msgs);
-        assert_eq!(out[0].content, text, "whitespace must be preserved when no PII");
+        assert_eq!(
+            out[0].content, text,
+            "whitespace must be preserved when no PII"
+        );
     }
 
     #[test]
@@ -499,7 +575,11 @@ mod tests {
         // ADR-196: a Luhn-valid card (4111 1111 1111 1111, the standard Visa test
         // number) must be masked before reaching the cloud and restored after.
         // No-separator and space-separated forms both mask.
-        for card in ["4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111"] {
+        for card in [
+            "4111111111111111",
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+        ] {
             let msgs = vec![msg(&format!("charge {card} now"))];
             let (out, mapping) = pseudonymize_messages(&msgs);
             assert!(
@@ -525,14 +605,19 @@ mod tests {
         // A short or non-Luhn digit run must not be masked as a card.
         let msgs = vec![msg("order 12345 and ref 4111111111111112")]; // 2nd fails Luhn
         let (out, _) = pseudonymize_messages(&msgs);
-        assert!(!out[0].content.contains("<CARD"), "no card token: {}", out[0].content);
+        assert!(
+            !out[0].content.contains("<CARD"),
+            "no card token: {}",
+            out[0].content
+        );
         assert!(out[0].content.contains("12345"), "short number preserved");
     }
 
     #[test]
     fn test_credit_card_in_tool_call_arguments_masked() {
         // ADR-196 + ADR-188: a card inside tool-call argument JSON is masked too.
-        let tc = r#"[{"function":{"name":"charge","arguments":"{\"card\":\"4111111111111111\"}"}}]"#;
+        let tc =
+            r#"[{"function":{"name":"charge","arguments":"{\"card\":\"4111111111111111\"}"}}]"#;
         let msgs = vec![Message {
             role: "assistant".to_string(),
             content: String::new(),
@@ -541,8 +626,14 @@ mod tests {
         }];
         let (out, _) = pseudonymize_messages(&msgs);
         let tc_out = out[0].tool_calls_json.as_deref().unwrap();
-        assert!(tc_out.contains("<CARD_1>"), "card in tool args must mask: {tc_out}");
-        assert!(!tc_out.contains("4111111111111111"), "raw card must not remain: {tc_out}");
+        assert!(
+            tc_out.contains("<CARD_1>"),
+            "card in tool args must mask: {tc_out}"
+        );
+        assert!(
+            !tc_out.contains("4111111111111111"),
+            "raw card must not remain: {tc_out}"
+        );
     }
 
     #[test]
@@ -557,7 +648,11 @@ mod tests {
             "JWT must be masked: {}",
             out[0].content
         );
-        assert!(!out[0].content.contains(jwt), "raw JWT must not remain: {}", out[0].content);
+        assert!(
+            !out[0].content.contains(jwt),
+            "raw JWT must not remain: {}",
+            out[0].content
+        );
         let restored = restore(&out[0].content, &mapping);
         assert!(restored.contains(jwt), "JWT must restore: {restored}");
     }
@@ -566,9 +661,8 @@ mod tests {
     fn test_jwt_in_tool_call_arguments_masked() {
         // ADR-197 + ADR-188: a JWT inside tool-call argument JSON is masked too.
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJ1IjoieCJ9.sig_value_1234567";
-        let tc = format!(
-            r#"[{{"function":{{"name":"call","arguments":"{{\"token\":\"{jwt}\"}}"}}}}]"#
-        );
+        let tc =
+            format!(r#"[{{"function":{{"name":"call","arguments":"{{\"token\":\"{jwt}\"}}"}}}}]"#);
         let msgs = vec![Message {
             role: "assistant".to_string(),
             content: String::new(),
@@ -577,7 +671,10 @@ mod tests {
         }];
         let (out, _) = pseudonymize_messages(&msgs);
         let tc_out = out[0].tool_calls_json.as_deref().unwrap();
-        assert!(tc_out.contains("<JWT_1>"), "JWT in tool args must mask: {tc_out}");
+        assert!(
+            tc_out.contains("<JWT_1>"),
+            "JWT in tool args must mask: {tc_out}"
+        );
         assert!(!tc_out.contains(jwt), "raw JWT must not remain: {tc_out}");
     }
 
@@ -635,8 +732,14 @@ mod tests {
         let msgs = vec![tool_call_msg("", tc)];
         let (out, _) = pseudonymize_messages(&msgs);
         let tc_out = out[0].tool_calls_json.as_deref().unwrap();
-        assert!(tc_out.contains("<IP_1>"), "IP must be pseudonymized: {tc_out}");
-        assert!(!tc_out.contains("192.168.1.100"), "raw IP must not remain: {tc_out}");
+        assert!(
+            tc_out.contains("<IP_1>"),
+            "IP must be pseudonymized: {tc_out}"
+        );
+        assert!(
+            !tc_out.contains("192.168.1.100"),
+            "raw IP must not remain: {tc_out}"
+        );
     }
 
     #[test]
@@ -662,7 +765,10 @@ mod tests {
         let (out, mapping) = pseudonymize_messages(&msgs);
         let tc_out = out[0].tool_calls_json.as_deref().unwrap();
         // JSON may be reformatted by re-encode but must not change PII-free values.
-        assert!(!tc_out.contains("<EMAIL"), "no email token for benign args: {tc_out}");
+        assert!(
+            !tc_out.contains("<EMAIL"),
+            "no email token for benign args: {tc_out}"
+        );
         assert!(mapping.is_empty(), "no mapping entries for benign args");
     }
 
@@ -672,9 +778,7 @@ mod tests {
         // argument must share a stable token across the full request (so restore
         // can use a single mapping entry to fix both).
         let email = "shared@example.com";
-        let tc = format!(
-            r#"[{{"function":{{"arguments":"{{\"to\":\"{email}\"}}"}}}}"#
-        );
+        let tc = format!(r#"[{{"function":{{"arguments":"{{\"to\":\"{email}\"}}"}}}}"#);
         let msgs = vec![Message {
             role: "assistant".to_string(),
             content: format!("sending to {email}"),
@@ -769,7 +873,10 @@ mod tests {
             r.pending.len()
         );
         let tail = r.finish();
-        assert!(format!("{out}{tail}").contains("a < "), "literal '<' preserved");
+        assert!(
+            format!("{out}{tail}").contains("a < "),
+            "literal '<' preserved"
+        );
     }
 
     #[test]
@@ -791,7 +898,11 @@ mod tests {
         let mut r = StreamRestorer::new(Vec::new());
         let out = r.push("a < b still flowing");
         assert_eq!(out, "a < b still flowing");
-        assert!(r.pending.is_empty(), "empty mapping must not buffer: {:?}", r.pending);
+        assert!(
+            r.pending.is_empty(),
+            "empty mapping must not buffer: {:?}",
+            r.pending
+        );
     }
 
     #[test]
@@ -804,7 +915,10 @@ mod tests {
         }
         out.push_str(&r.finish());
         assert_eq!(out, "x alice@example.com y");
-        assert!(!out.contains("<EMAIL_1>"), "raw token must not survive: {out}");
+        assert!(
+            !out.contains("<EMAIL_1>"),
+            "raw token must not survive: {out}"
+        );
     }
 
     // ── ADR-203: url_credential + env_secret masking ────────────────────────
@@ -820,7 +934,10 @@ mod tests {
         assert!(c.contains("https://"), "scheme must be preserved: {c}");
         assert!(c.contains("@db.example.com"), "host must be preserved: {c}");
         let restored = restore(c, &mapping);
-        assert!(restored.contains("admin:hunter2"), "userinfo must restore: {restored}");
+        assert!(
+            restored.contains("admin:hunter2"),
+            "userinfo must restore: {restored}"
+        );
     }
 
     #[test]
@@ -828,7 +945,10 @@ mod tests {
         // A port-only URL must not be masked (it has no userinfo).
         let msgs = vec![msg("server at http://localhost:8080/api/v1")];
         let (out, mapping) = pseudonymize_messages(&msgs);
-        assert_eq!(out[0].content, msgs[0].content, "port-only URL must not change");
+        assert_eq!(
+            out[0].content, msgs[0].content,
+            "port-only URL must not change"
+        );
         assert!(mapping.is_empty());
     }
 
@@ -841,7 +961,10 @@ mod tests {
         let c = &out[0].content;
         assert!(c.contains("<URL_1>"), "first cred must mask: {c}");
         assert!(c.contains("<URL_2>"), "second cred must mask: {c}");
-        assert!(!c.contains("secret1") && !c.contains("secret2"), "no raw creds: {c}");
+        assert!(
+            !c.contains("secret1") && !c.contains("secret2"),
+            "no raw creds: {c}"
+        );
         assert_eq!(mapping.len(), 2);
     }
 
@@ -857,8 +980,14 @@ mod tests {
         }];
         let (out, _) = pseudonymize_messages(&msgs);
         let tc_out = out[0].tool_calls_json.as_deref().unwrap();
-        assert!(tc_out.contains("<URL_1>"), "URL cred in tool args must mask: {tc_out}");
-        assert!(!tc_out.contains("p4ss"), "raw password must not remain: {tc_out}");
+        assert!(
+            tc_out.contains("<URL_1>"),
+            "URL cred in tool args must mask: {tc_out}"
+        );
+        assert!(
+            !tc_out.contains("p4ss"),
+            "raw password must not remain: {tc_out}"
+        );
     }
 
     #[test]
@@ -872,7 +1001,10 @@ mod tests {
         assert!(c.contains("DB_PASSWORD="), "key must be preserved: {c}");
         assert!(c.contains("DB_HOST=localhost"), "benign var unchanged: {c}");
         let restored = restore(c, &mapping);
-        assert!(restored.contains("hunter2"), "value must restore: {restored}");
+        assert!(
+            restored.contains("hunter2"),
+            "value must restore: {restored}"
+        );
     }
 
     #[test]
@@ -881,8 +1013,14 @@ mod tests {
         let (out, _) = pseudonymize_messages(&msgs);
         let c = &out[0].content;
         assert!(c.contains("<ENV_1>"), "export form must be masked: {c}");
-        assert!(!c.contains("supersecrettoken123"), "raw token must not remain: {c}");
-        assert!(c.contains("export API_TOKEN="), "export + key preserved: {c}");
+        assert!(
+            !c.contains("supersecrettoken123"),
+            "raw token must not remain: {c}"
+        );
+        assert!(
+            c.contains("export API_TOKEN="),
+            "export + key preserved: {c}"
+        );
     }
 
     #[test]
@@ -913,13 +1051,25 @@ mod tests {
         let (out, mapping) = pseudonymize_messages(&msgs);
         let c = &out[0].content;
         assert!(c.contains("<PEM_1>"), "PEM block must be masked: {c}");
-        assert!(!c.contains("-----BEGIN"), "BEGIN header must not remain: {c}");
-        assert!(!c.contains("MIIEpAIBAAKCAQEA"), "key material must not remain: {c}");
+        assert!(
+            !c.contains("-----BEGIN"),
+            "BEGIN header must not remain: {c}"
+        );
+        assert!(
+            !c.contains("MIIEpAIBAAKCAQEA"),
+            "key material must not remain: {c}"
+        );
         assert!(c.starts_with("here is my key:"), "prefix preserved: {c}");
         assert!(c.ends_with("\nend"), "suffix preserved: {c}");
         let restored = restore(c, &mapping);
-        assert!(restored.contains("-----BEGIN RSA PRIVATE KEY-----"), "header restores: {restored}");
-        assert!(restored.contains("MIIEpAIBAAKCAQEA"), "key material restores: {restored}");
+        assert!(
+            restored.contains("-----BEGIN RSA PRIVATE KEY-----"),
+            "header restores: {restored}"
+        );
+        assert!(
+            restored.contains("MIIEpAIBAAKCAQEA"),
+            "key material restores: {restored}"
+        );
     }
 
     #[test]
@@ -927,7 +1077,11 @@ mod tests {
         let msgs = vec![msg(&format!("key: {FAKE_PKCS8_PEM}"))];
         let (out, _) = pseudonymize_messages(&msgs);
         assert!(out[0].content.contains("<PEM_1>"), "{}", out[0].content);
-        assert!(!out[0].content.contains("-----BEGIN PRIVATE KEY"), "{}", out[0].content);
+        assert!(
+            !out[0].content.contains("-----BEGIN PRIVATE KEY"),
+            "{}",
+            out[0].content
+        );
     }
 
     #[test]
@@ -935,7 +1089,11 @@ mod tests {
         let msgs = vec![msg(FAKE_EC_PEM)];
         let (out, _) = pseudonymize_messages(&msgs);
         assert!(out[0].content.contains("<PEM_1>"), "{}", out[0].content);
-        assert!(!out[0].content.contains("-----BEGIN EC"), "{}", out[0].content);
+        assert!(
+            !out[0].content.contains("-----BEGIN EC"),
+            "{}",
+            out[0].content
+        );
     }
 
     #[test]
@@ -955,17 +1113,26 @@ mod tests {
         let pub_key = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9test\n-----END PUBLIC KEY-----";
         let msgs = vec![msg(pub_key)];
         let (out, mapping) = pseudonymize_messages(&msgs);
-        assert_eq!(out[0].content, pub_key, "public key must not change: {}", out[0].content);
+        assert_eq!(
+            out[0].content, pub_key,
+            "public key must not change: {}",
+            out[0].content
+        );
         assert!(mapping.is_empty());
     }
 
     #[test]
     fn test_pem_certificate_not_masked() {
         // A CERTIFICATE block must NOT be masked.
-        let cert = "-----BEGIN CERTIFICATE-----\nMIIDazCCAlOgAwIBAgItest\n-----END CERTIFICATE-----";
+        let cert =
+            "-----BEGIN CERTIFICATE-----\nMIIDazCCAlOgAwIBAgItest\n-----END CERTIFICATE-----";
         let msgs = vec![msg(cert)];
         let (out, mapping) = pseudonymize_messages(&msgs);
-        assert_eq!(out[0].content, cert, "certificate must not change: {}", out[0].content);
+        assert_eq!(
+            out[0].content, cert,
+            "certificate must not change: {}",
+            out[0].content
+        );
         assert!(mapping.is_empty());
     }
 
@@ -984,7 +1151,65 @@ mod tests {
         }];
         let (out, _) = pseudonymize_messages(&msgs);
         let tc_out = out[0].tool_calls_json.as_deref().unwrap();
-        assert!(tc_out.contains("<PEM_1>"), "PEM in tool args must mask: {tc_out}");
-        assert!(!tc_out.contains("MIIEpAIBAAKCAQEA"), "key material must not remain: {tc_out}");
+        assert!(
+            tc_out.contains("<PEM_1>"),
+            "PEM in tool args must mask: {tc_out}"
+        );
+        assert!(
+            !tc_out.contains("MIIEpAIBAAKCAQEA"),
+            "key material must not remain: {tc_out}"
+        );
+    }
+
+    // ── ADR-205: restore() prefix-collision fix ──────────────────────────────
+
+    #[test]
+    fn test_restore_no_prefix_collision_with_10_plus_emails() {
+        // ADR-205: tokens <EMAIL_1>…<EMAIL_9> are 9-byte prefixes of
+        // <EMAIL_10>…<EMAIL_N>.  Before the fix, restore() iterated in insertion
+        // order, so replacing <EMAIL_1> first would turn every <EMAIL_10> in the
+        // text into `user1@example.com0>` (corrupted).  Longest-first ordering
+        // ensures <EMAIL_10> is matched before <EMAIL_1>.
+        let emails: Vec<String> = (1..=12).map(|i| format!("user{i}@example.com")).collect();
+        let msgs = vec![msg(&emails.join(" "))];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        // Every value must have been tokenized.
+        for i in 1..=12 {
+            let tok = format!("<EMAIL_{i}>");
+            assert!(
+                out[0].content.contains(&tok),
+                "token {tok} must appear: {}",
+                out[0].content
+            );
+        }
+        // restore() must reconstruct every original address without corruption.
+        let restored = restore(&out[0].content, &mapping);
+        for email in &emails {
+            assert!(
+                restored.contains(email.as_str()),
+                "email {email} must restore without corruption: {restored}"
+            );
+        }
+        // No raw token residue must remain in the restored text.
+        assert!(
+            !restored.contains("<EMAIL_"),
+            "no token residue after restore: {restored}"
+        );
+    }
+
+    #[test]
+    fn test_restore_no_prefix_collision_with_10_plus_ip_addresses() {
+        // Same prefix-collision risk for IP category (and any other ≥10 distinct values).
+        let ips: Vec<String> = (1..=11).map(|i| format!("10.0.0.{i}")).collect();
+        let msgs = vec![msg(&ips.join(" "))];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let restored = restore(&out[0].content, &mapping);
+        for ip in &ips {
+            assert!(
+                restored.contains(ip.as_str()),
+                "IP {ip} must restore: {restored}"
+            );
+        }
+        assert!(!restored.contains("<IP_"), "no token residue: {restored}");
     }
 }
