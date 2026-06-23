@@ -174,30 +174,101 @@ pub fn contains_pem_key(text: &str) -> bool {
     text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----")
 }
 
+/// Returns byte ranges of the `userinfo` (user:password) inside each URL with
+/// embedded credentials (ADR-203). Each span covers the userinfo only (not the
+/// `://` or `@`), so the pseudonymizer can replace only the credential while
+/// preserving the scheme and host. Example:
+///   `https://user:pass@host/path` → span = byte range of `user:pass`.
+/// Port-only URLs (`http://host:8080/path`) are not matched — they have no `@`.
+pub fn url_credential_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut search_start = 0;
+    while let Some(rel) = text[search_start..].find("://") {
+        let after_start = search_start + rel + 3;
+        let after = &text[after_start..];
+        let authority_end = after.find('/').unwrap_or(after.len());
+        let authority = &after[..authority_end];
+        if let Some(at_pos) = authority.find('@') {
+            let user_info = &authority[..at_pos];
+            if let Some(colon) = user_info.find(':') {
+                if !user_info[colon + 1..].is_empty() {
+                    spans.push((after_start, after_start + at_pos));
+                }
+            }
+        }
+        search_start = after_start;
+    }
+    spans
+}
+
 /// Detect URL-embedded credentials: `scheme://user:password@host`.
 /// Requires a non-empty password part after the colon to avoid matching
 /// `http://host:8080/path` (port-only, no user info).
 pub fn contains_url_credential(text: &str) -> bool {
-    let mut search = text;
-    while let Some(pos) = search.find("://") {
-        let after = &search[pos + 3..];
-        // Bound the search: credentials appear before the first slash in the authority
-        let authority = match after.find('/') {
-            Some(s) => &after[..s],
-            None => after,
+    !url_credential_spans(text).is_empty()
+}
+
+/// Returns byte ranges of the **value** (the secret part) in each secret
+/// environment-variable assignment found in `text` (ADR-203). The span covers
+/// the raw value text including any surrounding quotes, so the pseudonymizer can
+/// replace the value while preserving the key name and `=`.
+/// Example: `DB_PASSWORD=hunter2\n` → span = byte range of `hunter2`.
+pub fn env_secret_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut line_start = 0;
+    for line in text.lines() {
+        let raw_line = &text[line_start..line_start + line.len()];
+        let trimmed_offset = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        let (trimmed, export_add) = if let Some(s) = trimmed.strip_prefix("export ") {
+            (s, "export ".len())
+        } else {
+            (trimmed, 0)
         };
-        if let Some(at_pos) = authority.find('@') {
-            let user_info = &authority[..at_pos];
-            if let Some(colon) = user_info.find(':') {
-                // Non-empty password part after the colon
-                if !user_info[colon + 1..].is_empty() {
-                    return true;
+        if let Some(eq_pos) = trimmed.find('=') {
+            let key = trimmed[..eq_pos].trim();
+            if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let key_lower = key.to_lowercase();
+                if ENV_SECRET_SUBSTRINGS.iter().any(|s| key_lower.contains(s)) {
+                    let raw_val = &trimmed[eq_pos + 1..];
+                    let val = raw_val.trim().trim_matches('"').trim_matches('\'').trim();
+                    let trivial = val.is_empty()
+                        || matches!(val, "true" | "false" | "0" | "1" | "none" | "null" | "''");
+                    if !trivial && val.len() >= 4 {
+                        // Span covers the raw value (including any surrounding quotes)
+                        // from after the `=` sign in the original text.
+                        let val_start_in_raw = trimmed_offset + export_add + eq_pos + 1;
+                        // Trim leading whitespace from the value start.
+                        let leading_ws = raw_val.len() - raw_val.trim_start().len();
+                        let span_start = line_start + val_start_in_raw + leading_ws;
+                        // Trim trailing whitespace/newline from the value end.
+                        let raw_val_trimmed = raw_val.trim();
+                        let span_end = span_start + raw_val_trimmed.len();
+                        if span_start < span_end && span_end <= line_start + raw_line.len() {
+                            spans.push((span_start, span_end));
+                        }
+                    }
                 }
             }
         }
-        search = &search[pos + 3..];
+        // Advance past this line + the newline character (\n or nothing at EOF).
+        line_start += line.len();
+        if line_start < text.len()
+            && (text.as_bytes()[line_start] == b'\n'
+                || text.as_bytes()[line_start] == b'\r')
+        {
+            // Skip \r\n or \n
+            if text.as_bytes()[line_start] == b'\r'
+                && line_start + 1 < text.len()
+                && text.as_bytes()[line_start + 1] == b'\n'
+            {
+                line_start += 2;
+            } else {
+                line_start += 1;
+            }
+        }
     }
-    false
+    spans
 }
 
 /// Detect environment-variable secret assignments, e.g.:
@@ -205,30 +276,7 @@ pub fn contains_url_credential(text: &str) -> bool {
 /// Matches lines where the variable name contains a secret-sounding substring
 /// and the value is non-trivial (length ≥ 4, not a bare boolean/null/empty).
 pub fn contains_env_secret(text: &str) -> bool {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-        let Some((key, val)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        // Variable names are ASCII alphanumeric + underscores only
-        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
-        }
-        let key_lower = key.to_lowercase();
-        if !ENV_SECRET_SUBSTRINGS.iter().any(|s| key_lower.contains(s)) {
-            continue;
-        }
-        // Strip surrounding quotes and whitespace from the value
-        let val = val.trim().trim_matches('"').trim_matches('\'').trim();
-        let trivial =
-            val.is_empty() || matches!(val, "true" | "false" | "0" | "1" | "none" | "null" | "''");
-        if !trivial && val.len() >= 4 {
-            return true;
-        }
-    }
-    false
+    !env_secret_spans(text).is_empty()
 }
 
 /// Heuristic email: `local@domain.tld`, no spaces, dot after the `@`.

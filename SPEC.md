@@ -445,7 +445,9 @@ When `PASTURE_PSEUDONYMIZE=1`, **cloud-bound** requests have detected PII replac
 stable opaque tokens before they leave the machine, and the cloud response has the
 tokens restored to the original values. Categories: `<EMAIL_n>`, `<IP_n>` (v4+v6),
 `<PHONE_n>`, `<KEY_n>`, `<CARD_n>` (Luhn-valid credit cards, ADR-196),
-`<JWT_n>` (ADR-197). Coverage:
+`<JWT_n>` (ADR-197), `<URL_n>` (userinfo in `scheme://user:pass@host`, ADR-203),
+`<ENV_n>` (secret value in `KEY=value` / `export KEY=value` assignments, ADR-203).
+Coverage:
 
 - **Message content** — tokenised and restored (buffered + SSE, the latter handling a
   token split across deltas, ADR-168).

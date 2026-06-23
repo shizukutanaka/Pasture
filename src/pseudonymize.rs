@@ -9,9 +9,9 @@
 //!
 //! **Security caveat:** pseudonymization catches the PII patterns Pasture
 //! already detects (email, IPv4/IPv6, phone, API-key prefixes, Luhn-valid
-//! credit-card numbers — ADR-196, and JWTs — ADR-197). It is NOT a guarantee
-//! that no other sensitive information is sent — use `local_only` mode for hard
-//! guarantees.
+//! credit-card numbers — ADR-196, JWTs — ADR-197, URL-embedded credentials
+//! and env-var secret values — ADR-203). It is NOT a guarantee that no other
+//! sensitive information is sent — use `local_only` mode for hard guarantees.
 //!
 //! Privacy invariant (I5): the replacement mapping lives only in memory for
 //! the duration of the request and is never logged.
@@ -131,6 +131,8 @@ struct Ctx {
     key_n: usize,
     card_n: usize,
     jwt_n: usize,
+    url_n: usize,  // ADR-203: URL-embedded credentials
+    env_n: usize,  // ADR-203: env-var secret values
 }
 
 impl Ctx {
@@ -143,6 +145,8 @@ impl Ctx {
             key_n: 0,
             card_n: 0,
             jwt_n: 0,
+            url_n: 0,
+            env_n: 0,
         }
     }
 
@@ -157,6 +161,8 @@ impl Ctx {
             "PHONE" => { self.phone_n += 1; self.phone_n }
             "CARD" => { self.card_n += 1; self.card_n }
             "JWT" => { self.jwt_n += 1; self.jwt_n }
+            "URL" => { self.url_n += 1; self.url_n }
+            "ENV" => { self.env_n += 1; self.env_n }
             _ => { self.key_n += 1; self.key_n }
         };
         let tok = format!("<{}_{}>", category, n);
@@ -276,23 +282,20 @@ fn replace_in_json_strings(json: &str, ctx: &mut Ctx) -> String {
     out
 }
 
-/// Mask credit-card numbers with `<CARD_n>` tokens (ADR-196). Cards are handled
-/// by a whole-text pre-pass, not the per-token loop, because a card may contain
-/// space/hyphen separators (`4111 1111 1111 1111`) and so span multiple
-/// whitespace tokens that the tokenizer would never reassemble. The classifier
-/// already flags cards as sensitive; this masks them so they do not reach the
-/// cloud raw under `allow_sensitive_cloud` + `pseudonymize`. Stable per value
-/// (the same card reuses one token) via the shared `Ctx`.
-fn mask_credit_cards(text: &str, ctx: &mut Ctx) -> String {
-    let spans = crate::privacy::credit_card_spans(text);
+/// Span-based pre-pass helper: apply `spans` (byte ranges in `text`) replacing
+/// each with a token from `ctx.token_for(original, category)`.
+fn apply_spans(text: &str, spans: Vec<(usize, usize)>, ctx: &mut Ctx, category: &str) -> String {
     if spans.is_empty() {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
     for (start, end) in spans {
+        if start >= end || end > text.len() {
+            continue;
+        }
         out.push_str(&text[last..start]);
-        let tok = ctx.token_for(&text[start..end], "CARD");
+        let tok = ctx.token_for(&text[start..end], category);
         out.push_str(&tok);
         last = end;
     }
@@ -300,11 +303,42 @@ fn mask_credit_cards(text: &str, ctx: &mut Ctx) -> String {
     out
 }
 
+/// Mask credit-card numbers with `<CARD_n>` tokens (ADR-196). Cards are handled
+/// by a whole-text pre-pass, not the per-token loop, because a card may contain
+/// space/hyphen separators (`4111 1111 1111 1111`) and so span multiple
+/// whitespace tokens that the tokenizer would never reassemble.
+fn mask_credit_cards(text: &str, ctx: &mut Ctx) -> String {
+    apply_spans(text, crate::privacy::credit_card_spans(text), ctx, "CARD")
+}
+
+/// Mask URL-embedded credentials (`user:password` in `scheme://user:pass@host`)
+/// with `<URL_n>` tokens (ADR-203). The scheme and host are preserved; only the
+/// userinfo part is replaced, so `https://user:hunter2@host` becomes
+/// `https://<URL_1>@host`. A pre-pass is necessary because the URL is typically
+/// a single whitespace token and the per-token loop cannot split it.
+fn mask_url_credentials(text: &str, ctx: &mut Ctx) -> String {
+    apply_spans(text, crate::privacy::url_credential_spans(text), ctx, "URL")
+}
+
+/// Mask environment-variable secret values (`DB_PASSWORD=hunter2` →
+/// `DB_PASSWORD=<ENV_n>`) with `<ENV_n>` tokens (ADR-203). The key name and
+/// `=` sign are preserved; only the value is replaced. A line-based pre-pass
+/// handles multi-line `.env` blocks without requiring whitespace around `=`.
+fn mask_env_secrets(text: &str, ctx: &mut Ctx) -> String {
+    apply_spans(text, crate::privacy::env_secret_spans(text), ctx, "ENV")
+}
+
 /// Replace PII in `text` token by token, preserving original whitespace.
 fn replace_in_text(text: &str, ctx: &mut Ctx) -> String {
-    // Card pre-pass first: replaces multi-token card numbers with `<CARD_n>`,
-    // which the per-token loop below then passes through untouched.
+    // Pre-passes in order of specificity:
+    //  1. Credit-card numbers (may span whitespace, ADR-196)
+    //  2. URL-embedded credentials (ADR-203)
+    //  3. Env-var secret values (ADR-203)
+    // Each pass chains its output into the next; the per-token loop then handles
+    // the remaining single-token PII (email, IP, phone, API key, JWT).
     let masked = mask_credit_cards(text, ctx);
+    let masked = mask_url_credentials(&masked, ctx);
+    let masked = mask_env_secrets(&masked, ctx);
     let text = masked.as_str();
     let mut out = String::with_capacity(text.len() + 32);
     let bytes = text.as_bytes();
@@ -755,5 +789,97 @@ mod tests {
         out.push_str(&r.finish());
         assert_eq!(out, "x alice@example.com y");
         assert!(!out.contains("<EMAIL_1>"), "raw token must not survive: {out}");
+    }
+
+    // ── ADR-203: url_credential + env_secret masking ────────────────────────
+
+    #[test]
+    fn test_url_credential_is_masked_and_restored() {
+        // The credential (user:pass) must be replaced; scheme and host are kept.
+        let msgs = vec![msg("connect to https://admin:hunter2@db.example.com/mydb")];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<URL_1>"), "userinfo must be masked: {c}");
+        assert!(!c.contains("hunter2"), "raw password must not remain: {c}");
+        assert!(c.contains("https://"), "scheme must be preserved: {c}");
+        assert!(c.contains("@db.example.com"), "host must be preserved: {c}");
+        let restored = restore(c, &mapping);
+        assert!(restored.contains("admin:hunter2"), "userinfo must restore: {restored}");
+    }
+
+    #[test]
+    fn test_url_without_credential_unchanged() {
+        // A port-only URL must not be masked (it has no userinfo).
+        let msgs = vec![msg("server at http://localhost:8080/api/v1")];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        assert_eq!(out[0].content, msgs[0].content, "port-only URL must not change");
+        assert!(mapping.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_url_credentials_masked_independently() {
+        let msgs = vec![msg(
+            "primary: postgres://alice:secret1@host1/db1 backup: postgres://bob:secret2@host2/db2",
+        )];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<URL_1>"), "first cred must mask: {c}");
+        assert!(c.contains("<URL_2>"), "second cred must mask: {c}");
+        assert!(!c.contains("secret1") && !c.contains("secret2"), "no raw creds: {c}");
+        assert_eq!(mapping.len(), 2);
+    }
+
+    #[test]
+    fn test_url_credential_in_tool_call_arguments_masked() {
+        // ADR-203 + ADR-188: a URL with embedded credentials in tool-call JSON is masked.
+        let tc = r#"[{"function":{"name":"connect","arguments":"{\"dsn\":\"mysql://user:p4ss@host/db\"}"}}]"#;
+        let msgs = vec![Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls_json: Some(tc.to_string()),
+            ..Default::default()
+        }];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        assert!(tc_out.contains("<URL_1>"), "URL cred in tool args must mask: {tc_out}");
+        assert!(!tc_out.contains("p4ss"), "raw password must not remain: {tc_out}");
+    }
+
+    #[test]
+    fn test_env_secret_value_is_masked_and_restored() {
+        // The value after `=` is masked; the key name is kept.
+        let msgs = vec![msg("DB_PASSWORD=hunter2\nDB_HOST=localhost")];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<ENV_1>"), "secret value must be masked: {c}");
+        assert!(!c.contains("hunter2"), "raw value must not remain: {c}");
+        assert!(c.contains("DB_PASSWORD="), "key must be preserved: {c}");
+        assert!(c.contains("DB_HOST=localhost"), "benign var unchanged: {c}");
+        let restored = restore(c, &mapping);
+        assert!(restored.contains("hunter2"), "value must restore: {restored}");
+    }
+
+    #[test]
+    fn test_env_secret_export_form_is_masked() {
+        let msgs = vec![msg("export API_TOKEN=\"supersecrettoken123\"")];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<ENV_1>"), "export form must be masked: {c}");
+        assert!(!c.contains("supersecrettoken123"), "raw token must not remain: {c}");
+        assert!(c.contains("export API_TOKEN="), "export + key preserved: {c}");
+    }
+
+    #[test]
+    fn test_env_trivial_value_not_masked() {
+        // Short or boolean/null/empty values are not secrets.
+        for s in ["DEBUG=true", "RETRY=0", "SECRET=", "DB_PASS=''"] {
+            let msgs = vec![msg(s)];
+            let (out, _) = pseudonymize_messages(&msgs);
+            assert!(
+                !out[0].content.contains("<ENV"),
+                "trivial env assignment {s:?} must not mask: {}",
+                out[0].content
+            );
+        }
     }
 }
