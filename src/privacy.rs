@@ -174,6 +174,50 @@ pub fn contains_pem_key(text: &str) -> bool {
     text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----")
 }
 
+/// Returns byte ranges of complete PEM private-key blocks in `text` (ADR-204).
+/// Each span covers the entire block from `-----BEGIN` to the closing `-----`
+/// of the matching `-----END` footer, so the pseudonymizer can replace the whole
+/// block (header + base64 body + footer) with a single `<PEM_n>` token.
+///
+/// Supported types: RSA PRIVATE KEY, EC PRIVATE KEY, PRIVATE KEY (PKCS#8),
+/// OPENSSH PRIVATE KEY. Public keys (`PUBLIC KEY`) and certificates (`CERTIFICATE`)
+/// are not matched — they do not contain "PRIVATE KEY".
+///
+/// Note: `contains_pem_key` is deliberately kept more permissive (an unpaired
+/// BEGIN header is enough to flag the text as sensitive and keep it local).
+/// `pem_key_spans` only returns spans for complete, paired blocks; an unpaired
+/// BEGIN with no END is not returned (there is nothing coherent to mask).
+pub fn pem_key_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut search_start = 0;
+    while let Some(begin_rel) = text[search_start..].find("-----BEGIN") {
+        let begin_abs = search_start + begin_rel;
+        let after_begin = &text[begin_abs + 10..];
+        // The begin header ends with "PRIVATE KEY-----" (covers RSA/EC/PKCS8/OPENSSH).
+        let Some(pk_rel) = after_begin.find("PRIVATE KEY-----") else {
+            // No "PRIVATE KEY-----" after this "-----BEGIN" → not a private-key block.
+            search_start = begin_abs + 10;
+            continue;
+        };
+        let header_end = begin_abs + 10 + pk_rel + "PRIVATE KEY-----".len();
+        // Find the "-----END" footer after the base64 body.
+        let Some(end_rel) = text[header_end..].find("-----END") else {
+            search_start = header_end;
+            continue;
+        };
+        let end_abs = header_end + end_rel;
+        // Find the closing "-----" at the end of the footer line.
+        let Some(close_rel) = text[end_abs + 8..].find("-----") else {
+            search_start = end_abs + 8;
+            continue;
+        };
+        let block_end = end_abs + 8 + close_rel + 5;
+        spans.push((begin_abs, block_end));
+        search_start = block_end;
+    }
+    spans
+}
+
 /// Returns byte ranges of the `userinfo` (user:password) inside each URL with
 /// embedded credentials (ADR-203). Each span covers the userinfo only (not the
 /// `://` or `@`), so the pseudonymizer can replace only the credential while

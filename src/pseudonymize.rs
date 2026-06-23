@@ -10,8 +10,9 @@
 //! **Security caveat:** pseudonymization catches the PII patterns Pasture
 //! already detects (email, IPv4/IPv6, phone, API-key prefixes, Luhn-valid
 //! credit-card numbers — ADR-196, JWTs — ADR-197, URL-embedded credentials
-//! and env-var secret values — ADR-203). It is NOT a guarantee that no other
-//! sensitive information is sent — use `local_only` mode for hard guarantees.
+//! and env-var secret values — ADR-203, complete PEM private-key blocks —
+//! ADR-204). It is NOT a guarantee that no other sensitive information is sent
+//! — use `local_only` mode for hard guarantees.
 //!
 //! Privacy invariant (I5): the replacement mapping lives only in memory for
 //! the duration of the request and is never logged.
@@ -133,6 +134,7 @@ struct Ctx {
     jwt_n: usize,
     url_n: usize,  // ADR-203: URL-embedded credentials
     env_n: usize,  // ADR-203: env-var secret values
+    pem_n: usize,  // ADR-204: PEM private-key blocks
 }
 
 impl Ctx {
@@ -147,6 +149,7 @@ impl Ctx {
             jwt_n: 0,
             url_n: 0,
             env_n: 0,
+            pem_n: 0,
         }
     }
 
@@ -163,6 +166,7 @@ impl Ctx {
             "JWT" => { self.jwt_n += 1; self.jwt_n }
             "URL" => { self.url_n += 1; self.url_n }
             "ENV" => { self.env_n += 1; self.env_n }
+            "PEM" => { self.pem_n += 1; self.pem_n }
             _ => { self.key_n += 1; self.key_n }
         };
         let tok = format!("<{}_{}>", category, n);
@@ -328,17 +332,29 @@ fn mask_env_secrets(text: &str, ctx: &mut Ctx) -> String {
     apply_spans(text, crate::privacy::env_secret_spans(text), ctx, "ENV")
 }
 
+/// Mask complete PEM private-key blocks with `<PEM_n>` tokens (ADR-204).
+/// The entire block — header, base64 body, and footer — is replaced so no key
+/// material reaches the cloud under `allow_sensitive_cloud` + `pseudonymize`.
+/// Only complete, paired blocks (with both a BEGIN header and an END footer) are
+/// masked; an unpaired header alone cannot be coherently restored and is
+/// flagged by the classifier to stay local before pseudonymization applies.
+fn mask_pem_keys(text: &str, ctx: &mut Ctx) -> String {
+    apply_spans(text, crate::privacy::pem_key_spans(text), ctx, "PEM")
+}
+
 /// Replace PII in `text` token by token, preserving original whitespace.
 fn replace_in_text(text: &str, ctx: &mut Ctx) -> String {
     // Pre-passes in order of specificity:
     //  1. Credit-card numbers (may span whitespace, ADR-196)
     //  2. URL-embedded credentials (ADR-203)
     //  3. Env-var secret values (ADR-203)
+    //  4. PEM private-key blocks (multi-line, ADR-204)
     // Each pass chains its output into the next; the per-token loop then handles
     // the remaining single-token PII (email, IP, phone, API key, JWT).
     let masked = mask_credit_cards(text, ctx);
     let masked = mask_url_credentials(&masked, ctx);
     let masked = mask_env_secrets(&masked, ctx);
+    let masked = mask_pem_keys(&masked, ctx);
     let text = masked.as_str();
     let mut out = String::with_capacity(text.len() + 32);
     let bytes = text.as_bytes();
@@ -881,5 +897,94 @@ mod tests {
                 out[0].content
             );
         }
+    }
+
+    // ── ADR-204: PEM private-key block masking ────────────────────────────
+
+    // Fake RSA private key for tests — NOT a real key, purely structural.
+    const FAKE_RSA_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAtestkey1234567890abcdef\nghijklmnopqrstuvwxyzABCDEFGHIJKLMN\n-----END RSA PRIVATE KEY-----";
+    const FAKE_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBGkqhkiG9w0BAQEFAASCBKcwggtest\n-----END PRIVATE KEY-----";
+    const FAKE_EC_PEM: &str = "-----BEGIN EC PRIVATE KEY-----\nMHQCAQEEITestECkeydata1234567890abc\n-----END EC PRIVATE KEY-----";
+
+    #[test]
+    fn test_pem_rsa_key_is_masked_and_restored() {
+        // The entire PEM block must be replaced; surrounding text is preserved.
+        let msgs = vec![msg(&format!("here is my key:\n{FAKE_RSA_PEM}\nend"))];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<PEM_1>"), "PEM block must be masked: {c}");
+        assert!(!c.contains("-----BEGIN"), "BEGIN header must not remain: {c}");
+        assert!(!c.contains("MIIEpAIBAAKCAQEA"), "key material must not remain: {c}");
+        assert!(c.starts_with("here is my key:"), "prefix preserved: {c}");
+        assert!(c.ends_with("\nend"), "suffix preserved: {c}");
+        let restored = restore(c, &mapping);
+        assert!(restored.contains("-----BEGIN RSA PRIVATE KEY-----"), "header restores: {restored}");
+        assert!(restored.contains("MIIEpAIBAAKCAQEA"), "key material restores: {restored}");
+    }
+
+    #[test]
+    fn test_pem_pkcs8_key_is_masked() {
+        let msgs = vec![msg(&format!("key: {FAKE_PKCS8_PEM}"))];
+        let (out, _) = pseudonymize_messages(&msgs);
+        assert!(out[0].content.contains("<PEM_1>"), "{}", out[0].content);
+        assert!(!out[0].content.contains("-----BEGIN PRIVATE KEY"), "{}", out[0].content);
+    }
+
+    #[test]
+    fn test_pem_ec_key_is_masked() {
+        let msgs = vec![msg(FAKE_EC_PEM)];
+        let (out, _) = pseudonymize_messages(&msgs);
+        assert!(out[0].content.contains("<PEM_1>"), "{}", out[0].content);
+        assert!(!out[0].content.contains("-----BEGIN EC"), "{}", out[0].content);
+    }
+
+    #[test]
+    fn test_multiple_pem_keys_masked_independently() {
+        let text = format!("{FAKE_RSA_PEM}\nand\n{FAKE_EC_PEM}");
+        let msgs = vec![msg(&text)];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<PEM_1>"), "first key masked: {c}");
+        assert!(c.contains("<PEM_2>"), "second key masked: {c}");
+        assert_eq!(mapping.len(), 2, "two distinct mappings");
+    }
+
+    #[test]
+    fn test_pem_public_key_not_masked() {
+        // A PUBLIC KEY block must NOT be masked (not a private key).
+        let pub_key = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9test\n-----END PUBLIC KEY-----";
+        let msgs = vec![msg(pub_key)];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        assert_eq!(out[0].content, pub_key, "public key must not change: {}", out[0].content);
+        assert!(mapping.is_empty());
+    }
+
+    #[test]
+    fn test_pem_certificate_not_masked() {
+        // A CERTIFICATE block must NOT be masked.
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIDazCCAlOgAwIBAgItest\n-----END CERTIFICATE-----";
+        let msgs = vec![msg(cert)];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        assert_eq!(out[0].content, cert, "certificate must not change: {}", out[0].content);
+        assert!(mapping.is_empty());
+    }
+
+    #[test]
+    fn test_pem_key_in_tool_call_arguments_masked() {
+        // ADR-204 + ADR-188: a PEM key inside tool-call argument JSON is masked.
+        let pem_escaped = FAKE_RSA_PEM.replace('\n', "\\n");
+        let tc = format!(
+            r#"[{{"function":{{"name":"upload_key","arguments":"{{\"key\":\"{pem_escaped}\"}}"}}}}"#
+        );
+        let msgs = vec![Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls_json: Some(tc),
+            ..Default::default()
+        }];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        assert!(tc_out.contains("<PEM_1>"), "PEM in tool args must mask: {tc_out}");
+        assert!(!tc_out.contains("MIIEpAIBAAKCAQEA"), "key material must not remain: {tc_out}");
     }
 }
