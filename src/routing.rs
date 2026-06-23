@@ -244,9 +244,45 @@ fn has_marker(lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| lower.contains(m))
 }
 
-/// Count distinct question marks (ASCII and full-width).
+/// Count clause-terminating question marks (ASCII `?` and full-width `？`).
+///
+/// A question mark counts only when it *ends a clause* — it is the last
+/// character of the text, or the next character is whitespace or a closing
+/// delimiter (`)`, `]`, `}`, `"`, `'`, `>`, `？`, `?`). This excludes the `?`
+/// that delimits a URL query string (`https://x.com/s?q=1`), where the `?` is
+/// immediately followed by an alphanumeric query key (ADR-209). Without this
+/// guard, a prompt that merely references three URLs with query strings tripped
+/// the `multi_question` hard signal and routed to cloud — the same
+/// delimiter-vs-operator confusion fixed for `looks_mathy` in ADR-208.
 pub fn question_count(text: &str) -> usize {
-    text.chars().filter(|&c| c == '?' || c == '？').count()
+    let chars: Vec<char> = text.chars().collect();
+    let mut count = 0;
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            // Full-width '？' is never a URL query delimiter (URLs use ASCII '?'),
+            // and CJK text has no inter-word spaces, so a '？' is followed directly
+            // by the next sentence. Always count it.
+            '？' => count += 1,
+            // ASCII '?' counts only when it ends a clause: end-of-text, or the
+            // next character is whitespace or a closing delimiter. A '?' followed
+            // immediately by an alphanumeric is a URL query key (`?q=1`), not a
+            // question (ADR-209).
+            '?' => {
+                let terminates = match chars.get(i + 1) {
+                    None => true,
+                    Some(&next) => {
+                        next.is_whitespace()
+                            || matches!(next, ')' | ']' | '}' | '"' | '\'' | '>' | '?' | '！' | '!')
+                    }
+                };
+                if terminates {
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    count
 }
 
 /// True when the text is math-heavy: at least 3 *distinct* mathematical
@@ -949,6 +985,39 @@ mod tests {
         assert_eq!(question_count("a? b? c?"), 3);
         assert!(hard_signals("why? how? when?").contains(&"multi_question"));
         assert!(!hard_signals("what is this?").contains(&"multi_question"));
+    }
+
+    #[test]
+    fn test_question_count_ignores_url_query_delimiters() {
+        // ADR-209: a '?' that delimits a URL query string is immediately
+        // followed by an alphanumeric key, so it must NOT count as a question.
+        assert_eq!(
+            question_count("https://a.com/s?q=1 https://b.com?x=2 https://c.com?y=3"),
+            0,
+            "URL query '?' must not be counted as questions"
+        );
+        // A prompt that merely references three query-string URLs must not trip
+        // the multi_question hard signal.
+        assert!(!hard_signals(
+            "compare https://a.com/s?q=1 and https://b.com?x=2 and https://c.com?y=3"
+        )
+        .contains(&"multi_question"));
+        // Real questions still count even when mixed with a query URL.
+        assert_eq!(
+            question_count("is https://a.com/s?q=1 down? why? when?"),
+            3,
+            "clause-terminating '?' still counts alongside a URL query '?'"
+        );
+    }
+
+    #[test]
+    fn test_question_count_terminating_forms() {
+        // Question mark before a closing delimiter or end-of-text counts.
+        assert_eq!(question_count("really?"), 1); // EOL
+        assert_eq!(question_count("(really?) yes"), 1); // before ')'
+        assert_eq!(question_count("\"done?\" ok"), 1); // before '"'
+        assert_eq!(question_count("これは何ですか？"), 1); // full-width at EOL
+        assert_eq!(question_count("何？本当？"), 2); // full-width before full-width
     }
 
     #[test]
