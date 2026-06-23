@@ -21,7 +21,7 @@ COMMANDS:
     connect [app]            Show how to point your app at pasture (openwebui/continue/cursor/lmstudio/sdk)
     models                   Recommend local models for your machine
     hw                       Show the detected hardware profile
-    route <text>             Dry-run: show where a prompt would be routed
+    route <text> [--json]    Dry-run: show where a prompt would be routed (--json for scripting)
     chat  <text>             Send one prompt through the router (needs Ollama)
     serve                    Start the OpenAI-compatible proxy server
     eval [--external <file>] Measure routing quality + token-threshold sweep (--json for machine output)
@@ -83,16 +83,139 @@ pub fn route_decision_text(engine: &RoutingEngine, text: &str, forced: Option<Ro
     }
 }
 
-/// Rich routing preview for `pasture route <text>` (ADR-201).
+/// What the budget/spike guard does to a cloud route (ADR-202).
+#[derive(Clone, Copy, PartialEq)]
+enum BudgetAction {
+    Block,    // reject with 429
+    Warn,     // proceed on cloud, over budget
+    Redirect, // downgrade to local
+}
+
+/// The guard's read-only verdict when it overrides a cloud route.
+struct BudgetHit {
+    spike: bool, // true = spike guard fired; false = daily budget exhausted
+    action: BudgetAction,
+    avg: u64, // running cloud-token average (spike denominator)
+}
+
+/// A computed routing preview — the single source of truth shared by the human
+/// (`route_preview_text`) and machine (`route_preview_json`) renderers, matching
+/// the fields HTTP `POST /v1/route` returns (ADR-201/202). `route` is the
+/// **effective** route *after* the budget/spike guard, so all three surfaces
+/// (CLI text, CLI JSON, HTTP JSON) agree with what would really happen.
+struct RoutePreview {
+    route: Route,
+    reason: String,
+    threshold: usize,
+    sensitive: bool,
+    categories: Vec<&'static str>,
+    est_input: u64,
+    est_output: u64,
+    est_total: u64,
+    cost_usd: f64,
+    serves_cloud: bool,
+    budget_active: bool, // a daily token budget is configured
+    today_tokens: u64,
+    budget_limit: u64,
+    spike_factor: u64,
+    hit: Option<BudgetHit>, // Some only when the guard overrides the cloud route
+}
+
+/// Compute a routing preview, applying the read-only budget/spike guard so the
+/// reported route and cost match reality (ADR-202). Budget/spike state is
+/// derived from the cost log (best-effort; the live proxy uses in-memory atomics
+/// seeded from the same log at startup). Returns `Err(reason)` if the engine
+/// cannot route (e.g. sensitive content with no local backend).
+fn compute_route_preview(
+    engine: &RoutingEngine,
+    config: &Config,
+    text: &str,
+    forced: Option<Route>,
+    today_tokens: u64,
+    cloud_count: u64,
+    cloud_sum: u64,
+) -> Result<RoutePreview, String> {
+    let report = crate::privacy::classify(text);
+    let decision = engine
+        .decide_with_sensitivity(text, forced, report.is_sensitive())
+        .map_err(|e| e.to_string())?;
+
+    let est_input = crate::routing::estimate_tokens(text) as u64;
+    let est_total = crate::routing::estimate_total_tokens(text, None) as u64;
+    let est_output = est_total.saturating_sub(est_input);
+
+    // Read-only budget/spike guard, mirroring Proxy::budget_spike_preview's
+    // conditions and apply_budget_guard's action branching (ADR-200). It only
+    // applies to an engine "cloud" decision when a guard is configured.
+    let guard_configured = config.budget_daily_tokens > 0 || config.spike_factor > 0;
+    let (route, serves_cloud, hit) = if decision.route == Route::Cloud && guard_configured {
+        let avg = if cloud_count > 0 {
+            cloud_sum / cloud_count
+        } else {
+            0
+        };
+        let spike_hit = config.spike_factor > 0
+            && est_total > 0
+            && avg > 0
+            && est_total > config.spike_factor.saturating_mul(avg);
+        let budget_hit =
+            config.budget_daily_tokens > 0 && today_tokens >= config.budget_daily_tokens;
+        if spike_hit || budget_hit {
+            let action = match config.budget_action.as_str() {
+                "block" => BudgetAction::Block,
+                "warn" => BudgetAction::Warn,
+                _ => BudgetAction::Redirect,
+            };
+            let hit = BudgetHit {
+                spike: spike_hit,
+                action,
+                avg,
+            };
+            match action {
+                // block/warn keep the cloud route; block won't actually serve it
+                // (429), so it costs nothing. redirect downgrades to local.
+                BudgetAction::Block => (Route::Cloud, false, Some(hit)),
+                BudgetAction::Warn => (Route::Cloud, true, Some(hit)),
+                BudgetAction::Redirect => (Route::Local, false, Some(hit)),
+            }
+        } else {
+            (Route::Cloud, true, None)
+        }
+    } else {
+        (decision.route, decision.route == Route::Cloud, None)
+    };
+
+    let (in_price, out_price) = config.cloud_price_per_1m;
+    let cost_usd = if serves_cloud {
+        (est_input as f64 * in_price + est_output as f64 * out_price) / 1_000_000.0
+    } else {
+        0.0
+    };
+
+    Ok(RoutePreview {
+        route,
+        reason: decision.reason,
+        threshold: engine.threshold(),
+        sensitive: report.is_sensitive(),
+        categories: report.categories,
+        est_input,
+        est_output,
+        est_total,
+        cost_usd,
+        serves_cloud,
+        budget_active: config.budget_daily_tokens > 0,
+        today_tokens,
+        budget_limit: config.budget_daily_tokens,
+        spike_factor: config.spike_factor,
+        hit,
+    })
+}
+
+/// Rich human-readable routing preview for `pasture route <text>` (ADR-201/202).
 ///
-/// Mirrors the fields returned by HTTP `POST /v1/route` so CLI and HTTP are in
-/// parity. Budget/spike state is derived from the cost log (best-effort; the
-/// live proxy uses in-memory atomics seeded from the same log at startup).
-///
-/// Parameters:
-/// - `today_tokens`: cloud tokens recorded today (from `cost::today_cloud_tokens`).
-/// - `cloud_count`:  cloud requests logged today (spike avg denominator).
-/// - `cloud_sum`:    total tokens on those cloud requests (spike avg numerator).
+/// Shows sensitivity, the **effective** route (after the budget/spike guard),
+/// reason, threshold, token estimates, cost, and budget status — the same facts
+/// HTTP `POST /v1/route` returns, formatted for a terminal.
 pub fn route_preview_text(
     engine: &RoutingEngine,
     config: &Config,
@@ -102,93 +225,78 @@ pub fn route_preview_text(
     cloud_count: u64,
     cloud_sum: u64,
 ) -> String {
-    let report = crate::privacy::classify(text);
-    let decision = match engine.decide_with_sensitivity(text, forced, report.is_sensitive()) {
-        Ok(d) => d,
+    let p = match compute_route_preview(
+        engine,
+        config,
+        text,
+        forced,
+        today_tokens,
+        cloud_count,
+        cloud_sum,
+    ) {
+        Ok(p) => p,
         Err(e) => return format!("error: {e}"),
     };
 
-    let est_input = crate::routing::estimate_tokens(text) as u64;
-    let est_total = crate::routing::estimate_total_tokens(text, None) as u64;
-    let est_output = est_total.saturating_sub(est_input);
-
-    let (in_price, out_price) = config.cloud_price_per_1m;
-    let cost_usd = if decision.route == Route::Cloud {
-        (est_input as f64 * in_price + est_output as f64 * out_price) / 1_000_000.0
-    } else {
-        0.0
-    };
-
-    // Read-only budget/spike check — same logic as Proxy::budget_spike_preview,
-    // but driven by cost-log data rather than in-memory atomics.
-    let budget_note: Option<String> = if decision.route == Route::Cloud {
-        let spike_hit = config.spike_factor > 0
-            && cloud_count > 0
-            && est_total > 0
-            && {
-                let avg = cloud_sum / cloud_count;
-                avg > 0 && est_total > config.spike_factor.saturating_mul(avg)
-            };
-        let budget_hit =
-            config.budget_daily_tokens > 0 && today_tokens >= config.budget_daily_tokens;
-
-        if spike_hit || budget_hit {
-            let reason = if spike_hit {
-                let avg = cloud_sum / cloud_count;
-                format!(
-                    "spike: {est_total} predicted > {}×avg {avg}",
-                    config.spike_factor
-                )
-            } else {
-                format!(
-                    "daily budget: {today_tokens}/{} tokens used",
-                    config.budget_daily_tokens
-                )
-            };
-            let action = match config.budget_action.as_str() {
-                "block" => "would be blocked (429)",
-                "warn" => "proceeds with warning",
-                _ => "would redirect to local",
-            };
-            Some(format!("{action} — {reason}"))
-        } else if config.budget_daily_tokens > 0 {
-            Some(format!(
-                "within budget ({today_tokens}/{} tokens used today)",
-                config.budget_daily_tokens
-            ))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     let mut out = String::new();
-    if report.is_sensitive() {
-        out.push_str(&format!("sensitive: yes [{}]\n", report.categories.join(", ")));
+    if p.sensitive {
+        out.push_str(&format!("sensitive: yes [{}]\n", p.categories.join(", ")));
     } else {
         out.push_str("sensitive: no\n");
     }
-    out.push_str(&format!("route:     {}\n", decision.route.as_str()));
-    out.push_str(&format!("reason:    {}\n", decision.reason));
-    out.push_str(&format!("threshold: {} tokens\n", engine.threshold()));
+    out.push_str(&format!("route:     {}\n", p.route.as_str()));
+    out.push_str(&format!("reason:    {}\n", p.reason));
+    out.push_str(&format!("threshold: {} tokens\n", p.threshold));
     out.push_str(&format!(
-        "estimated: {est_input} in, ~{est_total} predicted total\n"
+        "estimated: {} in, ~{} predicted total\n",
+        p.est_input, p.est_total
     ));
-    if decision.route == Route::Cloud {
+
+    let (in_price, out_price) = config.cloud_price_per_1m;
+    if p.serves_cloud {
         if in_price > 0.0 || out_price > 0.0 {
             out.push_str(&format!(
-                "cost:      ${cost_usd:.6} (${in_price:.2}/${out_price:.2} per 1M in/out)\n"
+                "cost:      ${:.6} (${in_price:.2}/${out_price:.2} per 1M in/out)\n",
+                p.cost_usd
             ));
         } else {
             out.push_str("cost:      (no price configured — set PASTURE_CLOUD_PRICE_PER_1M)\n");
         }
-    } else {
+    } else if p.route == Route::Local {
         out.push_str("cost:      $0.000000 (local — no charge)\n");
+    } else {
+        // Cloud route the guard won't actually serve (block) — no charge incurred.
+        out.push_str("cost:      $0.000000 (not served — over budget)\n");
     }
-    match &budget_note {
-        Some(note) => out.push_str(&format!("budget:    {note}\n")),
-        None if config.budget_daily_tokens == 0 && decision.route == Route::Cloud => {
+
+    // Budget line: spell out an override, confirm headroom, or note it's off.
+    match &p.hit {
+        Some(h) => {
+            let action = match h.action {
+                BudgetAction::Block => "would be blocked (429)",
+                BudgetAction::Warn => "proceeds with warning",
+                BudgetAction::Redirect => "would redirect to local",
+            };
+            let reason = if h.spike {
+                format!(
+                    "spike: {} predicted > {}×avg {}",
+                    p.est_total, p.spike_factor, h.avg
+                )
+            } else {
+                format!(
+                    "daily budget: {}/{} tokens used",
+                    p.today_tokens, p.budget_limit
+                )
+            };
+            out.push_str(&format!("budget:    {action} — {reason}\n"));
+        }
+        None if p.budget_active && p.serves_cloud => {
+            out.push_str(&format!(
+                "budget:    within budget ({}/{} tokens used today)\n",
+                p.today_tokens, p.budget_limit
+            ));
+        }
+        None if !p.budget_active && p.route == Route::Cloud => {
             out.push_str("budget:    not configured\n");
         }
         None => {}
@@ -197,6 +305,76 @@ pub fn route_preview_text(
         out.pop();
     }
     out
+}
+
+/// Machine-readable routing preview for `pasture route --json` (ADR-202).
+///
+/// Emits the exact same `pasture.route` JSON object that HTTP `POST /v1/route`
+/// returns, so a script gets identical structured output whether it shells out
+/// to the CLI or calls the proxy. `has_tools` is always `false` (the CLI routes
+/// plain text). The `budget` field is `null` unless the guard overrides the
+/// cloud route, matching the HTTP endpoint's wording.
+pub fn route_preview_json(
+    engine: &RoutingEngine,
+    config: &Config,
+    text: &str,
+    forced: Option<Route>,
+    today_tokens: u64,
+    cloud_count: u64,
+    cloud_sum: u64,
+) -> String {
+    use crate::json::escape_string;
+    let p = match compute_route_preview(
+        engine,
+        config,
+        text,
+        forced,
+        today_tokens,
+        cloud_count,
+        cloud_sum,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return format!(
+                "{{\"object\":\"pasture.error\",\"error\":\"{}\"}}",
+                escape_string(&e)
+            );
+        }
+    };
+    let categories = p
+        .categories
+        .iter()
+        .map(|c| format!("\"{}\"", escape_string(c)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let budget_field = match &p.hit {
+        Some(h) => {
+            let reason = if h.spike {
+                "spike detected — request exceeds average by spike_factor"
+            } else {
+                "daily cloud token budget exceeded"
+            };
+            let note = match h.action {
+                BudgetAction::Block => format!("would be blocked (429): {reason}"),
+                BudgetAction::Warn => format!("over budget, proceeds (warn): {reason}"),
+                BudgetAction::Redirect => format!("redirected to local: {reason}"),
+            };
+            format!("\"{}\"", escape_string(&note))
+        }
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"object\":\"pasture.route\",\"route\":\"{}\",\"reason\":\"{}\",\"budget\":{},\"sensitive\":{},\"categories\":[{}],\"estimated_tokens\":{},\"predicted_output_tokens\":{},\"predicted_total_tokens\":{},\"estimated_cost_usd\":{:.6},\"has_tools\":false}}",
+        p.route.as_str(),
+        escape_string(&p.reason),
+        budget_field,
+        p.sensitive,
+        categories,
+        p.est_input,
+        p.est_output,
+        p.est_total,
+        p.cost_usd,
+    )
 }
 
 /// Format the hardware profile for display (testable).
@@ -307,39 +485,52 @@ fn run_route(config: &Config, rest: &[String]) -> i32 {
     // Derive budget/spike state from the cost log (best-effort; live proxy uses
     // in-memory atomics seeded from the same source at startup).
     let today = crate::cost::today_start_secs();
-    let (today_tokens, cloud_count, cloud_sum) =
-        match crate::cost::read_log(&config.cost_log_path) {
-            Ok(records) => {
-                let today_recs: Vec<_> = records
-                    .iter()
-                    .filter(|r| r.ts_secs >= today && r.route == "cloud")
-                    .collect();
-                let today_tokens: u64 = today_recs
-                    .iter()
-                    .map(|r| r.prompt_tokens + r.completion_tokens)
-                    .sum();
-                let cloud_count = today_recs.len() as u64;
-                let cloud_sum: u64 = today_recs
-                    .iter()
-                    .map(|r| r.prompt_tokens + r.completion_tokens)
-                    .sum();
-                (today_tokens, cloud_count, cloud_sum)
-            }
-            Err(_) => (0, 0, 0),
-        };
+    let (today_tokens, cloud_count, cloud_sum) = match crate::cost::read_log(&config.cost_log_path)
+    {
+        Ok(records) => {
+            let today_recs: Vec<_> = records
+                .iter()
+                .filter(|r| r.ts_secs >= today && r.route == "cloud")
+                .collect();
+            let today_tokens: u64 = today_recs
+                .iter()
+                .map(|r| r.prompt_tokens + r.completion_tokens)
+                .sum();
+            let cloud_count = today_recs.len() as u64;
+            let cloud_sum: u64 = today_recs
+                .iter()
+                .map(|r| r.prompt_tokens + r.completion_tokens)
+                .sum();
+            (today_tokens, cloud_count, cloud_sum)
+        }
+        Err(_) => (0, 0, 0),
+    };
 
-    println!(
-        "{}",
-        route_preview_text(
+    let forced = parse_route_flag(rest);
+    // `--json` emits the same `pasture.route` object as HTTP POST /v1/route, so a
+    // script gets identical output from either surface (ADR-202).
+    let out = if rest.iter().any(|a| a == "--json") {
+        route_preview_json(
             &engine,
             config,
             text,
-            parse_route_flag(rest),
+            forced,
             today_tokens,
             cloud_count,
             cloud_sum,
         )
-    );
+    } else {
+        route_preview_text(
+            &engine,
+            config,
+            text,
+            forced,
+            today_tokens,
+            cloud_count,
+            cloud_sum,
+        )
+    };
+    println!("{out}");
     0
 }
 
@@ -534,7 +725,9 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
                         match cloud_b.complete(&creq) {
                             Ok(cr) => println!("{}", cr.content),
                             Err(ce) => {
-                                eprintln!("pasture: cascade cloud failed ({ce}); using local answer");
+                                eprintln!(
+                                    "pasture: cascade cloud failed ({ce}); using local answer"
+                                );
                                 println!("{}", lr.content);
                             }
                         }
@@ -663,7 +856,11 @@ fn print_doctor_models(lang: crate::i18n::Lang, models: &[String]) {
     } else {
         println!(
             "{}",
-            tf(lang, "doctor.ollama.models", &[("models", &models.join(", "))])
+            tf(
+                lang,
+                "doctor.ollama.models",
+                &[("models", &models.join(", "))]
+            )
         );
     }
 }
@@ -994,7 +1191,10 @@ fn run_improvements(path: Option<&str>, review: bool) -> i32 {
 
     if review {
         let (_, needs) = crate::improve::partition_for_review(&items);
-        println!("Self-improvement review gate: {} ({} records)", path, s.total);
+        println!(
+            "Self-improvement review gate: {} ({} records)",
+            path, s.total
+        );
         println!(
             "  auto-approved (machine-verified): {}   needs human review: {}   ({:.0}% auto)",
             s.auto_approved,
@@ -1203,7 +1403,11 @@ fn run_calibrate_error(lang: crate::i18n::Lang, rest: &[String]) -> i32 {
         tf(
             lang,
             "calibrate.error.header",
-            &[("n", &n.to_string()), ("overall", &overall), ("target", &tgt)]
+            &[
+                ("n", &n.to_string()),
+                ("overall", &overall),
+                ("target", &tgt)
+            ]
         )
     );
     // The fitted step curve: each band runs from its start logprob up to the
@@ -1648,10 +1852,10 @@ mod tests {
         assert!(!listen_addr_is_loopback("[::]:11435")); // all IPv6 interfaces
         assert!(!listen_addr_is_loopback("192.168.1.5:11435")); // LAN
         assert!(!listen_addr_is_loopback("myhost.lan:8080")); // hostname, not localhost
-        // Regression: a GLOBAL address that merely starts with the "::1" prefix
-        // must NOT be treated as loopback. The old heuristic's
-        // `starts_with("::1")` returned true for this and SUPPRESSED the
-        // exposed-without-auth warning; `::1:2:3:4` is `0:0:0:0:1:2:3:4`, global.
+                                                              // Regression: a GLOBAL address that merely starts with the "::1" prefix
+                                                              // must NOT be treated as loopback. The old heuristic's
+                                                              // `starts_with("::1")` returned true for this and SUPPRESSED the
+                                                              // exposed-without-auth warning; `::1:2:3:4` is `0:0:0:0:1:2:3:4`, global.
         assert!(!listen_addr_is_loopback("::1:2:3:4"));
     }
 
@@ -1866,15 +2070,7 @@ mod tests {
     fn test_route_preview_sensitive_shown() {
         let engine = preview_engine();
         let cfg = base_config();
-        let out = route_preview_text(
-            &engine,
-            &cfg,
-            "my password is hunter2",
-            None,
-            0,
-            0,
-            0,
-        );
+        let out = route_preview_text(&engine, &cfg, "my password is hunter2", None, 0, 0, 0);
         assert!(out.contains("sensitive: yes"), "{out}");
     }
 
@@ -1886,5 +2082,126 @@ mod tests {
         cfg.budget_daily_tokens = 5_000;
         let out = route_preview_text(&engine, &cfg, "hi", Some(Route::Local), 0, 0, 0);
         assert!(!out.contains("budget:"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_redirect_shows_effective_local_route_and_zero_cost() {
+        // ADR-202 semantic fix: a budget redirect must show the EFFECTIVE route
+        // (local) and $0 cost, not the pre-guard engine route (cloud) with a
+        // cloud cost. Matches the HTTP endpoint and reality.
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.budget_daily_tokens = 1_000;
+        cfg.budget_action = "local-only".to_string();
+        cfg.cloud_price_per_1m = (10.0, 30.0);
+        let out = route_preview_text(&engine, &cfg, "hi", Some(Route::Cloud), 2_000, 1, 2_000);
+        assert!(out.contains("route:     local"), "{out}");
+        assert!(out.contains("$0.000000"), "{out}");
+        assert!(out.contains("would redirect to local"), "{out}");
+    }
+
+    // --- route_preview_json: format parity with HTTP POST /v1/route (ADR-202) ---
+
+    fn parse_json(s: &str) -> crate::json::JsonValue {
+        crate::json::parse(s).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{s}"))
+    }
+
+    #[test]
+    fn test_route_preview_json_is_valid_pasture_route_object() {
+        let engine = preview_engine();
+        let cfg = base_config();
+        let out = route_preview_json(&engine, &cfg, "hi", None, 0, 0, 0);
+        let v = parse_json(&out);
+        assert_eq!(
+            v.get("object").and_then(|x| x.as_str()),
+            Some("pasture.route")
+        );
+        assert_eq!(v.get("route").and_then(|x| x.as_str()), Some("local"));
+        assert_eq!(v.get("has_tools").and_then(|x| x.as_bool()), Some(false));
+        // budget is null when no guard is active.
+        assert!(matches!(
+            v.get("budget"),
+            Some(crate::json::JsonValue::Null)
+        ));
+    }
+
+    #[test]
+    fn test_route_preview_json_has_all_http_fields() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.cloud_price_per_1m = (1.0, 5.0);
+        let out = route_preview_json(&engine, &cfg, "hi", Some(Route::Cloud), 0, 0, 0);
+        let v = parse_json(&out);
+        for field in [
+            "object",
+            "route",
+            "reason",
+            "budget",
+            "sensitive",
+            "categories",
+            "estimated_tokens",
+            "predicted_output_tokens",
+            "predicted_total_tokens",
+            "estimated_cost_usd",
+            "has_tools",
+        ] {
+            assert!(v.get(field).is_some(), "missing {field} in {out}");
+        }
+        // Cloud route with pricing → positive cost.
+        assert!(
+            v.get("estimated_cost_usd")
+                .and_then(|x| x.as_f64())
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn test_route_preview_json_redirect_route_is_local_with_budget_string() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.budget_daily_tokens = 1_000;
+        cfg.budget_action = "local-only".to_string();
+        cfg.cloud_price_per_1m = (10.0, 30.0);
+        let out = route_preview_json(&engine, &cfg, "hi", Some(Route::Cloud), 2_000, 1, 2_000);
+        let v = parse_json(&out);
+        // Effective route is local; cost is 0; budget explains the redirect.
+        assert_eq!(v.get("route").and_then(|x| x.as_str()), Some("local"));
+        assert_eq!(
+            v.get("estimated_cost_usd").and_then(|x| x.as_f64()),
+            Some(0.0)
+        );
+        let budget = v.get("budget").and_then(|x| x.as_str()).unwrap_or("");
+        assert!(budget.contains("redirected to local"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_json_sensitive_categories_are_labels() {
+        let engine = preview_engine();
+        let cfg = base_config();
+        let out = route_preview_json(&engine, &cfg, "my password is hunter2", None, 0, 0, 0);
+        let v = parse_json(&out);
+        assert_eq!(v.get("sensitive").and_then(|x| x.as_bool()), Some(true));
+        // The raw secret value must never appear (I3: labels only).
+        assert!(!out.contains("hunter2"), "{out}");
+    }
+
+    #[test]
+    fn test_route_preview_json_block_keeps_cloud_route_zero_cost() {
+        let engine = preview_engine();
+        let mut cfg = base_config();
+        cfg.budget_daily_tokens = 1_000;
+        cfg.budget_action = "block".to_string();
+        cfg.cloud_price_per_1m = (10.0, 30.0);
+        let out = route_preview_json(&engine, &cfg, "hi", Some(Route::Cloud), 1_000, 1, 1_000);
+        let v = parse_json(&out);
+        // block keeps the cloud route but won't serve it → cost 0, budget note set.
+        assert_eq!(v.get("route").and_then(|x| x.as_str()), Some("cloud"));
+        assert_eq!(
+            v.get("estimated_cost_usd").and_then(|x| x.as_f64()),
+            Some(0.0)
+        );
+        let budget = v.get("budget").and_then(|x| x.as_str()).unwrap_or("");
+        assert!(budget.contains("would be blocked"), "{out}");
     }
 }

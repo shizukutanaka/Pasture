@@ -149,8 +149,15 @@ value; the predicted token fields and `estimated_cost_usd` use `estimation_text`
 + the IMP-24 output prediction priced from `PASTURE_CLOUD_PRICE_PER_1M` (ADR-199),
 and cost is 0 unless the request would actually be served on cloud. PII-free —
 `categories` carries only labels, never matched values (I3). Subject to the §7
-auth/rate-limit gate. Mirrors the CLI `route` command. Implemented by
-`handle_route_preview`.
+auth/rate-limit gate. Implemented by `handle_route_preview`.
+
+The CLI `pasture route <text>` is the offline twin of this endpoint (ADR-201/202):
+it prints the same facts in human form, or — with `--json` — emits the **identical**
+`pasture.route` object (`has_tools` always `false`, since the CLI routes plain
+text). Both surfaces share one computation (`compute_route_preview`) so the CLI's
+effective route, cost, and budget verdict cannot disagree with the HTTP endpoint.
+The CLI seeds the read-only budget/spike check from today's `cost_log` records
+(the same source the live proxy's atomics are seeded from at startup).
 
 ### 3.3 `GET /health`
 `200`, `{"status":"ok"}`.
