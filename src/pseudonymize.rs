@@ -215,8 +215,15 @@ impl Ctx {
         if inner.is_empty() {
             return None;
         }
-        let prefix = &token[..token.len() - inner.len()];
-        let suffix = &token[prefix.len() + inner.len()..];
+        // trim_matches returns a subslice, so the pointer difference gives the
+        // exact byte offset where inner starts within token (ADR-206).  The old
+        // formula `token.len() - inner.len()` counted total-stripped chars and
+        // wrongly assigned ALL of them to the leading side, making suffix always
+        // empty and leaking trailing-punct chars (e.g. "alice@example.com," →
+        // prefix="a", suffix="" instead of prefix="", suffix=",").
+        let inner_start = inner.as_ptr() as usize - token.as_ptr() as usize;
+        let prefix = &token[..inner_start];
+        let suffix = &token[inner_start + inner.len()..];
 
         if privacy::looks_like_email(inner) {
             let tok = self.token_for(inner, "EMAIL");
@@ -1211,5 +1218,88 @@ mod tests {
             );
         }
         assert!(!restored.contains("<IP_"), "no token residue: {restored}");
+    }
+
+    // ── ADR-206: trim_punct prefix/suffix offset fix ──────────────────────────
+
+    #[test]
+    fn test_email_with_trailing_comma_fully_masked() {
+        // ADR-206: "alice@example.com," has a trailing comma stripped by trim_punct.
+        // The old formula (token.len() - inner.len()) counted total stripped chars
+        // and attributed them all to the prefix, so prefix="a" and the comma was
+        // lost.  The fix uses pointer arithmetic so prefix="" and suffix=",".
+        let msgs = vec![msg("contact alice@example.com, or bob@example.com.")];
+        // Note: '.' is NOT in trim_punct, so "bob@example.com." stays as inner="bob@example.com."
+        // which does NOT match looks_like_email — only alice is affected by the bug fix.
+        let msgs_comma = vec![msg("contact alice@example.com, for help")];
+        let (out, mapping) = pseudonymize_messages(&msgs_comma);
+        let c = &out[0].content;
+        // Full email must not appear, including no partial leak of leading chars.
+        assert!(
+            !c.contains("alice"),
+            "no raw email chars must remain (ADR-206): {c}"
+        );
+        assert!(c.contains("<EMAIL_1>"), "email must be tokenized: {c}");
+        // The trailing comma must be preserved in the output (not swallowed).
+        assert!(
+            c.contains("<EMAIL_1>,"),
+            "trailing comma must survive after token (ADR-206): {c}"
+        );
+        // Round-trip restore must recover the original.
+        let restored = restore(c, &mapping);
+        assert!(
+            restored.contains("alice@example.com,"),
+            "email + comma must restore: {restored}"
+        );
+    }
+
+    #[test]
+    fn test_email_with_leading_punct_fully_masked() {
+        // Leading quote before email: '"alice@example.com' — prefix should be '"'.
+        let msgs = vec![msg(r#"address "alice@example.com" is valid"#)];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(!c.contains("alice"), "no raw email chars: {c}");
+        assert!(c.contains("<EMAIL_1>"), "email tokenized: {c}");
+        // Surrounding quotes preserved.
+        assert!(c.contains('"'), "double-quote preserved: {c}");
+        let restored = restore(c, &mapping);
+        assert!(
+            restored.contains("alice@example.com"),
+            "email restores: {restored}"
+        );
+    }
+
+    #[test]
+    fn test_email_with_trailing_semicolon_fully_masked() {
+        // Semicolon at end of list: "alice@example.com;"
+        let msgs = vec![msg("recipients: alice@example.com;")];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(!c.contains("alice"), "no leading char leak: {c}");
+        assert!(
+            c.contains("<EMAIL_1>;") || c.ends_with("<EMAIL_1>"),
+            "semicolon preserved or token at end: {c}"
+        );
+        let restored = restore(c, &mapping);
+        assert!(
+            restored.contains("alice@example.com"),
+            "restores: {restored}"
+        );
+    }
+
+    #[test]
+    fn test_ip_with_trailing_comma_fully_masked() {
+        // Same prefix bug applies to IP addresses, not just emails.
+        let msgs = vec![msg("servers 192.168.1.1, and 10.0.0.1,")];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        // No partial IP octets should leak.
+        assert!(
+            !c.contains("192.168"),
+            "raw IP must not remain after comma (ADR-206): {c}"
+        );
+        assert!(c.contains("<IP_1>"), "first IP tokenized: {c}");
+        assert!(c.contains("<IP_2>"), "second IP tokenized: {c}");
     }
 }
