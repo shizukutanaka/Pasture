@@ -236,7 +236,14 @@ pub fn url_credential_spans(text: &str) -> Vec<(usize, usize)> {
         if let Some(at_pos) = authority.find('@') {
             let user_info = &authority[..at_pos];
             if let Some(colon) = user_info.find(':') {
-                if !user_info[colon + 1..].is_empty() {
+                let password = &user_info[colon + 1..];
+                // A password that is purely numeric (all digits) is likely a port
+                // number from a host:port construct (e.g. "api.example.com:8080")
+                // rather than an actual password. Skip it to avoid false positives
+                // (ADR-211).
+                let is_numeric_port =
+                    !password.is_empty() && password.chars().all(|c| c.is_ascii_digit());
+                if !password.is_empty() && !is_numeric_port {
                     spans.push((after_start, after_start + at_pos));
                 }
             }
@@ -945,6 +952,18 @@ mod tests {
         // host:port is not a credential
         assert!(!contains_url_credential("http://localhost:8080/path"));
         assert!(!contains_url_credential("https://api.example.com/v1"));
+    }
+
+    #[test]
+    fn test_url_host_port_with_at_not_flagged() {
+        // ADR-211: "host.domain.com:8080@attacker.com" could be misparsed as
+        // user:password if we don't exclude numeric-only password fields. The
+        // ":8080" part (pure digits) is a port, not a password. Must not be
+        // flagged as a credential.
+        assert!(!contains_url_credential(
+            "http://db.example.com:5432@attacker.com/"
+        ));
+        assert!(!contains_url_credential("http://api.host.com:443@bad.net"));
     }
 
     #[test]
