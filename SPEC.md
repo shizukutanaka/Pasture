@@ -255,12 +255,15 @@ to text three different ways, each matched to its job (ADR-184/187):
 | `url_credential` | `scheme://user:password@host` embedded credentials |
 | `env_secret` | `KEY=value` / `export KEY=value` where KEY name suggests a secret (password/secret/token/auth/…) |
 
-**Full-width digit normalization (ADR-213):** before running the digit-based
+**Full-width normalization (ADR-213/214):** before running the digit-based
 detectors (`ip`, `credit_card`, `my_number`, `phone`), the classifier normalizes
-full-width digits (`０`–`９`, U+FF10–FF19) to ASCII, so numeric PII typed in
-full-width form (common in Japanese input, e.g. `１２３４５６７８９０１８`) is
-still detected and kept local. (Full-width separators such as `．`/`－` are not
-yet normalized; the bare full-width digit run is.)
+to ASCII: full-width digits (`０`–`９`, U+FF10–FF19), the full-width full stop
+(`．` → `.`), the full-width hyphen and Unicode dash family (`－‐‑‒–—―` → `-`),
+and the ideographic space (`　` → ` `). So numeric PII typed in full-width form
+(common in Japanese input, e.g. `１２３４５６７８９０１８`,
+`１９２．１６８．１．１`, `４１１１－１１１１－１１１１－１１１１`) is still
+detected and kept local. This is a targeted, std-only normalization (not a full
+NFKC, which would require an external crate).
 
 Any hit ⇒ sensitive ⇒ forced local (§4 step 1) and never cached (I2).
 The bias is deliberately toward over-classifying: false positive = stays local (cheap);
