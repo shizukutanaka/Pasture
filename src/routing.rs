@@ -187,14 +187,14 @@ pub fn looks_like_code(text: &str) -> bool {
     let mut fence_count = 0;
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            let after = &trimmed[3..];
+        if let Some(after) = trimmed.strip_prefix("```") {
             // A fence is properly formed if followed by EOL, whitespace, or a
             // language specifier (e.g., python, C++, c#).
             let is_fence = after.is_empty()
-                || after.chars().next().map_or(false, |c| {
-                    c.is_alphanumeric() || c == '-' || c.is_whitespace()
-                });
+                || after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '-' || c.is_whitespace());
             if is_fence {
                 fence_count += 1;
             }

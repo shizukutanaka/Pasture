@@ -12,7 +12,8 @@
 //! international numbers that span whitespace, ADR-207 — API-key prefixes,
 //! Luhn-valid credit-card numbers — ADR-196, JWTs — ADR-197, URL-embedded
 //! credentials and env-var secret values — ADR-203, complete PEM private-key
-//! blocks — ADR-204). It is NOT a guarantee that no other sensitive information
+//! blocks — ADR-204, Japanese My Numbers / マイナンバー with a valid check
+//! digit — ADR-212). It is NOT a guarantee that no other sensitive information
 //! is sent — use `local_only` mode for hard guarantees.
 //!
 //! Privacy invariant (I5): the replacement mapping lives only in memory for
@@ -141,9 +142,10 @@ struct Ctx {
     key_n: usize,
     card_n: usize,
     jwt_n: usize,
-    url_n: usize, // ADR-203: URL-embedded credentials
-    env_n: usize, // ADR-203: env-var secret values
-    pem_n: usize, // ADR-204: PEM private-key blocks
+    url_n: usize,      // ADR-203: URL-embedded credentials
+    env_n: usize,      // ADR-203: env-var secret values
+    pem_n: usize,      // ADR-204: PEM private-key blocks
+    mynumber_n: usize, // ADR-212: Japanese My Number (マイナンバー)
 }
 
 impl Ctx {
@@ -159,6 +161,7 @@ impl Ctx {
             url_n: 0,
             env_n: 0,
             pem_n: 0,
+            mynumber_n: 0,
         }
     }
 
@@ -199,6 +202,10 @@ impl Ctx {
             "PEM" => {
                 self.pem_n += 1;
                 self.pem_n
+            }
+            "MYNUMBER" => {
+                self.mynumber_n += 1;
+                self.mynumber_n
             }
             _ => {
                 self.key_n += 1;
@@ -385,6 +392,14 @@ fn mask_credit_cards(text: &str, ctx: &mut Ctx) -> String {
     apply_spans(text, crate::privacy::credit_card_spans(text), ctx, "CARD")
 }
 
+/// Mask Japanese My Numbers (マイナンバー) with `<MYNUMBER_n>` tokens (ADR-212).
+/// A 12-digit My Number may be written with space/hyphen separators
+/// (`1234 5678 9018`), spanning multiple whitespace tokens, so it needs a
+/// checksum-validated span pre-pass exactly like credit cards.
+fn mask_my_numbers(text: &str, ctx: &mut Ctx) -> String {
+    apply_spans(text, crate::privacy::my_number_spans(text), ctx, "MYNUMBER")
+}
+
 /// Mask international (`+`-prefixed) phone numbers with `<PHONE_n>` tokens
 /// (ADR-207). Like credit cards, a number written `+1 555 123 4567` spans
 /// several whitespace tokens, so the per-token loop (which calls
@@ -425,16 +440,19 @@ fn mask_pem_keys(text: &str, ctx: &mut Ctx) -> String {
 /// Replace PII in `text` token by token, preserving original whitespace.
 fn replace_in_text(text: &str, ctx: &mut Ctx) -> String {
     // Pre-passes in order of specificity:
-    //  1. Credit-card numbers (may span whitespace, ADR-196)
-    //  2. International phone numbers (`+1 555 123 4567`, span whitespace, ADR-207)
-    //  3. URL-embedded credentials (ADR-203)
-    //  4. Env-var secret values (ADR-203)
-    //  5. PEM private-key blocks (multi-line, ADR-204)
+    //  1. Credit-card numbers (13-19 digits, may span whitespace, ADR-196)
+    //  2. My Numbers (マイナンバー, exactly 12 digits + check digit, ADR-212)
+    //  3. International phone numbers (`+1 555 123 4567`, span whitespace, ADR-207)
+    //  4. URL-embedded credentials (ADR-203)
+    //  5. Env-var secret values (ADR-203)
+    //  6. PEM private-key blocks (multi-line, ADR-204)
     // Each pass chains its output into the next; the per-token loop then handles
     // the remaining single-token PII (email, IP, domestic phone, API key, JWT).
-    // Cards and phones are disjoint: a card span starts with a digit, a phone
-    // span with '+', so the two pre-passes never contend for the same bytes.
+    // Cards (13-19 digits) and My Numbers (exactly 12) are length-disjoint, and
+    // both are digit-anchored while phones are '+'-anchored, so no pre-pass
+    // contends with another for the same bytes.
     let masked = mask_credit_cards(text, ctx);
+    let masked = mask_my_numbers(&masked, ctx);
     let masked = mask_phones(&masked, ctx);
     let masked = mask_url_credentials(&masked, ctx);
     let masked = mask_env_secrets(&masked, ctx);
@@ -1387,5 +1405,62 @@ mod tests {
         assert!(c.contains("<PHONE_1>"), "phone masked: {c}");
         assert!(!c.contains("4111"), "raw card gone: {c}");
         assert!(!c.contains("555 123"), "raw phone gone: {c}");
+    }
+
+    // ── ADR-212: My Number (マイナンバー) masking ──────────────────────────────
+
+    #[test]
+    fn test_my_number_masked_and_restored() {
+        // ADR-212: a valid 12-digit My Number is masked and round-trips.
+        let msgs = vec![msg("私のマイナンバーは 1234 5678 9018 です")];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<MYNUMBER_1>"), "My Number must be masked: {c}");
+        assert!(!c.contains("5678 9018"), "raw digits must not remain: {c}");
+        assert!(
+            c.contains("マイナンバーは "),
+            "surrounding text preserved: {c}"
+        );
+        let restored = restore(c, &mapping);
+        assert!(
+            restored.contains("1234 5678 9018"),
+            "My Number must restore: {restored}"
+        );
+    }
+
+    #[test]
+    fn test_my_number_and_card_coexist_disjoint() {
+        // A My Number (12 digits) and a credit card (16 digits) coexist; the
+        // length-disjoint pre-passes mask each with its own token.
+        let msgs = vec![msg("mynumber 123456789018 card 4111111111111111")];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let c = &out[0].content;
+        assert!(c.contains("<MYNUMBER_1>"), "My Number masked: {c}");
+        assert!(c.contains("<CARD_1>"), "card masked: {c}");
+        assert!(!c.contains("123456789018"), "raw My Number gone: {c}");
+        assert!(!c.contains("4111"), "raw card gone: {c}");
+    }
+
+    #[test]
+    fn test_my_number_in_tool_call_arguments_masked() {
+        // ADR-212 + ADR-188: a My Number inside tool-call JSON is masked too.
+        let tc =
+            r#"[{"function":{"name":"register","arguments":"{\"mynumber\":\"123456789018\"}"}}]"#;
+        let msgs = vec![Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls_json: Some(tc.to_string()),
+            ..Default::default()
+        }];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap();
+        assert!(
+            tc_out.contains("<MYNUMBER_1>"),
+            "My Number in tool args must mask: {tc_out}"
+        );
+        assert!(
+            !tc_out.contains("123456789018"),
+            "raw My Number must not remain: {tc_out}"
+        );
     }
 }

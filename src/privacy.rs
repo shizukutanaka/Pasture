@@ -147,6 +147,9 @@ pub fn classify(text: &str) -> SensitivityReport {
     if contains_credit_card(text) {
         categories.push("credit_card");
     }
+    if contains_my_number(text) {
+        categories.push("my_number");
+    }
     if text.split_whitespace().any(looks_like_phone) || contains_intl_phone(text) {
         categories.push("phone");
     }
@@ -609,6 +612,82 @@ fn luhn_valid(digits: &[u8]) -> bool {
     sum % 10 == 0
 }
 
+/// Detect a Japanese Individual Number (マイナンバー / My Number) anywhere in
+/// the text (ADR-212). My Number is a 12-digit identifier with a check digit,
+/// so detection is checksum-validated like credit cards, keeping false
+/// positives low (a random 12-digit run passes with probability ~1/11).
+pub fn contains_my_number(text: &str) -> bool {
+    !my_number_spans(text).is_empty()
+}
+
+/// Byte ranges of valid 12-digit Japanese My Numbers (マイナンバー), where the
+/// number may contain internal space/hyphen separators (common forms:
+/// `123456789018`, `1234 5678 9018`, `1234-5678-9018`). The end of each span is
+/// the byte just after the final digit, so trailing separators are not included.
+/// Shared by `contains_my_number` (any hit → sensitive) and the pseudonymizer
+/// (mask each span with a `<MYNUMBER_n>` token) so detection has a single source
+/// of truth. The check digit (12th digit) is validated to suppress false
+/// positives on arbitrary 12-digit runs (ADR-212).
+pub fn my_number_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Only start a candidate at a digit boundary (preceding byte not a digit)
+        // so a 13+ digit run is not mistaken for a 12-digit My Number prefix.
+        let at_boundary = i == 0 || !bytes[i - 1].is_ascii_digit();
+        if c.is_ascii_digit() && at_boundary {
+            let mut digits: Vec<u8> = Vec::new();
+            let mut j = i;
+            let mut last_digit_end = i;
+            while j < bytes.len() {
+                let cj = bytes[j];
+                if cj.is_ascii_digit() {
+                    digits.push(cj - b'0');
+                    j += 1;
+                    last_digit_end = j;
+                } else if cj == b' ' || cj == b'-' {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            // Exactly 12 digits AND a valid check digit. The exact-length guard
+            // distinguishes My Number from credit cards (13-19 digits).
+            if digits.len() == 12 && my_number_check_valid(&digits) {
+                spans.push((i, last_digit_end));
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+/// Validate the My Number check digit (検査用数字). The 12th digit is computed
+/// from the first 11 via a weighted modulo-11 sum:
+///   check = 11 - (Σ P_n·Q_n mod 11), where the result is 0 if the remainder ≤ 1.
+/// P_n is the n-th digit counting from the lowest non-check digit (P_1 = 11th
+/// digit from the left), and Q_n is the weight: n+1 for 1≤n≤6, n-5 for 7≤n≤11.
+fn my_number_check_valid(digits: &[u8]) -> bool {
+    if digits.len() != 12 {
+        return false;
+    }
+    // digits[0..11] are P_11..P_1 (left-to-right); P_1 is the lowest non-check
+    // digit = digits[10]. Iterate n = 1..=11 with P_n = digits[11 - n].
+    let mut sum = 0u32;
+    for n in 1..=11u32 {
+        let p = digits[(11 - n) as usize] as u32;
+        let q = if n <= 6 { n + 1 } else { n - 5 };
+        sum += p * q;
+    }
+    let rem = sum % 11;
+    let check = if rem <= 1 { 0 } else { 11 - rem };
+    check == digits[11] as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +764,56 @@ mod tests {
     #[test]
     fn test_credit_card_short_digits_ignored() {
         assert!(!contains_credit_card("order 12345 shipped"));
+    }
+
+    // --- My Number (マイナンバー, ADR-212) ---
+
+    #[test]
+    fn test_my_number_check_digit_valid() {
+        // 123456789018 is a structurally-valid My Number (check digit 8).
+        assert!(my_number_check_valid(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 8]));
+        // Flip the check digit → invalid.
+        assert!(!my_number_check_valid(&[
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 7
+        ]));
+        // Wrong length → invalid.
+        assert!(!my_number_check_valid(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn test_my_number_detected_forms() {
+        // Bare, space-separated, and hyphen-separated forms all detect.
+        assert!(contains_my_number("マイナンバーは 123456789018 です"));
+        assert!(contains_my_number("番号: 1234 5678 9018"));
+        assert!(contains_my_number("number 1234-5678-9018"));
+        // Classified into the my_number category.
+        assert!(classify("私のマイナンバーは123456789018です")
+            .categories
+            .contains(&"my_number"));
+    }
+
+    #[test]
+    fn test_my_number_invalid_checkdigit_not_detected() {
+        // A 12-digit run with a wrong check digit must not be flagged.
+        assert!(!contains_my_number("id 123456789017 ok"));
+    }
+
+    #[test]
+    fn test_my_number_wrong_length_not_detected() {
+        // 11 digits (too short) and 13 digits (too long) must not match.
+        assert!(!contains_my_number("number 12345678901 here"));
+        assert!(!contains_my_number("number 1234567890123 here"));
+    }
+
+    #[test]
+    fn test_my_number_span_position() {
+        // The span covers exactly the 12 digits (with separators), excluding
+        // trailing separators and surrounding text.
+        let text = "no: 1234 5678 9018.";
+        let spans = my_number_spans(text);
+        assert_eq!(spans.len(), 1, "exactly one span: {spans:?}");
+        let (s, e) = spans[0];
+        assert_eq!(&text[s..e], "1234 5678 9018");
     }
 
     #[test]
