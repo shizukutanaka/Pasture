@@ -127,10 +127,40 @@ const ENV_SECRET_SUBSTRINGS: &[&str] = &[
     "_key",       // SIGNING_KEY, STRIPE_KEY
 ];
 
+/// Normalize full-width ASCII digits (U+FF10..=U+FF19, `０`..`９`) to their
+/// half-width ASCII equivalents (`0`..`9`); all other characters are unchanged.
+///
+/// Japanese input frequently uses full-width digits, but every numeric PII
+/// detector (`looks_like_ipv4`, `credit_card_spans`, `my_number_spans`,
+/// `looks_like_phone`) tests `is_ascii_digit()`, so a My Number or credit card
+/// typed in full-width form (`１２３４５６７８９０１８`) would bypass detection
+/// entirely. The classifier normalizes its input through this function before
+/// running the digit-based detectors so such PII is still detected and kept
+/// local — the "Layer 1 normalization" step common to Japanese-PII pipelines
+/// (ADR-213). The classifier returns only category labels (never byte offsets),
+/// so the byte-length change from normalization (full-width = 3 bytes, ASCII =
+/// 1 byte) does not matter here.
+pub fn normalize_fullwidth_digits(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if ('\u{FF10}'..='\u{FF19}').contains(&c) {
+                // '０' (U+FF10) → '0' … '９' (U+FF19) → '9'
+                char::from(b'0' + (c as u32 - 0xFF10) as u8)
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Classify a prompt's sensitivity. Returns category labels only.
 pub fn classify(text: &str) -> SensitivityReport {
     let mut categories: Vec<&'static str> = Vec::new();
     let lower = text.to_lowercase();
+    // ADR-213: normalize full-width digits to ASCII for the digit-based
+    // detectors so numeric PII typed in full-width form (common in Japanese
+    // input) is still detected and kept local.
+    let normalized = normalize_fullwidth_digits(text);
 
     if KEYWORDS.iter().any(|k| lower.contains(k)) {
         categories.push("keyword");
@@ -138,19 +168,19 @@ pub fn classify(text: &str) -> SensitivityReport {
     if text.split_whitespace().any(looks_like_email) {
         categories.push("email");
     }
-    if text
+    if normalized
         .split_whitespace()
         .any(|t| looks_like_ipv4(t) || looks_like_ipv6(t))
     {
         categories.push("ip");
     }
-    if contains_credit_card(text) {
+    if contains_credit_card(&normalized) {
         categories.push("credit_card");
     }
-    if contains_my_number(text) {
+    if contains_my_number(&normalized) {
         categories.push("my_number");
     }
-    if text.split_whitespace().any(looks_like_phone) || contains_intl_phone(text) {
+    if normalized.split_whitespace().any(looks_like_phone) || contains_intl_phone(&normalized) {
         categories.push("phone");
     }
     if text.split_whitespace().any(looks_like_api_key) || contains_embedded_api_key(text) {
@@ -814,6 +844,46 @@ mod tests {
         assert_eq!(spans.len(), 1, "exactly one span: {spans:?}");
         let (s, e) = spans[0];
         assert_eq!(&text[s..e], "1234 5678 9018");
+    }
+
+    // --- Full-width digit normalization (全角数字, ADR-213) ---
+
+    #[test]
+    fn test_normalize_fullwidth_digits() {
+        assert_eq!(
+            normalize_fullwidth_digits("１２３４５６７８９０"),
+            "1234567890"
+        );
+        // Non-digit characters (kanji, ASCII letters) are unchanged.
+        assert_eq!(normalize_fullwidth_digits("番号abc１２３"), "番号abc123");
+        // Already-ASCII text is unchanged.
+        assert_eq!(normalize_fullwidth_digits("hello 42"), "hello 42");
+    }
+
+    #[test]
+    fn test_fullwidth_my_number_detected() {
+        // ADR-213: a My Number typed in full-width digits must still be
+        // classified sensitive (would otherwise bypass is_ascii_digit checks).
+        assert!(classify("マイナンバーは１２３４５６７８９０１８です")
+            .categories
+            .contains(&"my_number"));
+    }
+
+    #[test]
+    fn test_fullwidth_credit_card_detected() {
+        // A full-width credit card number must be classified sensitive.
+        assert!(classify("カード番号４１１１１１１１１１１１１１１１")
+            .categories
+            .contains(&"credit_card"));
+    }
+
+    #[test]
+    fn test_fullwidth_ipv4_digits_detected() {
+        // Full-width digits with ASCII dot separators normalize and detect.
+        // (Full-width dot `．` is a separate normalization not handled here.)
+        assert!(classify("サーバー １９２.１６８.１.１ に接続")
+            .categories
+            .contains(&"ip"));
     }
 
     #[test]

@@ -239,7 +239,7 @@ to text three different ways, each matched to its job (ADR-184/187):
 
 ## 5. Privacy classification
 
-`classify(text)` returns category labels only (I3). **Ten categories:**
+`classify(text)` returns category labels only (I3). **Eleven categories:**
 
 | Category | Detection rule |
 |---|---|
@@ -247,12 +247,20 @@ to text three different ways, each matched to its job (ADR-184/187):
 | `email` | `local@domain.tld` heuristic |
 | `ip` | Four-octet IPv4 in 0–255 |
 | `credit_card` | 13–19 digit run passing Luhn check |
+| `my_number` | Japanese My Number (マイナンバー): exactly 12 digits passing the check-digit (検査用数字) test (ADR-212) |
 | `phone` | International `+`-form (8–15 digits) and JP domestic mobile/hyphenated landline |
 | `api_key` | Known vendor prefix + min length (20+ prefixes: OpenAI, GitHub, Stripe, SendGrid, AWS, Google OAuth, npm, …) |
 | `jwt` | `eyJ…` + 3 base64url segments |
 | `pem_key` | `-----BEGIN … PRIVATE KEY-----` block (RSA/EC/OPENSSH/PKCS8 etc.) |
 | `url_credential` | `scheme://user:password@host` embedded credentials |
 | `env_secret` | `KEY=value` / `export KEY=value` where KEY name suggests a secret (password/secret/token/auth/…) |
+
+**Full-width digit normalization (ADR-213):** before running the digit-based
+detectors (`ip`, `credit_card`, `my_number`, `phone`), the classifier normalizes
+full-width digits (`０`–`９`, U+FF10–FF19) to ASCII, so numeric PII typed in
+full-width form (common in Japanese input, e.g. `１２３４５６７８９０１８`) is
+still detected and kept local. (Full-width separators such as `．`/`－` are not
+yet normalized; the bare full-width digit run is.)
 
 Any hit ⇒ sensitive ⇒ forced local (§4 step 1) and never cached (I2).
 The bias is deliberately toward over-classifying: false positive = stays local (cheap);
