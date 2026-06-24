@@ -176,8 +176,32 @@ fn is_dense_script(c: char) -> bool {
 }
 
 /// True when the text appears to contain source code (fenced block).
+/// True when the text contains a properly-formed fenced code block (```) that
+/// indicates a code-heavy request. A properly-formed fence is three backticks
+/// at the start of a line (after optional leading whitespace), followed by
+/// nothing (EOL) or a language specifier (alphanumeric + optional dash/hyphen).
+/// In-line backticks (e.g. "use ``` like this ```" in prose) do not count —
+/// they are markup, not code blocks (ADR-210). Requires a balanced pair of
+/// opening and closing fences to confirm code is present.
 pub fn looks_like_code(text: &str) -> bool {
-    text.contains("```")
+    let mut fence_count = 0;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            let after = &trimmed[3..];
+            // A fence is properly formed if followed by EOL, whitespace, or a
+            // language specifier (e.g., python, C++, c#).
+            let is_fence = after.is_empty()
+                || after.chars().next().map_or(false, |c| {
+                    c.is_alphanumeric() || c == '-' || c.is_whitespace()
+                });
+            if is_fence {
+                fence_count += 1;
+            }
+        }
+    }
+    // Requires at least 2 fences (opening + closing), so the block is balanced.
+    fence_count >= 2
 }
 
 /// Reasoning-depth markers (EN + JA). Hard reasoning benefits from the strong
@@ -779,6 +803,29 @@ mod tests {
     }
 
     #[test]
+    fn test_looks_like_code_requires_balanced_fences() {
+        // ADR-210: requires both opening AND closing fences.
+        // Single opening fence (unclosed block) must not trigger code signal.
+        assert!(!looks_like_code("start a code block:\n```\nfn foo() {}"));
+        // Fenced blocks with language specifiers are valid.
+        assert!(looks_like_code("```python\nprint('hello')\n```"));
+        assert!(looks_like_code("```rust\nfn main() {}\n```"));
+        assert!(looks_like_code("```c++\nint x = 5;\n```"));
+    }
+
+    #[test]
+    fn test_looks_like_code_ignores_inline_backticks() {
+        // ADR-210: backticks in the middle of prose (not at line start) do not
+        // form a valid fence and must not trigger the code signal.
+        // "use ``` like this ```" — three backticks appear mid-line, not as fences.
+        assert!(!looks_like_code(
+            "you can write code like ``` foo() ``` and test it"
+        ));
+        // A fence MUST be at line start (after whitespace).
+        assert!(!looks_like_code("text before ``` code content ```"));
+    }
+
+    #[test]
     fn test_decide_short_query_goes_local() {
         let d = both().decide("hello", None).unwrap();
         assert_eq!(d.route, Route::Local);
@@ -1189,7 +1236,7 @@ mod tests {
     fn test_skill_profile_unknown_skill_falls_through() {
         // An unknown skill name in the profile is a no-op; generic routing applies.
         let e = both().with_skills(vec![("unknown_skill".to_string(), Route::Local)]);
-        let d = e.decide("```code```", None).unwrap();
+        let d = e.decide("```\ncode here\n```", None).unwrap();
         // Generic code→cloud still fires because the skill profile didn't match.
         assert_eq!(d.route, Route::Cloud);
     }
