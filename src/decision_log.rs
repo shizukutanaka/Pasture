@@ -4,7 +4,7 @@
 //! and analysis. Contains only decision metadata (signals, thresholds, route choice),
 //! never prompt content or PII values—safe for long-term retention.
 
-use crate::routing::{Decision, Route};
+use crate::routing::Decision;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Mutex;
