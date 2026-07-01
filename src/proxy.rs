@@ -264,6 +264,16 @@ pub struct Proxy {
     /// local model within the next request instead of inferring it only from
     /// scattered error logs.
     local_health: crate::health::BackendHealth,
+    /// Circuit-breaker cooldown in seconds (IMP-34, ADR-221). Acts on
+    /// `local_health` instead of only observing it: once the local backend
+    /// is `Down`, `route_decision` redirects *non-sensitive* Local decisions
+    /// to Cloud (when available) instead of repeating a call already known
+    /// to fail — until `cooldown` elapses, at which point one probe request
+    /// is let through to detect recovery. Sensitive content is never
+    /// redirected (privacy over availability, I5), and there is no cloud
+    /// fallback if none is configured — this only ever makes an already-Local
+    /// decision faster to fail over, never a privacy override.
+    health_cooldown_secs: u64,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -335,6 +345,7 @@ impl Proxy {
             input_pii_stats: None,
             decision_logger: None,
             local_health: crate::health::BackendHealth::new(),
+            health_cooldown_secs: 30,
         }
     }
 
@@ -426,6 +437,16 @@ impl Proxy {
         } else {
             None
         };
+        self
+    }
+
+    /// Set the local-backend circuit-breaker cooldown in seconds (IMP-34).
+    /// Default 30. 0 disables the cooldown (every request probes local again
+    /// immediately when Down — effectively no circuit-breaking, matching
+    /// pre-IMP-34 behavior since `should_attempt` with cooldown 0 always
+    /// returns true).
+    pub fn with_health_cooldown(mut self, secs: u64) -> Self {
+        self.health_cooldown_secs = secs;
         self
     }
 
@@ -1049,10 +1070,35 @@ impl Proxy {
                 None
             }
         };
-        let decision = self
+        let mut decision = self
             .engine
             .decide_full(&text, forced, sensitive, req.has_tools)
             .map_err(|e| ProxyError::Routing(e.to_string()))?;
+        // Circuit breaker (IMP-34, ADR-221): local_health (IMP-30) was, until
+        // now, purely observational — the router kept sending traffic to a
+        // backend it already knew was Down, wasting a full request's latency
+        // on a call almost certain to fail again before any fallback kicked
+        // in. Redirect the *natural, difficulty-based* Local decision to
+        // Cloud once the local backend is Down and outside its cooldown
+        // window — but never for: sensitive content (I5 — privacy always
+        // wins over availability), an explicit per-request model pin
+        // (`forced`, e.g. `model:"local"` — honour the caller's explicit
+        // choice), or `PASTURE_LOCAL_ONLY` (an explicit "never touch cloud"
+        // operator setting). Requires a configured cloud backend to fall back
+        // to; with none, this is a no-op (there is nowhere to redirect).
+        if decision.route == Route::Local
+            && !sensitive
+            && forced.is_none()
+            && !self.engine.is_local_only()
+            && self.cloud.is_some()
+            && !self.local_health.should_attempt(self.health_cooldown_secs)
+        {
+            decision.reason = format!(
+                "{} (local circuit open, redirected to cloud)",
+                decision.reason
+            );
+            decision.route = Route::Cloud;
+        }
         Ok((decision, report))
     }
 

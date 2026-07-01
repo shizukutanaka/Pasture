@@ -1816,6 +1816,7 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         } else {
             Some(config.decision_log.as_str())
         })
+        .with_health_cooldown(config.health_cooldown_secs)
         .with_otel_log(if config.otel_log.is_empty() {
             None
         } else {

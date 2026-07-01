@@ -381,6 +381,7 @@ wins). Variables:
 | `PASTURE_OUTPUT_PII_SCAN` | off | tally PII categories seen in response text; detection-only, exposed on `/v1/stats` (IMP-33) |
 | `PASTURE_INPUT_PII_SCAN` | off | tally which PII categories trigger local-only routing; exposed on `/v1/stats` (IMP-28) |
 | `PASTURE_DECISION_LOG` | _(off)_ | path to the routing decision audit log (JSONL: signals, threshold, route, reason; no PII) (IMP-29) |
+| `PASTURE_HEALTH_COOLDOWN_SECS` | `30` | circuit-breaker cooldown: once local is Down, redirect non-sensitive Local decisions to cloud until this elapses; 0 disables (IMP-34) |
 | `PASTURE_INJECTION_GUARD` | `off` | prompt-injection guard: `off` \| `flag` \| `block` (§7.2, IMP-20) |
 | `PASTURE_SEMANTIC_CACHE` | `0` | semantic (embedding) cache capacity; 0 = disabled (§6, IMP-12) |
 | `PASTURE_SEMANTIC_THRESHOLD` | `0.92` | cosine-similarity threshold for a semantic-cache hit (§6) |

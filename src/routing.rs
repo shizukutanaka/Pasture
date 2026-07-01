@@ -479,6 +479,15 @@ impl RoutingEngine {
         self
     }
 
+    /// True when `PASTURE_LOCAL_ONLY` is in effect (cloud is never contacted
+    /// regardless of content signals or token length). Exposed so callers can
+    /// tell a plain difficulty-based Local decision apart from one produced
+    /// by an explicit "never touch cloud" operator setting (IMP-34's circuit
+    /// breaker must not override the latter).
+    pub fn is_local_only(&self) -> bool {
+        self.local_only
+    }
+
     /// Set skill-profile route overrides (IMP-25).
     ///
     /// Each entry is `(skill_label, route)`. Recognised labels: `"code"`,

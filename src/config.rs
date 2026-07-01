@@ -129,6 +129,14 @@ pub struct Config {
     /// threshold, route, reason — no PII, no prompt content). Set via
     /// `PASTURE_DECISION_LOG=<path>`.
     pub decision_log: String,
+    /// Local-backend circuit-breaker cooldown in seconds (IMP-34). Once the
+    /// local backend is marked Down (3 consecutive failures), non-sensitive
+    /// Local decisions redirect to Cloud (when configured) until this many
+    /// seconds have elapsed, at which point one probe request is let through
+    /// to detect recovery. Default 30. 0 disables the circuit breaker
+    /// (matches pre-IMP-34 behavior: every request still attempts local).
+    /// Set via `PASTURE_HEALTH_COOLDOWN_SECS=<n>`.
+    pub health_cooldown_secs: u64,
     /// Optional OTel-compatible GenAI trace log path (IMP-23). Each request
     /// appends one JSONL span with GenAI semantic convention attributes.
     /// Empty = disabled (default). Set via `PASTURE_OTEL_LOG=<path>`.
@@ -191,6 +199,7 @@ impl Default for Config {
             output_pii_scan: false,
             input_pii_scan: false,
             decision_log: String::new(),
+            health_cooldown_secs: 30,
             otel_log: String::new(),
             cloud_fallback_provider: String::new(),
             cloud_fallback_model: String::new(),
@@ -429,6 +438,11 @@ impl Config {
         }
         if let Ok(v) = std::env::var("PASTURE_DECISION_LOG") {
             self.decision_log = v;
+        }
+        if let Ok(v) = std::env::var("PASTURE_HEALTH_COOLDOWN_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.health_cooldown_secs = n;
+            }
         }
         if let Ok(v) = std::env::var("PASTURE_OTEL_LOG") {
             self.otel_log = v;

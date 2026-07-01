@@ -4187,6 +4187,148 @@ fn test_local_health_tracked_for_streaming_requests_too() {
     let _ = std::fs::remove_file(&log);
 }
 
+// ── IMP-34 circuit breaker (acts on local_health instead of only observing) ──
+
+#[test]
+fn test_circuit_breaker_redirects_to_cloud_once_local_is_down() {
+    // Next step after IMP-30: local_health was purely observational. Once
+    // Down, the router must stop repeating a call known to fail and use the
+    // configured cloud backend instead, for the natural (non-forced,
+    // non-sensitive) difficulty-based Local decision.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, true); // high threshold → naturally local
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(AlwaysFailBackend)),
+        Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+        &log,
+    );
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    // Drive 3 failures to trip the breaker (Down).
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Local);
+    }
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).unwrap();
+    assert_eq!(
+        v.get("local_health")
+            .and_then(|x| x.as_str().map(String::from)),
+        Some("down".to_string())
+    );
+    // Preview the routing decision: with local Down and cloud configured,
+    // the naturally-Local decision must redirect to Cloud.
+    let preview = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("cloud"));
+    assert!(
+        pv.get("reason")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .contains("circuit"),
+        "{preview}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_circuit_breaker_never_overrides_sensitive_content() {
+    // I5 invariant: privacy always wins over availability. Even with local
+    // Down and cloud configured, sensitive content must still route local
+    // (and fail explicitly) rather than ever reaching the cloud backend.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, true);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(AlwaysFailBackend)),
+        Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+        &log,
+    );
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Local);
+    }
+    let preview = p
+        .handle_route_preview(
+            r#"{"messages":[{"role":"user","content":"my email is alice@example.com"}]}"#,
+        )
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("local"));
+    assert_eq!(pv.get("sensitive").and_then(|x| x.as_bool()), Some(true));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_circuit_breaker_never_overrides_explicit_model_pin() {
+    // An explicit per-request model:"local" pin is the caller's deliberate
+    // choice; the circuit breaker must not silently redirect it to cloud.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, true);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(AlwaysFailBackend)),
+        Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+        &log,
+    );
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Local);
+    }
+    let preview = p
+        .handle_route_preview(r#"{"model":"local","messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("local"));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_circuit_breaker_disabled_with_zero_cooldown() {
+    // PASTURE_HEALTH_COOLDOWN_SECS=0 disables the breaker entirely: every
+    // request probes local again immediately, matching pre-IMP-34 behavior.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, true);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(AlwaysFailBackend)),
+        Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+        &log,
+    )
+    .with_health_cooldown(0);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Local);
+    }
+    let preview = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    // should_attempt(0) always returns true, so the breaker never trips.
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("local"));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_circuit_breaker_noop_without_cloud_backend() {
+    // No cloud backend configured: nothing to redirect to, so the natural
+    // Local decision stands even after the breaker trips.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, false);
+    let p = Proxy::new(engine, Some(Box::new(AlwaysFailBackend)), None, &log);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Local);
+    }
+    let preview = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("local"));
+    let _ = std::fs::remove_file(&log);
+}
+
 #[test]
 fn test_local_health_starts_healthy() {
     let log = tmp_log();
