@@ -2887,7 +2887,7 @@ impl Proxy {
                 io_err = Some(e);
             }
         }
-        let resp = backend.stream_complete(req, &mut |delta| {
+        let mut on_delta = |delta: &str| {
             if io_err.is_some() {
                 return;
             }
@@ -2912,7 +2912,18 @@ impl Proxy {
             if let Err(e) = sock.write_all(frame.as_bytes()) {
                 io_err = Some(e);
             }
-        });
+        };
+        // IMP-30: streaming previously bypassed local-health tracking entirely —
+        // only the buffered strategies (complete_direct/complete_cascade/
+        // complete_cloud_with_fallback) called track_local_call. Since a stream:true
+        // request routed Local calls stream_complete directly, a crashed local
+        // backend never showed up in /v1/stats for streaming traffic, which is the
+        // more common path for interactive chat UIs. Record the same outcome here.
+        let resp = if route == Route::Local {
+            self.track_local_call(|| backend.stream_complete(req, &mut on_delta))
+        } else {
+            backend.stream_complete(req, &mut on_delta)
+        };
         // The backend stream has fully completed — it reads the upstream to the end
         // even if the client went away mid-stream, so `resp` carries the real token
         // usage. Account the work (cost/budget/trace/cache) BEFORE the remaining

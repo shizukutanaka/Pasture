@@ -4084,6 +4084,33 @@ impl Backend for AlwaysFailBackend {
 // ── IMP-30 local backend health tracking ─────────────────────────────────────
 
 #[test]
+fn test_local_health_tracked_for_streaming_requests_too() {
+    // Socratic follow-up to IMP-30: health tracking was wired into the
+    // buffered strategies (complete_direct/complete_cascade/
+    // complete_cloud_with_fallback), but a stream:true request calls
+    // backend.stream_complete() directly — a separate code path. A crashed
+    // local backend must be visible in /v1/stats for streaming traffic too,
+    // since SSE is the common path for interactive chat UIs.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, false);
+    let p = Proxy::new(engine, Some(Box::new(AlwaysFailBackend)), None, &log);
+    let body = r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, resp) = roundtrip_ref(&p, http_post("/v1/chat/completions", body));
+    // Streaming always returns 200 once the SSE headers are committed (ADR-192);
+    // the backend failure surfaces as an in-stream error frame instead.
+    assert_eq!(status, 200);
+    assert!(resp.contains("upstream_error"), "{resp}");
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).unwrap();
+    assert_eq!(
+        v.get("local_health")
+            .and_then(|x| x.as_str().map(String::from)),
+        Some("degraded".to_string())
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_local_health_starts_healthy() {
     let log = tmp_log();
     let p = proxy_with(true, false, 100, &log);
