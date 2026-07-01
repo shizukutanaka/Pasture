@@ -1238,8 +1238,20 @@ impl Proxy {
     ) -> EmbeddingStep {
         let want_difficulty =
             !self.hard_prompts.is_empty() && route == Route::Local && self.cloud.is_some();
+        // Socratic follow-up to IMP-34 (ADR-224): the circuit breaker protects the
+        // completion call paths (complete_direct/complete_cascade/
+        // complete_cloud_with_fallback, plus streaming), but this embeddings()
+        // call — needed for the semantic cache lookup and the difficulty signal —
+        // is a *separate* call to the same local backend, made unconditionally
+        // whenever semantic_cache/hard_prompts are configured, regardless of
+        // route. Without this check, a circuit-open local backend still gets an
+        // embeddings call on every single request (wasting latency on a call
+        // already known to fail), defeating the whole point of the breaker for
+        // any deployment using the semantic cache or difficulty signal.
+        let local_viable =
+            self.local.is_some() && self.local_health.should_attempt(self.health_cooldown_secs);
         let query_embedding: Option<Vec<f64>> =
-            if !sensitive && (self.semantic_cache.is_some() || want_difficulty) {
+            if !sensitive && local_viable && (self.semantic_cache.is_some() || want_difficulty) {
                 self.local.as_deref().and_then(|local| {
                     let text = semantic_embed_text(req);
                     local

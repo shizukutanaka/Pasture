@@ -2993,6 +2993,52 @@ fn test_streaming_sensitive_skips_semantic_cache() {
     let _ = std::fs::remove_file(&log);
 }
 
+#[test]
+fn test_semantic_cache_embedding_skipped_when_local_circuit_open() {
+    // Socratic follow-up to IMP-34 (ADR-224): the circuit breaker protects
+    // the completion call paths, but embedding_step's local.embeddings()
+    // call for the semantic cache lookup was a *separate* call made
+    // unconditionally whenever semantic_cache is configured, regardless of
+    // circuit state -- wasting latency on a call already known to fail on
+    // every single request once local is Down. Using a counting backend
+    // (not AlwaysFailBackend, whose embeddings() already errors via the
+    // default trait method -- that would "pass" even without the fix)
+    // proves the call is genuinely skipped, not merely tolerated.
+    let log = tmp_log();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let engine = RoutingEngine::new(100, true, true);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(CountingFailBackend {
+            embeddings_calls: counter.clone(),
+        })),
+        Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+        &log,
+    )
+    .with_semantic_cache(8, 0.5);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Local);
+    }
+    assert_eq!(p.local_health.status(), crate::health::HealthStatus::Down);
+    // A pre-trip request would have called embeddings() once per request; reset
+    // the counter's baseline understanding by reading it now (any calls so far
+    // came from complete_direct, which never touches embeddings()).
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let resp = p
+        .handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    assert!(resp.contains("cloud-reply"), "{resp}");
+    // The key assertion: embeddings() must NOT have been called, since local
+    // is circuit-open. Without the fix this would be 1 (the wasted call).
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "embeddings() must be skipped while local is circuit-open"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── ADR-153 streamed completion accounted even on client disconnect ─────────
 
 #[test]
@@ -4156,6 +4202,31 @@ impl Backend for AlwaysFailBackend {
     }
     fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
         Err(BackendError::Transport("provider down".into()))
+    }
+}
+
+/// Like `AlwaysFailBackend`, but counts `embeddings()` calls (via a shared
+/// `Arc` the test retains after the backend is moved into `Proxy::new`) so a
+/// test can assert the circuit breaker actually *skips* the semantic-cache
+/// embedding lookup (ADR-224) rather than merely tolerating its failure.
+struct CountingFailBackend {
+    embeddings_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+impl Backend for CountingFailBackend {
+    fn name(&self) -> &str {
+        "counting-fail"
+    }
+    fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
+        Err(BackendError::Transport("provider down".into()))
+    }
+    fn embeddings(&self, _inputs: &[String]) -> Result<EmbeddingsResponse, BackendError> {
+        self.embeddings_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(EmbeddingsResponse {
+            model: "counting-fail".to_string(),
+            vectors: vec![vec![1.0, 0.0]],
+            prompt_tokens: 1,
+        })
     }
 }
 
