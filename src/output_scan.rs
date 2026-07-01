@@ -1,4 +1,4 @@
-//! Output-side PII visibility scan (IMP-32).
+//! Output-side PII visibility scan (IMP-33).
 //!
 //! Input prompts are classified before routing (`privacy::classify`) so
 //! sensitive requests stay local. That guards what the *client* sends, but
