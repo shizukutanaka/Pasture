@@ -837,6 +837,33 @@ fn test_output_pii_scan_disabled_by_default_no_field_populated() {
 }
 
 #[test]
+fn test_output_pii_scan_covers_streaming_responses_too() {
+    // Socratic follow-up to IMP-33: complete_buffered scanned resp.content, but
+    // finalize_streamed (the streaming path's equivalent finalization point)
+    // did not — the same buffered-vs-streaming asymmetry class of gap found in
+    // ADR-219 for local-health tracking. A response echoing an email over a
+    // stream:true request must be tallied too.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, false);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "contact alice@example.com")) as Box<dyn Backend>),
+        None,
+        &log,
+    )
+    .with_output_pii_scan(true);
+    let body = r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, resp) = roundtrip_ref(&p, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    assert!(resp.contains("alice@example.com"));
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    let categories = v.get("output_pii_categories").expect("field present");
+    assert_eq!(categories.get("email").and_then(|x| x.as_f64()), Some(1.0));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_output_pii_scan_enabled_tallies_response_categories() {
     // IMP-33: with with_output_pii_scan(true), a response echoing an email
     // is tallied under "email" in /v1/stats — detection only, never mutated.

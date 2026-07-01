@@ -1339,6 +1339,17 @@ impl Proxy {
             Some(m) => crate::pseudonymize::restore(&r.content, m),
             None => r.content.clone(),
         };
+        // IMP-33 streaming parity: complete_buffered scans the *restored* response
+        // (real PII visible again, after any pseudonymize masking is undone) — the
+        // buffered path's stats.scan(&resp.content) runs after run_completion has
+        // already called pseudonymize::restore internally. Scanning `r.content`
+        // here instead would see masked placeholders like `<EMAIL_1>` whenever
+        // pseudonymize is active, never the real category. `restored` is exactly
+        // what the client actually receives over the wire (the StreamRestorer
+        // de-masks each SSE delta the same way), so it is the correct text to scan.
+        if let Some(stats) = &self.output_pii_stats {
+            stats.scan(&restored);
+        }
         if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
             let mut to_cache = r.clone();
             to_cache.content = restored.clone();
