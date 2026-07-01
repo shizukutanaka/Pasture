@@ -121,14 +121,62 @@ pub fn classify_injection(text: &str) -> InjectionRisk {
     InjectionRisk::Allow
 }
 
+/// Tallies injection-guard outcomes by `"{label}:{action}"` (e.g.
+/// `"role_switch:blocked"`, `"exfil_attempt:flagged"`) for observability
+/// (ADR-225). Detection-only, no prompt content — same I5 invariant as the
+/// PII category tallies (IMP-28/33). Closes a real gap: `block` mode
+/// previously produced *no* trace at all of what it rejected — not even a
+/// stderr line, unlike `flag` mode — so an operator running a public-facing
+/// deployment with `PASTURE_INJECTION_GUARD=block` had no way to measure the
+/// guard's own effectiveness or false-positive rate.
+#[derive(Debug, Default)]
+pub struct GuardStats {
+    counts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl GuardStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Tally one outcome. `action` is `"flagged"` or `"blocked"`.
+    pub fn tally(&self, label: &str, action: &str) {
+        if let Ok(mut counts) = self.counts.lock() {
+            *counts.entry(format!("{label}:{action}")).or_insert(0) += 1;
+        }
+    }
+
+    /// Snapshot of `"{label}:{action}"` -> count, sorted for stable output.
+    pub fn snapshot(&self) -> Vec<(String, u64)> {
+        let counts = match self.counts.lock() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let mut out: Vec<(String, u64)> = counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        out.sort();
+        out
+    }
+
+    /// Total tallies across all label/action combinations.
+    pub fn total(&self) -> u64 {
+        self.counts.lock().map(|c| c.values().sum()).unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_allow_normal_prompt() {
-        assert_eq!(classify_injection("what is the capital of France?"), InjectionRisk::Allow);
-        assert_eq!(classify_injection("summarize this article for me"), InjectionRisk::Allow);
+        assert_eq!(
+            classify_injection("what is the capital of France?"),
+            InjectionRisk::Allow
+        );
+        assert_eq!(
+            classify_injection("summarize this article for me"),
+            InjectionRisk::Allow
+        );
         assert_eq!(classify_injection("翻訳してください"), InjectionRisk::Allow);
     }
 
@@ -204,5 +252,29 @@ mod tests {
             classify_injection("Could you act as a helpful assistant for this task?"),
             InjectionRisk::Flag("role_switch".to_string())
         );
+    }
+
+    #[test]
+    fn test_guard_stats_tallies_by_label_and_action() {
+        let stats = GuardStats::new();
+        stats.tally("role_switch", "blocked");
+        stats.tally("role_switch", "blocked");
+        stats.tally("exfil_attempt", "flagged");
+        assert_eq!(stats.total(), 3);
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap,
+            vec![
+                ("exfil_attempt:flagged".to_string(), 1),
+                ("role_switch:blocked".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_guard_stats_empty_by_default() {
+        let stats = GuardStats::new();
+        assert_eq!(stats.total(), 0);
+        assert!(stats.snapshot().is_empty());
     }
 }

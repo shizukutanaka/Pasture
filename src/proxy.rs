@@ -188,6 +188,14 @@ pub struct Proxy {
     /// Prompt-injection guard mode (IMP-20). `"off"` = disabled; `"flag"` =
     /// detect and log + annotate the JSON response; `"block"` = reject with 400.
     injection_guard: String,
+    /// Injection-guard outcome tally (ADR-225). Always present (cheap
+    /// bookkeeping, mirrors `local_health`'s always-on pattern); only ever
+    /// populated when `injection_guard != "off"`. Closes a real gap: `block`
+    /// mode previously left zero trace of what it rejected anywhere — not
+    /// even stderr — while `flag` mode did. Exposed via `/v1/stats` as
+    /// `injection_guard_stats` so an operator can measure the guard's own
+    /// effectiveness and false-positive rate.
+    injection_stats: crate::guard::GuardStats,
     /// Daily cloud token budget (IMP-26). 0 = disabled. Running sum of
     /// cloud prompt+completion tokens today (UTC day), initialized from the cost
     /// log at startup and incremented atomically on each cloud completion.
@@ -327,6 +335,7 @@ impl Proxy {
             hard_threshold: 0.85,
             hard_centroids: std::sync::Mutex::new(None),
             injection_guard: "off".to_string(),
+            injection_stats: crate::guard::GuardStats::new(),
             pseudonymize: false,
             otel_log: None,
             cloud_system: String::new(),
@@ -2186,6 +2195,7 @@ impl Proxy {
             .map(|s| s.snapshot())
             .unwrap_or_default();
         let local_health_last_error = self.local_health.last_check().and_then(|c| c.last_error);
+        let injection_guard_stats = self.injection_stats.snapshot();
         Ok(build_stats_response(
             &summary,
             live_hits,
@@ -2202,6 +2212,7 @@ impl Proxy {
             self.local_health.status().as_str(),
             &input_pii_categories,
             local_health_last_error.as_deref(),
+            &injection_guard_stats,
         ))
     }
 
@@ -2744,12 +2755,18 @@ impl Proxy {
             match crate::guard::classify_injection(&text) {
                 crate::guard::InjectionRisk::Flag(label) => {
                     if self.injection_guard == "block" {
+                        // ADR-225: block mode previously left zero trace here — not
+                        // even stderr — unlike flag mode below. eprintln! + tally
+                        // give an operator the same visibility both modes deserve.
+                        eprintln!("pasture: injection_blocked:{label}");
+                        self.injection_stats.tally(&label, "blocked");
                         return Err(ProxyError::BadRequest(format!(
                             "request blocked by injection guard: {label}"
                         )));
                     }
                     // flag mode: log and annotate, but let the request proceed.
                     eprintln!("pasture: injection_flag:{label} (flag mode, request proceeds)");
+                    self.injection_stats.tally(&label, "flagged");
                     Some(label)
                 }
                 crate::guard::InjectionRisk::Allow => None,
@@ -2794,6 +2811,10 @@ impl Proxy {
                 crate::guard::classify_injection(&text)
             {
                 if self.injection_guard == "block" {
+                    // ADR-225: same streaming-parity fix as the buffered path —
+                    // block mode had zero trace here previously.
+                    eprintln!("pasture: injection_blocked:{label}");
+                    self.injection_stats.tally(&label, "blocked");
                     let msg = format!("request blocked by injection guard: {label}");
                     write_response(
                         sock,
@@ -2805,6 +2826,7 @@ impl Proxy {
                     return Ok(400);
                 }
                 eprintln!("pasture: injection_flag:{label} (flag mode, stream proceeds)");
+                self.injection_stats.tally(&label, "flagged");
                 Some(label)
             } else {
                 None
@@ -3373,6 +3395,7 @@ pub fn build_stats_response(
     local_health: &'static str,
     input_pii_categories: &[(&'static str, u64)],
     local_health_last_error: Option<&str>,
+    injection_guard_stats: &[(String, u64)],
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
     let fmt_cats = |cats: &[(&'static str, u64)]| -> String {
@@ -3381,6 +3404,13 @@ pub fn build_stats_response(
             .collect::<Vec<String>>()
             .join(",")
     };
+    // ADR-225: injection-guard outcome tally, keyed by "label:action" (e.g.
+    // "role_switch:blocked"). Owned Strings (unlike the &'static str PII
+    // category keys) since classify_injection returns owned labels.
+    let injection_json: Vec<String> = injection_guard_stats
+        .iter()
+        .map(|(k, n)| format!("\"{}\":{n}", escape_string(k)))
+        .collect();
     // Socratic follow-up to IMP-30/34: HealthCheck has captured `last_error`
     // since it was introduced, but nothing ever read it back out — an
     // operator could see "down" without knowing *why* (timeout? connection
@@ -3401,7 +3431,7 @@ pub fn build_stats_response(
 \"budget_daily_tokens_used\":{budget_used},\"budget_daily_tokens_limit\":{budget_limit},\
 \"output_pii_categories\":{{{}}},\"local_health\":\"{local_health}\",\
 \"local_health_last_error\":{last_error_json},\
-\"input_pii_categories\":{{{}}}}}",
+\"input_pii_categories\":{{{}}},\"injection_guard_stats\":{{{}}}}}",
         s.total,
         s.local,
         s.cloud,
@@ -3413,6 +3443,7 @@ pub fn build_stats_response(
         round4(s.cloud_cost_usd),
         fmt_cats(output_pii_categories),
         fmt_cats(input_pii_categories),
+        injection_json.join(","),
     )
 }
 
