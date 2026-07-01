@@ -54,10 +54,7 @@ impl DecisionLogger {
     /// Create a new decision logger. If `log_path` is provided, opens it for appending.
     pub fn new(log_path: Option<&str>) -> std::io::Result<Self> {
         let file = if let Some(path) = log_path {
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
+            let f = OpenOptions::new().create(true).append(true).open(path)?;
             Some(Mutex::new(f))
         } else {
             None
@@ -156,7 +153,10 @@ fn escape_json_string(s: &str) -> String {
 
 /// Format a vector of strings as a JSON array.
 fn format_json_array(items: &[String]) -> String {
-    let escaped: Vec<String> = items.iter().map(|s| format!("\"{}\"", escape_json_string(s))).collect();
+    let escaped: Vec<String> = items
+        .iter()
+        .map(|s| format!("\"{}\"", escape_json_string(s)))
+        .collect();
     format!("[{}]", escaped.join(","))
 }
 

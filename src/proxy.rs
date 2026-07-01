@@ -234,6 +234,13 @@ pub struct Proxy {
     /// `(bytes_of_cost_log_consumed, running_summary)`. Each scrape folds only the
     /// newly-appended complete lines instead of re-parsing the whole growing log.
     metrics_cache: std::sync::Mutex<(u64, crate::cost::CostSummary)>,
+    /// Output-side PII category visibility (IMP-33). Off by default (`None`);
+    /// when enabled, every buffered completion's response text is scanned with
+    /// the same category classifier used on input, tallying counts only —
+    /// never mutating the response or storing matched values (I5). Exposed via
+    /// `/v1/stats` so an operator can see whether responses are echoing PII the
+    /// input classifier had no reason to flag (e.g. a summarized document).
+    output_pii_stats: Option<crate::output_scan::OutputPiiStats>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -301,6 +308,7 @@ impl Proxy {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             cloud_fallback: None,
             metrics_cache: std::sync::Mutex::new((0, crate::cost::summarize(&[]))),
+            output_pii_stats: None,
         }
     }
 
@@ -366,6 +374,19 @@ impl Proxy {
     /// request is sent to the cloud backend, and restored from the response.
     pub fn with_pseudonymize(mut self, enabled: bool) -> Self {
         self.pseudonymize = enabled;
+        self
+    }
+
+    /// Enable output-side PII category visibility scanning (IMP-33). Off by
+    /// default. When enabled, every buffered completion's response text is
+    /// scanned for PII categories (detection-only, never mutated) and tallied
+    /// for `/v1/stats`.
+    pub fn with_output_pii_scan(mut self, enabled: bool) -> Self {
+        self.output_pii_stats = if enabled {
+            Some(crate::output_scan::OutputPiiStats::new())
+        } else {
+            None
+        };
         self
     }
 
@@ -1934,6 +1955,11 @@ impl Proxy {
             .map(|g| (g.hits(), g.misses(), g.len(), g.cap()))
             .unwrap_or((0, 0, 0, 0));
         let (budget_used, budget_limit) = self.budget_snapshot();
+        let pii_categories = self
+            .output_pii_stats
+            .as_ref()
+            .map(|s| s.snapshot())
+            .unwrap_or_default();
         Ok(build_stats_response(
             &summary,
             live_hits,
@@ -1946,6 +1972,7 @@ impl Proxy {
             sem_cap,
             budget_used,
             budget_limit,
+            &pii_categories,
         ))
     }
 
@@ -2459,6 +2486,9 @@ impl Proxy {
 
         let (resp, label, logprob, reserved) = self.run_completion(req)?;
         self.log_cost(label, &resp, logprob, reserved);
+        if let Some(stats) = &self.output_pii_stats {
+            stats.scan(&resp.content);
+        }
         Ok(build_openai_response_with_injection(&resp, label, injection_label.as_deref()))
     }
 
@@ -3016,8 +3046,13 @@ pub fn build_stats_response(
     sem_cap: usize,
     budget_used: u64,
     budget_limit: u64,
+    output_pii_categories: &[(&'static str, u64)],
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
+    let pii_json: Vec<String> = output_pii_categories
+        .iter()
+        .map(|(cat, n)| format!("\"{cat}\":{n}"))
+        .collect();
     format!(
         "{{\"object\":\"pasture.stats\",\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
 \"cloud_rate\":{},\"cache_rate\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\
@@ -3025,7 +3060,8 @@ pub fn build_stats_response(
 \"cache_size\":{cache_size},\"cache_capacity\":{cache_cap},\
 \"semantic_cache_hits\":{sem_hits},\"semantic_cache_misses\":{sem_misses},\
 \"semantic_cache_size\":{sem_size},\"semantic_cache_capacity\":{sem_cap},\
-\"budget_daily_tokens_used\":{budget_used},\"budget_daily_tokens_limit\":{budget_limit}}}",
+\"budget_daily_tokens_used\":{budget_used},\"budget_daily_tokens_limit\":{budget_limit},\
+\"output_pii_categories\":{{{}}}}}",
         s.total,
         s.local,
         s.cloud,
@@ -3035,6 +3071,7 @@ pub fn build_stats_response(
         s.prompt_tokens,
         s.completion_tokens,
         round4(s.cloud_cost_usd),
+        pii_json.join(","),
     )
 }
 

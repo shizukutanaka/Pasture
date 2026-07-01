@@ -61,10 +61,7 @@ impl OutputPiiStats {
     /// Total number of category tallies recorded (sum across all categories;
     /// a single response with 2 categories contributes 2, not 1).
     pub fn total(&self) -> u64 {
-        self.counts
-            .lock()
-            .map(|c| c.values().sum())
-            .unwrap_or(0)
+        self.counts.lock().map(|c| c.values().sum()).unwrap_or(0)
     }
 }
 

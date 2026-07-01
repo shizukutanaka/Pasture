@@ -114,6 +114,11 @@ pub struct Config {
     /// tokens (`<EMAIL_1>`, etc.) that are reversed after the cloud response.
     /// Set via `PASTURE_PSEUDONYMIZE=1`.
     pub pseudonymize: bool,
+    /// Scan response text for PII categories and tally counts in `/v1/stats`
+    /// (IMP-33). Detection-only: never mutates the response or logs matched
+    /// values, only stable category labels (e.g. "email"). Off by default.
+    /// Set via `PASTURE_OUTPUT_PII_SCAN=1`.
+    pub output_pii_scan: bool,
     /// Optional OTel-compatible GenAI trace log path (IMP-23). Each request
     /// appends one JSONL span with GenAI semantic convention attributes.
     /// Empty = disabled (default). Set via `PASTURE_OTEL_LOG=<path>`.
@@ -173,6 +178,7 @@ impl Default for Config {
             max_body_bytes: 16 * 1024 * 1024,
             cache_control: false,
             pseudonymize: false,
+            output_pii_scan: false,
             otel_log: String::new(),
             cloud_fallback_provider: String::new(),
             cloud_fallback_model: String::new(),
@@ -394,6 +400,12 @@ impl Config {
         if let Ok(v) = std::env::var("PASTURE_PSEUDONYMIZE") {
             match v.to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" | "" => self.pseudonymize = true,
+                _ => {}
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_OUTPUT_PII_SCAN") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.output_pii_scan = true,
                 _ => {}
             }
         }

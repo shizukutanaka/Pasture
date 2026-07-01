@@ -76,10 +76,7 @@ impl BackendHealth {
 
     /// Get the last health check result.
     pub fn last_check(&self) -> Option<HealthCheck> {
-        self.last_check
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+        self.last_check.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// Record a successful health check.
@@ -168,7 +165,7 @@ mod tests {
         h.mark_unhealthy("timeout".to_string(), 5000);
         h.mark_unhealthy("timeout".to_string(), 5000);
         assert_eq!(h.status(), HealthStatus::Down);
-        assert!(!h.is_healthy());  // Down is not healthy
+        assert!(!h.is_healthy()); // Down is not healthy
         let check = h.last_check().unwrap();
         assert_eq!(check.status, HealthStatus::Down);
     }

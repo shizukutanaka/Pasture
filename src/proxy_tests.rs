@@ -731,7 +731,7 @@ fn test_build_stats_response_shape() {
         completion_tokens: 50,
         cloud_cost_usd: 0.0123,
     };
-    let json = build_stats_response(&s, 7, 3, 5, 128, 0, 0, 0, 0, 1500, 1_000_000);
+    let json = build_stats_response(&s, 7, 3, 5, 128, 0, 0, 0, 0, 1500, 1_000_000, &[]);
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
     assert_eq!(v.get("cloud").and_then(|x| x.as_f64()), Some(1.0));
@@ -766,6 +766,55 @@ fn test_handle_stats_empty_log_is_zeros() {
     let json = p.handle_stats().unwrap();
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(0.0));
+}
+
+#[test]
+fn test_output_pii_scan_disabled_by_default_no_field_populated() {
+    // IMP-33: without with_output_pii_scan(true), no scanning happens; the
+    // stats field is present but empty (existing behaviour unchanged).
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, false);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "contact alice@example.com")) as Box<dyn Backend>),
+        None,
+        &log,
+    );
+    p.handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    let categories = v.get("output_pii_categories").expect("field present");
+    assert!(matches!(categories, crate::json::JsonValue::Object(m) if m.is_empty()));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_output_pii_scan_enabled_tallies_response_categories() {
+    // IMP-33: with with_output_pii_scan(true), a response echoing an email
+    // is tallied under "email" in /v1/stats — detection only, never mutated.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, false);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "contact alice@example.com")) as Box<dyn Backend>),
+        None,
+        &log,
+    )
+    .with_output_pii_scan(true);
+    let resp = p
+        .handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    // The response body itself is untouched (detection-only, not masking).
+    assert!(resp.contains("alice@example.com"));
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    let categories = v.get("output_pii_categories").expect("field present");
+    assert_eq!(
+        categories.get("email").and_then(|x| x.as_f64()),
+        Some(1.0)
+    );
+    let _ = std::fs::remove_file(&log);
 }
 
 #[test]

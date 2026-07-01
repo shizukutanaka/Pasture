@@ -1809,6 +1809,7 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         .with_cloud_price(config.cloud_price_per_1m.0, config.cloud_price_per_1m.1)
         .with_max_body_bytes(config.max_body_bytes)
         .with_pseudonymize(config.pseudonymize)
+        .with_output_pii_scan(config.output_pii_scan)
         .with_otel_log(if config.otel_log.is_empty() {
             None
         } else {
