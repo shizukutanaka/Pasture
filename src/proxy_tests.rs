@@ -816,6 +816,26 @@ fn test_input_pii_scan_enabled_tallies_sensitive_categories() {
 }
 
 #[test]
+fn test_input_pii_scan_covers_streaming_requests_too() {
+    // Socratic verification: input_pii_stats is tallied inside
+    // classify_and_decide, which both run_completion and
+    // stream_chat_to_socket call before diverging — confirming that shared
+    // call site actually covers stream:true requests, closing the audit
+    // alongside ADR-219 (health) and ADR-220 (output scan).
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_input_pii_scan(true);
+    let body =
+        r#"{"stream":true,"messages":[{"role":"user","content":"contact alice@example.com"}]}"#;
+    let (status, _resp) = roundtrip_ref(&p, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    let categories = v.get("input_pii_categories").expect("field present");
+    assert_eq!(categories.get("email").and_then(|x| x.as_f64()), Some(1.0));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_output_pii_scan_disabled_by_default_no_field_populated() {
     // IMP-33: without with_output_pii_scan(true), no scanning happens; the
     // stats field is present but empty (existing behaviour unchanged).
@@ -924,6 +944,36 @@ fn test_decision_log_enabled_appends_jsonl_record() {
     assert!(v.get("final_route").is_some());
     assert!(v.get("reason").is_some());
     assert!(v.get("threshold").is_some());
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&decision_log_path);
+}
+
+#[test]
+fn test_decision_log_covers_streaming_requests_too() {
+    // Socratic verification (same question as ADR-219/220): decision_logger
+    // is called from both run_completion and stream_chat_to_socket in the
+    // source, but unlike output_pii_stats/local_health it had no dedicated
+    // streaming test. Confirming here that a stream:true request also
+    // appends a JSONL record, closing out the buffered-vs-streaming audit
+    // for all three IMP-28/29/30/33 features shipped this session.
+    let log = tmp_log();
+    let decision_log_path = tmp_log();
+    let engine = RoutingEngine::new(100, true, false);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply")) as Box<dyn Backend>),
+        None,
+        &log,
+    )
+    .with_decision_log(Some(&decision_log_path));
+    let body = r#"{"stream":true,"messages":[{"role":"user","content":"secret stream content"}]}"#;
+    let (status, _resp) = roundtrip_ref(&p, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    let contents = std::fs::read_to_string(&decision_log_path).expect("log file written");
+    assert!(!contents.is_empty());
+    assert!(!contents.contains("secret stream content"));
+    let v = crate::json::parse(contents.lines().next().unwrap()).expect("valid json line");
+    assert!(v.get("final_route").is_some());
     let _ = std::fs::remove_file(&log);
     let _ = std::fs::remove_file(&decision_log_path);
 }
