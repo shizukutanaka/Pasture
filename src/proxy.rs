@@ -1143,11 +1143,29 @@ impl Proxy {
                         Some(format!("over budget, proceeds (warn): {reason}")),
                         true,
                     ),
-                    _ => (
-                        Route::Local,
-                        Some(format!("redirected to local: {reason}")),
-                        false,
-                    ),
+                    _ => {
+                        // Mirror apply_budget_guard's ADR-223 fix exactly: the
+                        // preview must match what production actually does, or the
+                        // "no tokens spent, nothing sent to cloud" promise at the
+                        // top of this function silently lies when local is Down.
+                        let local_viable = self.local.is_some()
+                            && self.local_health.should_attempt(self.health_cooldown_secs);
+                        if local_viable {
+                            (
+                                Route::Local,
+                                Some(format!("redirected to local: {reason}")),
+                                false,
+                            )
+                        } else {
+                            (
+                                Route::Cloud,
+                                Some(format!(
+                                    "over budget, but local unavailable/circuit-open — proceeds on cloud: {reason}"
+                                )),
+                                true,
+                            )
+                        }
+                    }
                 },
             }
         } else {
@@ -1611,10 +1629,27 @@ impl Proxy {
                     return Ok((route, 0));
                 }
                 _ => {
-                    // "local-only" (default): silently redirect to local.
+                    // "local-only" (default): redirect to local — but only when local
+                    // is actually a viable alternative. Without this check, a request
+                    // that IMP-34's circuit breaker already redirected Local -> Cloud
+                    // (because local is Down) would get redirected right back to the
+                    // very backend just determined to be broken, guaranteeing failure
+                    // instead of the graceful degradation both features individually
+                    // promise (ADR-223). Falls through to the "warn" behavior (proceed
+                    // on cloud, over budget) when local is unavailable or circuit-open —
+                    // spending unplanned cloud tokens is strictly better than a
+                    // guaranteed-failed request.
                     // Reservation was rolled back in check_budget_and_spike (ADR-163).
-                    eprintln!("pasture: {reason} -> routing local");
-                    return Ok((Route::Local, 0));
+                    let local_viable = self.local.is_some()
+                        && self.local_health.should_attempt(self.health_cooldown_secs);
+                    if local_viable {
+                        eprintln!("pasture: {reason} -> routing local");
+                        return Ok((Route::Local, 0));
+                    }
+                    eprintln!(
+                        "pasture: {reason} -> local unavailable/circuit-open, proceeding on cloud"
+                    );
+                    return Ok((route, 0));
                 }
             }
         }

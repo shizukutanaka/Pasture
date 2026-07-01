@@ -4234,6 +4234,81 @@ fn test_circuit_breaker_redirects_to_cloud_once_local_is_down() {
 }
 
 #[test]
+fn test_budget_guard_local_only_action_does_not_fight_open_circuit() {
+    // Socratic feature-interaction probe: IMP-34's circuit breaker redirects
+    // a naturally-Local decision to Cloud when local is Down. But
+    // apply_budget_guard's default "local-only" over-budget action
+    // unconditionally redirects Cloud -> Local without checking whether
+    // local is actually viable. If both conditions hold at once (local Down
+    // AND over budget), the budget guard would silently send the request
+    // right back to the backend the circuit breaker just tried to avoid --
+    // guaranteeing failure instead of degrading gracefully. The fix must
+    // keep the request on cloud (accepting the over-budget cost) rather
+    // than routing to a backend already known to fail.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, true); // high threshold → naturally local
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(AlwaysFailBackend)),
+        Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+        &log,
+    )
+    .with_budget(1, "local-only", 0, &log); // tiny budget: exceeded after 1 request
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    // Trip the circuit breaker.
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Local);
+    }
+    assert_eq!(p.local_health.status(), crate::health::HealthStatus::Down);
+    // First request: prev==0 < budget(1), so it is not yet over-budget and
+    // proceeds on cloud, reserving tokens and pushing the counter past 1.
+    let resp1 = p
+        .handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    assert!(resp1.contains("cloud-reply"), "{resp1}");
+    // Second request: now over budget (prev >= 1) -> apply_budget_guard's
+    // default "local-only" action fires. It must NOT blindly redirect to the
+    // circuit-open local backend (guaranteed failure); it should keep serving
+    // from cloud rather than fight the breaker's decision.
+    let resp2 = p
+        .handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    assert!(resp2.contains("cloud-reply"), "{resp2}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_route_preview_matches_budget_guard_when_circuit_open() {
+    // handle_route_preview had its own independent copy of the "local-only"
+    // budget-action logic, with the same bug: it would preview "local" even
+    // when local was circuit-open, contradicting the doc comment's own
+    // promise that the preview "matches what would really happen". This
+    // confirms the preview and the real apply_budget_guard now agree.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, true);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(AlwaysFailBackend)),
+        Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+        &log,
+    )
+    .with_budget(1, "local-only", 0, &log);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Local);
+    }
+    assert_eq!(p.local_health.status(), crate::health::HealthStatus::Down);
+    // Push the counter over budget first (mirrors the real-traffic test above).
+    let _ = p.handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#);
+    let preview = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("cloud"));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_circuit_breaker_never_overrides_sensitive_content() {
     // I5 invariant: privacy always wins over availability. Even with local
     // Down and cloud configured, sensitive content must still route local
