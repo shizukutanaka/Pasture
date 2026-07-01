@@ -12,6 +12,7 @@ pub mod cli;
 pub mod cloud;
 pub mod config;
 pub mod cost;
+pub mod decision_log;
 pub mod difficulty;
 pub mod doctor;
 pub mod eval;
