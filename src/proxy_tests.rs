@@ -747,6 +747,7 @@ fn test_build_stats_response_shape() {
         &[],
         "healthy",
         &[],
+        None,
     );
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
@@ -4340,6 +4341,33 @@ fn test_local_health_starts_healthy() {
             .and_then(|x| x.as_str().map(String::from)),
         Some("healthy".to_string())
     );
+    // Socratic follow-up (過不足): HealthCheck has captured last_error since
+    // IMP-30, but nothing ever surfaced it — a fresh, healthy proxy must
+    // report null, not a stale or default error string.
+    assert_eq!(
+        v.get("local_health_last_error"),
+        Some(&crate::json::JsonValue::Null)
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_local_health_last_error_exposed_when_down() {
+    // Closes the gap: an operator could see local_health:"down" but had no
+    // way to know WHY (timeout? connection refused? malformed response?)
+    // without grepping stderr. last_error now answers that via /v1/stats.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, false);
+    let p = Proxy::new(engine, Some(Box::new(AlwaysFailBackend)), None, &log);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    let _ = p.complete_direct(&req, Route::Local);
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).unwrap();
+    let err = v
+        .get("local_health_last_error")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    assert!(err.contains("provider down"), "{err}");
     let _ = std::fs::remove_file(&log);
 }
 

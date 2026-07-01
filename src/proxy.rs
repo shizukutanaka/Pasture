@@ -2138,6 +2138,7 @@ impl Proxy {
             .as_ref()
             .map(|s| s.snapshot())
             .unwrap_or_default();
+        let local_health_last_error = self.local_health.last_check().and_then(|c| c.last_error);
         Ok(build_stats_response(
             &summary,
             live_hits,
@@ -2153,6 +2154,7 @@ impl Proxy {
             &pii_categories,
             self.local_health.status().as_str(),
             &input_pii_categories,
+            local_health_last_error.as_deref(),
         ))
     }
 
@@ -3323,6 +3325,7 @@ pub fn build_stats_response(
     output_pii_categories: &[(&'static str, u64)],
     local_health: &'static str,
     input_pii_categories: &[(&'static str, u64)],
+    local_health_last_error: Option<&str>,
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
     let fmt_cats = |cats: &[(&'static str, u64)]| -> String {
@@ -3330,6 +3333,16 @@ pub fn build_stats_response(
             .map(|(cat, n)| format!("\"{cat}\":{n}"))
             .collect::<Vec<String>>()
             .join(",")
+    };
+    // Socratic follow-up to IMP-30/34: HealthCheck has captured `last_error`
+    // since it was introduced, but nothing ever read it back out — an
+    // operator could see "down" without knowing *why* (timeout? connection
+    // refused? malformed response?) without grepping stderr. This is the same
+    // diagnostic text `track_local_call` already prints there; exposing it
+    // here is not new information disclosure, just a queryable copy of it.
+    let last_error_json = match local_health_last_error {
+        Some(e) => format!("\"{}\"", escape_string(e)),
+        None => "null".to_string(),
     };
     format!(
         "{{\"object\":\"pasture.stats\",\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
@@ -3340,6 +3353,7 @@ pub fn build_stats_response(
 \"semantic_cache_size\":{sem_size},\"semantic_cache_capacity\":{sem_cap},\
 \"budget_daily_tokens_used\":{budget_used},\"budget_daily_tokens_limit\":{budget_limit},\
 \"output_pii_categories\":{{{}}},\"local_health\":\"{local_health}\",\
+\"local_health_last_error\":{last_error_json},\
 \"input_pii_categories\":{{{}}}}}",
         s.total,
         s.local,
