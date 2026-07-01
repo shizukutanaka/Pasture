@@ -746,6 +746,7 @@ fn test_build_stats_response_shape() {
         1_000_000,
         &[],
         "healthy",
+        &[],
     );
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
@@ -781,6 +782,37 @@ fn test_handle_stats_empty_log_is_zeros() {
     let json = p.handle_stats().unwrap();
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(0.0));
+}
+
+#[test]
+fn test_input_pii_scan_disabled_by_default_no_field_populated() {
+    // IMP-28: without with_input_pii_scan(true), no tallying happens; the
+    // stats field is present but empty (existing behaviour unchanged).
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log);
+    p.handle_chat(r#"{"messages":[{"role":"user","content":"contact alice@example.com"}]}"#)
+        .unwrap();
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    let categories = v.get("input_pii_categories").expect("field present");
+    assert!(matches!(categories, crate::json::JsonValue::Object(m) if m.is_empty()));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_input_pii_scan_enabled_tallies_sensitive_categories() {
+    // IMP-28: with with_input_pii_scan(true), a request containing an email
+    // is tallied under "email" in /v1/stats — reusing the classify() report
+    // route_decision already computed for the local-only routing decision.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_input_pii_scan(true);
+    p.handle_chat(r#"{"messages":[{"role":"user","content":"contact alice@example.com"}]}"#)
+        .unwrap();
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).expect("valid json");
+    let categories = v.get("input_pii_categories").expect("field present");
+    assert_eq!(categories.get("email").and_then(|x| x.as_f64()), Some(1.0));
+    let _ = std::fs::remove_file(&log);
 }
 
 #[test]

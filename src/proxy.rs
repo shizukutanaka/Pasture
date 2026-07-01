@@ -241,6 +241,14 @@ pub struct Proxy {
     /// `/v1/stats` so an operator can see whether responses are echoing PII the
     /// input classifier had no reason to flag (e.g. a summarized document).
     output_pii_stats: Option<crate::output_scan::OutputPiiStats>,
+    /// Input-side PII category visibility (IMP-28). Off by default (`None`);
+    /// when enabled, every classified request's already-computed
+    /// `SensitivityReport` categories are tallied — no re-scanning, since
+    /// `route_decision` has already run `privacy::classify`. Complements the
+    /// existing stderr notice ("sensitive content detected -> keeping local
+    /// (N categories)") with a persistent, queryable breakdown of *which*
+    /// categories are triggering local-only routing, exposed via `/v1/stats`.
+    input_pii_stats: Option<crate::output_scan::OutputPiiStats>,
     /// Routing decision audit log (IMP-29). `None` disables logging (the
     /// default). When set via `PASTURE_DECISION_LOG=<path>`, every routed
     /// request appends one JSONL record (signals, threshold, route, reason —
@@ -324,6 +332,7 @@ impl Proxy {
             cloud_fallback: None,
             metrics_cache: std::sync::Mutex::new((0, crate::cost::summarize(&[]))),
             output_pii_stats: None,
+            input_pii_stats: None,
             decision_logger: None,
             local_health: crate::health::BackendHealth::new(),
         }
@@ -400,6 +409,19 @@ impl Proxy {
     /// for `/v1/stats`.
     pub fn with_output_pii_scan(mut self, enabled: bool) -> Self {
         self.output_pii_stats = if enabled {
+            Some(crate::output_scan::OutputPiiStats::new())
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Enable input-side PII category visibility tallying (IMP-28). Off by
+    /// default. When enabled, every classified request's sensitivity
+    /// categories are tallied (no re-scanning — reuses the report
+    /// `route_decision` already computed) and exposed via `/v1/stats`.
+    pub fn with_input_pii_scan(mut self, enabled: bool) -> Self {
+        self.input_pii_stats = if enabled {
             Some(crate::output_scan::OutputPiiStats::new())
         } else {
             None
@@ -990,6 +1012,9 @@ impl Proxy {
                 "pasture: sensitive content detected -> keeping local ({} categories)",
                 report.categories.len()
             );
+            if let Some(stats) = &self.input_pii_stats {
+                stats.tally(&report.categories);
+            }
         }
         Ok((decision, report.is_sensitive()))
     }
@@ -2051,6 +2076,11 @@ impl Proxy {
             .as_ref()
             .map(|s| s.snapshot())
             .unwrap_or_default();
+        let input_pii_categories = self
+            .input_pii_stats
+            .as_ref()
+            .map(|s| s.snapshot())
+            .unwrap_or_default();
         Ok(build_stats_response(
             &summary,
             live_hits,
@@ -2065,6 +2095,7 @@ impl Proxy {
             budget_limit,
             &pii_categories,
             self.local_health.status().as_str(),
+            &input_pii_categories,
         ))
     }
 
@@ -3223,12 +3254,15 @@ pub fn build_stats_response(
     budget_limit: u64,
     output_pii_categories: &[(&'static str, u64)],
     local_health: &'static str,
+    input_pii_categories: &[(&'static str, u64)],
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
-    let pii_json: Vec<String> = output_pii_categories
-        .iter()
-        .map(|(cat, n)| format!("\"{cat}\":{n}"))
-        .collect();
+    let fmt_cats = |cats: &[(&'static str, u64)]| -> String {
+        cats.iter()
+            .map(|(cat, n)| format!("\"{cat}\":{n}"))
+            .collect::<Vec<String>>()
+            .join(",")
+    };
     format!(
         "{{\"object\":\"pasture.stats\",\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
 \"cloud_rate\":{},\"cache_rate\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\
@@ -3237,7 +3271,8 @@ pub fn build_stats_response(
 \"semantic_cache_hits\":{sem_hits},\"semantic_cache_misses\":{sem_misses},\
 \"semantic_cache_size\":{sem_size},\"semantic_cache_capacity\":{sem_cap},\
 \"budget_daily_tokens_used\":{budget_used},\"budget_daily_tokens_limit\":{budget_limit},\
-\"output_pii_categories\":{{{}}},\"local_health\":\"{local_health}\"}}",
+\"output_pii_categories\":{{{}}},\"local_health\":\"{local_health}\",\
+\"input_pii_categories\":{{{}}}}}",
         s.total,
         s.local,
         s.cloud,
@@ -3247,7 +3282,8 @@ pub fn build_stats_response(
         s.prompt_tokens,
         s.completion_tokens,
         round4(s.cloud_cost_usd),
-        pii_json.join(","),
+        fmt_cats(output_pii_categories),
+        fmt_cats(input_pii_categories),
     )
 }
 

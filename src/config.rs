@@ -119,6 +119,11 @@ pub struct Config {
     /// values, only stable category labels (e.g. "email"). Off by default.
     /// Set via `PASTURE_OUTPUT_PII_SCAN=1`.
     pub output_pii_scan: bool,
+    /// Tally which PII categories trigger local-only routing and expose the
+    /// breakdown in `/v1/stats` (IMP-28). Detection-only: reuses the report
+    /// `route_decision` already computed, no re-scanning. Off by default.
+    /// Set via `PASTURE_INPUT_PII_SCAN=1`.
+    pub input_pii_scan: bool,
     /// Path to the routing decision audit log (IMP-29). Empty = disabled
     /// (default). Each routed request appends one JSONL record (signals,
     /// threshold, route, reason — no PII, no prompt content). Set via
@@ -184,6 +189,7 @@ impl Default for Config {
             cache_control: false,
             pseudonymize: false,
             output_pii_scan: false,
+            input_pii_scan: false,
             decision_log: String::new(),
             otel_log: String::new(),
             cloud_fallback_provider: String::new(),
@@ -412,6 +418,12 @@ impl Config {
         if let Ok(v) = std::env::var("PASTURE_OUTPUT_PII_SCAN") {
             match v.to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" | "" => self.output_pii_scan = true,
+                _ => {}
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_INPUT_PII_SCAN") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.input_pii_scan = true,
                 _ => {}
             }
         }

@@ -1810,6 +1810,7 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         .with_max_body_bytes(config.max_body_bytes)
         .with_pseudonymize(config.pseudonymize)
         .with_output_pii_scan(config.output_pii_scan)
+        .with_input_pii_scan(config.input_pii_scan)
         .with_decision_log(if config.decision_log.is_empty() {
             None
         } else {

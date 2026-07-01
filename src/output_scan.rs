@@ -1,27 +1,30 @@
-//! Output-side PII visibility scan (IMP-33).
+//! PII category visibility tallies, input- and output-side (IMP-28/IMP-33).
 //!
 //! Input prompts are classified before routing (`privacy::classify`) so
-//! sensitive requests stay local. That guards what the *client* sends, but
-//! says nothing about what a model *echoes back* — a summary of a document
-//! containing an email address, or a tool result relayed through a later
-//! turn, can carry PII into the response text without ever being flagged.
+//! sensitive requests stay local — but until now that classification only
+//! produced a one-line stderr notice ("sensitive content detected -> keeping
+//! local (N categories)") with no persistent, queryable breakdown of *which*
+//! categories triggered it. Nor did anything check what a model *echoes
+//! back*: a summary of a document containing an email address, or a tool
+//! result relayed through a later turn, can carry PII into the response text
+//! without ever being flagged on the way in.
 //!
-//! This module re-uses the same category classifier in read-only, opt-in
-//! mode: it counts which PII categories appear in *response* text so an
-//! operator can see "N responses this session echoed an email-shaped token"
-//! in `stats`. It never redacts or mutates the response — the response is
-//! model output already delivered to the client's own request; silently
-//! corrupting it (e.g. replacing legitimate code identifiers) would do more
-//! harm than the visibility gain is worth. Detection only, categories only,
-//! same I5 invariant as the input classifier (never log or store the
-//! matched value).
+//! This module tallies category labels on both sides, opt-in, read-only. It
+//! never redacts or mutates request/response text — the value here is
+//! visibility, not enforcement; silently rewriting model output (e.g.
+//! replacing legitimate code identifiers) would do more harm than the
+//! visibility gain is worth. Detection only, categories only, same I5
+//! invariant as the input classifier (never log or store the matched
+//! value).
 
 use crate::privacy::classify;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Running counts of PII categories observed in response text, keyed by the
-/// same stable labels `privacy::classify` returns (e.g. "email", "api_key").
+/// Running counts of PII categories, keyed by the same stable labels
+/// `privacy::classify` returns (e.g. "email", "api_key"). Used for both the
+/// input-side tally (IMP-28, fed from an already-computed `SensitivityReport`)
+/// and the output-side tally (IMP-33, fed by scanning response text).
 #[derive(Debug, Default)]
 pub struct OutputPiiStats {
     counts: Mutex<HashMap<&'static str, u64>>,
@@ -32,18 +35,25 @@ impl OutputPiiStats {
         Self::default()
     }
 
+    /// Add one tally per category in `categories`. A no-op for an empty slice.
+    /// Used directly by the input-side path, which has already run
+    /// `privacy::classify` for routing and would otherwise re-scan the text.
+    pub fn tally(&self, categories: &[&'static str]) {
+        if categories.is_empty() {
+            return;
+        }
+        if let Ok(mut counts) = self.counts.lock() {
+            for cat in categories {
+                *counts.entry(cat).or_insert(0) += 1;
+            }
+        }
+    }
+
     /// Scan `text` for PII categories and add one tally per category found.
     /// A no-op (aside from the classify scan) when no categories match.
     pub fn scan(&self, text: &str) {
         let report = classify(text);
-        if report.categories.is_empty() {
-            return;
-        }
-        if let Ok(mut counts) = self.counts.lock() {
-            for cat in report.categories {
-                *counts.entry(cat).or_insert(0) += 1;
-            }
-        }
+        self.tally(&report.categories);
     }
 
     /// Snapshot of category -> count, sorted by category name for stable
@@ -75,6 +85,25 @@ mod tests {
         stats.scan("The capital of France is Paris.");
         assert_eq!(stats.total(), 0);
         assert!(stats.snapshot().is_empty());
+    }
+
+    #[test]
+    fn test_tally_direct_categories_without_reclassifying() {
+        // IMP-28: the input-side path already has a SensitivityReport from
+        // routing and should tally it directly rather than re-scanning text.
+        let stats = OutputPiiStats::new();
+        stats.tally(&["email", "api_key"]);
+        stats.tally(&["email"]);
+        assert_eq!(stats.total(), 3);
+        let snap = stats.snapshot();
+        assert_eq!(snap, vec![("api_key", 1), ("email", 2)]);
+    }
+
+    #[test]
+    fn test_tally_empty_slice_is_noop() {
+        let stats = OutputPiiStats::new();
+        stats.tally(&[]);
+        assert_eq!(stats.total(), 0);
     }
 
     #[test]
