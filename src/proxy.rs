@@ -248,6 +248,14 @@ pub struct Proxy {
     /// after the fact instead of only inferred from the PII-free cost log's
     /// outcome-only view.
     decision_logger: Option<crate::decision_log::DecisionLogger>,
+    /// Local-backend health tracker (IMP-30). Always present (no opt-in
+    /// needed — it only tallies outcomes of calls Pasture already makes, no
+    /// extra probes or threads). Every local completion attempt records
+    /// success/failure here; after 3 consecutive failures the backend is
+    /// marked Down. Exposed via `/v1/stats` so an operator sees a crashed
+    /// local model within the next request instead of inferring it only from
+    /// scattered error logs.
+    local_health: crate::health::BackendHealth,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -317,6 +325,7 @@ impl Proxy {
             metrics_cache: std::sync::Mutex::new((0, crate::cost::summarize(&[]))),
             output_pii_stats: None,
             decision_logger: None,
+            local_health: crate::health::BackendHealth::new(),
         }
     }
 
@@ -1352,6 +1361,24 @@ impl Proxy {
         .ok_or_else(|| ProxyError::Routing(format!("no backend for route {}", route.as_str())))
     }
 
+    /// Record the outcome of a local-backend call in `local_health` (IMP-30).
+    /// A thin wrapper around the closure that actually makes the call, so
+    /// every local completion path (direct, cascade, cloud-failure fallback)
+    /// updates the same tracker without duplicating timing/outcome logic.
+    fn track_local_call<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let start = std::time::Instant::now();
+        let result = f();
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => self.local_health.mark_healthy(elapsed_ms),
+            Err(e) => self.local_health.mark_unhealthy(e.to_string(), elapsed_ms),
+        }
+        result
+    }
+
     /// Reset the daily token counter when the UTC day has advanced past the day
     /// it was last anchored to (IMP-26). Lazy — invoked on each budget access, so
     /// a long-running process gets a *daily* budget without a timer thread. The
@@ -1802,8 +1829,8 @@ impl Proxy {
         req: &CompletionRequest,
     ) -> Result<(CompletionResponse, Route, Option<f64>, u64), ProxyError> {
         let local = self.backend_for(Route::Local)?;
-        let (local_resp, confidence) = local
-            .complete_scored(req)
+        let (local_resp, confidence) = self
+            .track_local_call(|| local.complete_scored(req))
             .map_err(|e| ProxyError::Backend(e.to_string()))?;
         if crate::cascade::should_escalate(
             &local_resp.content,
@@ -1872,8 +1899,8 @@ impl Proxy {
                 match self.local.as_deref() {
                     Some(local) => {
                         eprintln!("pasture: cloud failed ({primary_err}); falling back to local");
-                        let resp = local
-                            .complete(req)
+                        let resp = self
+                            .track_local_call(|| local.complete(req))
                             .map_err(|e| ProxyError::Backend(e.to_string()))?;
                         Ok((resp, Route::Local, None, 0))
                     }
@@ -1896,9 +1923,13 @@ impl Proxy {
         } else {
             None
         };
-        let resp = backend
-            .complete(fast_req.as_ref().unwrap_or(req))
-            .map_err(|e| ProxyError::Backend(e.to_string()))?;
+        let effective_req = fast_req.as_ref().unwrap_or(req);
+        let resp = if route == Route::Local {
+            self.track_local_call(|| backend.complete(effective_req))
+        } else {
+            backend.complete(effective_req)
+        }
+        .map_err(|e| ProxyError::Backend(e.to_string()))?;
         Ok((resp, route, None, 0))
     }
 
@@ -2033,6 +2064,7 @@ impl Proxy {
             budget_used,
             budget_limit,
             &pii_categories,
+            self.local_health.status().as_str(),
         ))
     }
 
@@ -3190,6 +3222,7 @@ pub fn build_stats_response(
     budget_used: u64,
     budget_limit: u64,
     output_pii_categories: &[(&'static str, u64)],
+    local_health: &'static str,
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
     let pii_json: Vec<String> = output_pii_categories
@@ -3204,7 +3237,7 @@ pub fn build_stats_response(
 \"semantic_cache_hits\":{sem_hits},\"semantic_cache_misses\":{sem_misses},\
 \"semantic_cache_size\":{sem_size},\"semantic_cache_capacity\":{sem_cap},\
 \"budget_daily_tokens_used\":{budget_used},\"budget_daily_tokens_limit\":{budget_limit},\
-\"output_pii_categories\":{{{}}}}}",
+\"output_pii_categories\":{{{}}},\"local_health\":\"{local_health}\"}}",
         s.total,
         s.local,
         s.cloud,

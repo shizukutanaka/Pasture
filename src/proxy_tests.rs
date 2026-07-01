@@ -732,7 +732,21 @@ fn test_build_stats_response_shape() {
         completion_tokens: 50,
         cloud_cost_usd: 0.0123,
     };
-    let json = build_stats_response(&s, 7, 3, 5, 128, 0, 0, 0, 0, 1500, 1_000_000, &[]);
+    let json = build_stats_response(
+        &s,
+        7,
+        3,
+        5,
+        128,
+        0,
+        0,
+        0,
+        0,
+        1500,
+        1_000_000,
+        &[],
+        "healthy",
+    );
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
     assert_eq!(v.get("cloud").and_then(|x| x.as_f64()), Some(1.0));
@@ -4033,6 +4047,52 @@ impl Backend for AlwaysFailBackend {
     fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
         Err(BackendError::Transport("provider down".into()))
     }
+}
+
+// ── IMP-30 local backend health tracking ─────────────────────────────────────
+
+#[test]
+fn test_local_health_starts_healthy() {
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log);
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).unwrap();
+    assert_eq!(
+        v.get("local_health")
+            .and_then(|x| x.as_str().map(String::from)),
+        Some("healthy".to_string())
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_local_health_degrades_then_recovers_via_direct_completion() {
+    // IMP-30: a failing local backend degrades local_health via complete_direct
+    // (Route::Local branch); reported by /v1/stats without a separate poll thread.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, false);
+    let p = Proxy::new(engine, Some(Box::new(AlwaysFailBackend)), None, &log);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    // First failure: Degraded (< 3 consecutive failures).
+    assert!(p.complete_direct(&req, Route::Local).is_err());
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).unwrap();
+    assert_eq!(
+        v.get("local_health")
+            .and_then(|x| x.as_str().map(String::from)),
+        Some("degraded".to_string())
+    );
+    // Two more failures: Down.
+    assert!(p.complete_direct(&req, Route::Local).is_err());
+    assert!(p.complete_direct(&req, Route::Local).is_err());
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).unwrap();
+    assert_eq!(
+        v.get("local_health")
+            .and_then(|x| x.as_str().map(String::from)),
+        Some("down".to_string())
+    );
+    let _ = std::fs::remove_file(&log);
 }
 
 #[test]
