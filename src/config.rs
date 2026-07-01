@@ -119,6 +119,11 @@ pub struct Config {
     /// values, only stable category labels (e.g. "email"). Off by default.
     /// Set via `PASTURE_OUTPUT_PII_SCAN=1`.
     pub output_pii_scan: bool,
+    /// Path to the routing decision audit log (IMP-29). Empty = disabled
+    /// (default). Each routed request appends one JSONL record (signals,
+    /// threshold, route, reason — no PII, no prompt content). Set via
+    /// `PASTURE_DECISION_LOG=<path>`.
+    pub decision_log: String,
     /// Optional OTel-compatible GenAI trace log path (IMP-23). Each request
     /// appends one JSONL span with GenAI semantic convention attributes.
     /// Empty = disabled (default). Set via `PASTURE_OTEL_LOG=<path>`.
@@ -179,6 +184,7 @@ impl Default for Config {
             cache_control: false,
             pseudonymize: false,
             output_pii_scan: false,
+            decision_log: String::new(),
             otel_log: String::new(),
             cloud_fallback_provider: String::new(),
             cloud_fallback_model: String::new(),
@@ -408,6 +414,9 @@ impl Config {
                 "1" | "true" | "yes" | "" => self.output_pii_scan = true,
                 _ => {}
             }
+        }
+        if let Ok(v) = std::env::var("PASTURE_DECISION_LOG") {
+            self.decision_log = v;
         }
         if let Ok(v) = std::env::var("PASTURE_OTEL_LOG") {
             self.otel_log = v;

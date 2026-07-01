@@ -241,6 +241,13 @@ pub struct Proxy {
     /// `/v1/stats` so an operator can see whether responses are echoing PII the
     /// input classifier had no reason to flag (e.g. a summarized document).
     output_pii_stats: Option<crate::output_scan::OutputPiiStats>,
+    /// Routing decision audit log (IMP-29). `None` disables logging (the
+    /// default). When set via `PASTURE_DECISION_LOG=<path>`, every routed
+    /// request appends one JSONL record (signals, threshold, route, reason —
+    /// no PII, no prompt content) so a wrong decision can be replayed/audited
+    /// after the fact instead of only inferred from the PII-free cost log's
+    /// outcome-only view.
+    decision_logger: Option<crate::decision_log::DecisionLogger>,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -309,6 +316,7 @@ impl Proxy {
             cloud_fallback: None,
             metrics_cache: std::sync::Mutex::new((0, crate::cost::summarize(&[]))),
             output_pii_stats: None,
+            decision_logger: None,
         }
     }
 
@@ -387,6 +395,16 @@ impl Proxy {
         } else {
             None
         };
+        self
+    }
+
+    /// Enable the routing decision audit log (IMP-29). `path` empty or `None`
+    /// disables logging (the default). A file that cannot be opened for
+    /// appending disables logging silently (best-effort observability aid,
+    /// never a reason to fail request handling).
+    pub fn with_decision_log(mut self, path: Option<&str>) -> Self {
+        let path = path.filter(|p| !p.is_empty());
+        self.decision_logger = crate::decision_log::DecisionLogger::new(path).ok();
         self
     }
 
@@ -741,9 +759,9 @@ impl Proxy {
     /// Disabled (cap = 0) by default so the zero-dependency build is unchanged.
     pub fn with_semantic_cache(mut self, cap: usize, threshold: f64) -> Self {
         if cap > 0 {
-            self.semantic_cache = Some(std::sync::Mutex::new(
-                crate::cache::SemanticCache::new(cap, threshold),
-            ));
+            self.semantic_cache = Some(std::sync::Mutex::new(crate::cache::SemanticCache::new(
+                cap, threshold,
+            )));
         }
         self
     }
@@ -845,7 +863,12 @@ impl Proxy {
                 .get("tool_calls")
                 .filter(|tc| matches!(tc, JsonValue::Array(a) if !a.is_empty()))
                 .map(|tc| tc.to_json_string());
-            parsed.push(Message { role, content, tool_call_id, tool_calls_json });
+            parsed.push(Message {
+                role,
+                content,
+                tool_call_id,
+                tool_calls_json,
+            });
         }
         if parsed.is_empty() {
             return Err(ProxyError::BadRequest("no messages provided".to_string()));
@@ -874,10 +897,7 @@ impl Proxy {
         // "n" must be 1 (or absent). Pasture always returns exactly one
         // completion per request; n > 1 would silently return fewer than
         // requested, so we reject it with a clear error.
-        let n = v
-            .get("n")
-            .and_then(JsonValue::as_f64)
-            .unwrap_or(1.0) as i64;
+        let n = v.get("n").and_then(JsonValue::as_f64).unwrap_or(1.0) as i64;
         if n != 1 {
             return Err(ProxyError::BadRequest(format!(
                 "'n' must be 1; got {n} (Pasture returns exactly one completion per request)"
@@ -985,9 +1005,7 @@ impl Proxy {
         // honour the exact model name. Sentinels "local" and "cloud" also work.
         let forced = {
             let m = req.model.as_str();
-            if m == "local"
-                || (!self.local_model_name.is_empty() && m == self.local_model_name)
-            {
+            if m == "local" || (!self.local_model_name.is_empty() && m == self.local_model_name) {
                 Some(Route::Local)
             } else if m == "cloud"
                 || (!self.cloud_model_name.is_empty() && m == self.cloud_model_name)
@@ -1035,9 +1053,21 @@ impl Proxy {
             match self.budget_spike_preview(predicted_total) {
                 None => (Route::Cloud, None, true),
                 Some(reason) => match self.budget_action.as_str() {
-                    "block" => (Route::Cloud, Some(format!("would be blocked (429): {reason}")), false),
-                    "warn" => (Route::Cloud, Some(format!("over budget, proceeds (warn): {reason}")), true),
-                    _ => (Route::Local, Some(format!("redirected to local: {reason}")), false),
+                    "block" => (
+                        Route::Cloud,
+                        Some(format!("would be blocked (429): {reason}")),
+                        false,
+                    ),
+                    "warn" => (
+                        Route::Cloud,
+                        Some(format!("over budget, proceeds (warn): {reason}")),
+                        true,
+                    ),
+                    _ => (
+                        Route::Local,
+                        Some(format!("redirected to local: {reason}")),
+                        false,
+                    ),
                 },
             }
         } else {
@@ -1174,25 +1204,51 @@ impl Proxy {
         // so streaming flag-mode matches the buffered path's annotation.
         if let Some(label) = injection_label {
             let frame = sse_frame(&build_openai_injection_chunk(
-                &id, &model, &fp, route_label, label, created,
+                &id,
+                &model,
+                &fp,
+                route_label,
+                label,
+                created,
             ));
             sock.write_all(frame.as_bytes())?;
         }
         if !hit.content.is_empty() {
-            let frame =
-                sse_frame(&build_openai_chunk(&id, &model, &fp, &hit.content, route_label, None, created));
+            let frame = sse_frame(&build_openai_chunk(
+                &id,
+                &model,
+                &fp,
+                &hit.content,
+                route_label,
+                None,
+                created,
+            ));
             sock.write_all(frame.as_bytes())?;
         }
         // Replay any tool_calls as a delta chunk before the stop chunk (ADR-178),
         // so a cached tool-call response is not silently dropped on the stream path.
         if let Some(tc) = &hit.tool_calls {
-            let frame =
-                sse_frame(&build_openai_tool_calls_chunk(&id, &model, &fp, tc, route_label, created));
+            let frame = sse_frame(&build_openai_tool_calls_chunk(
+                &id,
+                &model,
+                &fp,
+                tc,
+                route_label,
+                created,
+            ));
             sock.write_all(frame.as_bytes())?;
         }
         self.log_cost(route_label, hit, None, 0);
         let finish = finish_reason_for(hit);
-        let stop = sse_frame(&build_openai_chunk(&id, &model, &fp, "", route_label, Some(finish), created));
+        let stop = sse_frame(&build_openai_chunk(
+            &id,
+            &model,
+            &fp,
+            "",
+            route_label,
+            Some(finish),
+            created,
+        ));
         sock.write_all(stop.as_bytes())?;
         if include_usage {
             let usage = sse_frame(&build_openai_usage_chunk(
@@ -1336,11 +1392,11 @@ impl Proxy {
     /// wrapped counter would then dwarf any budget and silently block the cloud
     /// route for the rest of the new day. A saturating CAS loop clamps at 0 instead.
     fn release_cloud_tokens(&self, n: u64) {
-        let _ = self.today_cloud_tokens.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(n)),
-        );
+        let _ = self
+            .today_cloud_tokens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(n))
+            });
     }
 
     /// Live view of the daily cloud-token budget for `/metrics` and `/v1/stats`
@@ -1379,7 +1435,9 @@ impl Proxy {
             // Atomically reserve estimated tokens. If the counter was already at or
             // above the budget before our add, roll back and reject. This closes the
             // TOCTOU window between check and increment (ADR-163).
-            let prev = self.today_cloud_tokens.fetch_add(estimated_tokens, Ordering::Relaxed);
+            let prev = self
+                .today_cloud_tokens
+                .fetch_add(estimated_tokens, Ordering::Relaxed);
             if prev >= self.budget_daily_tokens {
                 self.release_cloud_tokens(estimated_tokens);
                 return Some("daily cloud token budget exceeded");
@@ -1579,6 +1637,13 @@ impl Proxy {
         let req = framed.as_ref().unwrap_or(req);
 
         let (decision, sensitive) = self.classify_and_decide(req)?;
+        if let Some(logger) = &self.decision_logger {
+            logger.log_decision(
+                &decision,
+                crate::routing::estimate_tokens(&req.routing_text()) as u64,
+                self.engine.threshold() as u64,
+            );
+        }
 
         // OTel span (IMP-23/ADR-144): start before the cache checks so a cache
         // hit is traced too. Cache hits return early below, so the span must
@@ -1634,8 +1699,7 @@ impl Proxy {
         let pseudo_mapping;
         let pseudo_req;
         let req = if self.pseudonymize && planned_route == Route::Cloud {
-            let (msgs, mapping) =
-                crate::pseudonymize::pseudonymize_messages(&req.messages);
+            let (msgs, mapping) = crate::pseudonymize::pseudonymize_messages(&req.messages);
             pseudo_mapping = Some(mapping);
             pseudo_req = CompletionRequest {
                 messages: msgs,
@@ -1719,9 +1783,7 @@ impl Proxy {
             }
         }
         // Store on miss (semantic).
-        if let (Some(emb), Some(sem_mutex)) =
-            (query_embedding, self.semantic_cache.as_ref())
-        {
+        if let (Some(emb), Some(sem_mutex)) = (query_embedding, self.semantic_cache.as_ref()) {
             if let Ok(mut guard) = sem_mutex.lock() {
                 let samp = crate::cache::sampling_key(&req.sampling);
                 guard.put(emb, req.model.clone(), samp, resp.clone());
@@ -1809,9 +1871,7 @@ impl Proxy {
                 }
                 match self.local.as_deref() {
                     Some(local) => {
-                        eprintln!(
-                            "pasture: cloud failed ({primary_err}); falling back to local"
-                        );
+                        eprintln!("pasture: cloud failed ({primary_err}); falling back to local");
                         let resp = local
                             .complete(req)
                             .map_err(|e| ProxyError::Backend(e.to_string()))?;
@@ -2231,14 +2291,19 @@ impl Proxy {
             let rl_hdr = self.ratelimit_headers();
             // Server header identifies the proxy + version (peer parity: nginx,
             // LiteLLM, Ollama all send one); compile-time constant.
-            const SERVER_HDR: &str =
-                concat!("Server: pasture/", env!("CARGO_PKG_VERSION"), "\r\n");
+            const SERVER_HDR: &str = concat!("Server: pasture/", env!("CARGO_PKG_VERSION"), "\r\n");
             let extra = format!("{cors}{req_id_hdr}{rl_hdr}{SERVER_HDR}");
             // Append X-Response-Time (elapsed ms) to every response's header block.
             // Timing begins after request parsing, just before dispatch, so it covers
             // routing + backend time but not TCP accept or header reading.
             let t0 = std::time::Instant::now();
-            let te = || format!("{}X-Response-Time: {}ms\r\n", extra, t0.elapsed().as_millis());
+            let te = || {
+                format!(
+                    "{}X-Response-Time: {}ms\r\n",
+                    extra,
+                    t0.elapsed().as_millis()
+                )
+            };
             // Normalised path (no query string) for access-log entries.
             let norm_path = path.split('?').next().unwrap_or(&path);
             // Local macros log and write each response (IMP-access-log). Using
@@ -2279,7 +2344,12 @@ impl Proxy {
             macro_rules! wr_err {
                 ($e:expr) => {{
                     let e = $e;
-                    wr!(e.status(), &build_error_response(e.message(), e.kind()), &te(), false);
+                    wr!(
+                        e.status(),
+                        &build_error_response(e.message(), e.kind()),
+                        &te(),
+                        false
+                    );
                     return Ok(());
                 }};
             }
@@ -2296,11 +2366,17 @@ impl Proxy {
             if method == "OPTIONS" {
                 match self.cors_preflight(origin.as_deref()) {
                     Some(h) => {
-                        let h_timed = format!("{}X-Response-Time: {}ms\r\n", h, t0.elapsed().as_millis());
+                        let h_timed =
+                            format!("{}X-Response-Time: {}ms\r\n", h, t0.elapsed().as_millis());
                         access_log!(204u16);
                         write_response(stream, 204, "", &h_timed, keep_alive)?;
                     }
-                    None => wr!(404, &build_error_response("not found", "invalid_request_error"), &te(), keep_alive),
+                    None => wr!(
+                        404,
+                        &build_error_response("not found", "invalid_request_error"),
+                        &te(),
+                        keep_alive
+                    ),
                 }
                 // Preflight doesn't count as content: the client follows up immediately.
                 if !keep_alive {
@@ -2340,7 +2416,15 @@ impl Proxy {
             if method == "POST" {
                 if let Some(ct) = &content_type {
                     if !ct.starts_with("application/json") {
-                        wr!(415, &build_error_response("unsupported media type; use application/json", "invalid_request_error"), &te(), false);
+                        wr!(
+                            415,
+                            &build_error_response(
+                                "unsupported media type; use application/json",
+                                "invalid_request_error"
+                            ),
+                            &te(),
+                            false
+                        );
                         return Ok(());
                     }
                 }
@@ -2409,7 +2493,15 @@ impl Proxy {
                     match build_model_response(&self.models, id) {
                         Some(b) => wr!(200, &b, &te(), keep_alive),
                         None => {
-                            wr!(404, &build_error_response(&format!("model '{id}' not found"), "invalid_request_error"), &te(), false);
+                            wr!(
+                                404,
+                                &build_error_response(
+                                    &format!("model '{id}' not found"),
+                                    "invalid_request_error"
+                                ),
+                                &te(),
+                                false
+                            );
                             return Ok(());
                         }
                     }
@@ -2434,7 +2526,15 @@ impl Proxy {
             {
                 // Audio and image generation are not implemented in Pasture.
                 // Return 501 (not 404) so clients know the path is recognised but unsupported.
-                wr!(501, &build_error_response("audio and image endpoints are not supported by Pasture", "not_supported"), &te(), false);
+                wr!(
+                    501,
+                    &build_error_response(
+                        "audio and image endpoints are not supported by Pasture",
+                        "not_supported"
+                    ),
+                    &te(),
+                    false
+                );
                 return Ok(());
             } else if let Some(allow) =
                 Self::route_allowed_methods(path.split('?').next().unwrap_or(&path))
@@ -2451,7 +2551,12 @@ impl Proxy {
                 )?;
                 return Ok(());
             } else {
-                wr!(404, &build_error_response("not found", "invalid_request_error"), &te(), false);
+                wr!(
+                    404,
+                    &build_error_response("not found", "invalid_request_error"),
+                    &te(),
+                    false
+                );
                 return Ok(());
             }
             if !keep_alive {
@@ -2489,7 +2594,11 @@ impl Proxy {
         if let Some(stats) = &self.output_pii_stats {
             stats.scan(&resp.content);
         }
-        Ok(build_openai_response_with_injection(&resp, label, injection_label.as_deref()))
+        Ok(build_openai_response_with_injection(
+            &resp,
+            label,
+            injection_label.as_deref(),
+        ))
     }
 
     /// Stream a completion to the socket as Server-Sent Events (IMP-7).
@@ -2554,6 +2663,13 @@ impl Proxy {
                 return Ok(s);
             }
         };
+        if let Some(logger) = &self.decision_logger {
+            logger.log_decision(
+                &decision,
+                crate::routing::estimate_tokens(&req.routing_text()) as u64,
+                self.engine.threshold() as u64,
+            );
+        }
         // OTel span (IMP-23): started before the cache checks so a cache hit is
         // traced too (ADR-144). Shared by the exact/semantic hit paths and the
         // backend completion below.
@@ -2577,7 +2693,12 @@ impl Proxy {
             if let Some(hit) = hit {
                 self.emit_cache_hit_span(&mut otel_span, &hit, "cache");
                 self.write_cached_stream(
-                    sock, cors, &hit, "cache", include_usage, injection_label.as_deref(),
+                    sock,
+                    cors,
+                    &hit,
+                    "cache",
+                    include_usage,
+                    injection_label.as_deref(),
                 )?;
                 return Ok(200);
             }
@@ -2692,7 +2813,12 @@ impl Proxy {
         // buffered path's x_pasture_injection_flag and the cached-stream path above.
         if let Some(label) = injection_label.as_deref() {
             let frame = sse_frame(&build_openai_injection_chunk(
-                &id, &model, &fp, route_label, label, created,
+                &id,
+                &model,
+                &fp,
+                route_label,
+                label,
+                created,
             ));
             if let Err(e) = sock.write_all(frame.as_bytes()) {
                 io_err = Some(e);
@@ -2750,7 +2876,13 @@ impl Proxy {
                         let tail = rr.finish();
                         if !tail.is_empty() {
                             let frame = sse_frame(&build_openai_chunk(
-                                &id, &model, &fp, &tail, route_label, None, created,
+                                &id,
+                                &model,
+                                &fp,
+                                &tail,
+                                route_label,
+                                None,
+                                created,
                             ));
                             if let Err(e) = sock.write_all(frame.as_bytes()) {
                                 io_err = Some(e);
@@ -2775,7 +2907,12 @@ impl Proxy {
                                 _ => tc,
                             };
                             let frame = sse_frame(&build_openai_tool_calls_chunk(
-                                &id, &model, &fp, tc_to_emit, route_label, created,
+                                &id,
+                                &model,
+                                &fp,
+                                tc_to_emit,
+                                route_label,
+                                created,
                             ));
                             if let Err(e) = sock.write_all(frame.as_bytes()) {
                                 io_err = Some(e);
@@ -2785,7 +2922,13 @@ impl Proxy {
                     if io_err.is_none() {
                         let finish = finish_reason_for(r);
                         let stop = sse_frame(&build_openai_chunk(
-                            &id, &model, &fp, "", route_label, Some(finish), created,
+                            &id,
+                            &model,
+                            &fp,
+                            "",
+                            route_label,
+                            Some(finish),
+                            created,
                         ));
                         if let Err(e) = sock.write_all(stop.as_bytes()) {
                             io_err = Some(e);
@@ -3149,7 +3292,11 @@ pub fn fingerprint_for_model(model: &str) -> String {
 /// A response with a `tool_calls` array uses `"tool_calls"`; all others use `"stop"`.
 /// Used for both the SSE stop chunk and the OTel span `finish_reason` attribute.
 pub fn finish_reason_for(resp: &CompletionResponse) -> &'static str {
-    if resp.tool_calls.is_some() { "tool_calls" } else { "stop" }
+    if resp.tool_calls.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    }
 }
 
 pub fn build_openai_response(resp: &CompletionResponse, route_label: &str) -> String {
