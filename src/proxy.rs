@@ -1424,6 +1424,21 @@ impl Proxy {
             Some(m) => crate::pseudonymize::restore(&r.content, m),
             None => r.content.clone(),
         };
+        // ADR-226: tool_calls must be restored too, exactly like content — the
+        // buffered path (run_completion) restores BOTH resp.content and
+        // resp.tool_calls (ADR-189) before its cache-write, but this streaming
+        // finalizer only ever restored content, leaving r.tool_calls (still
+        // holding masked placeholders like `<EMAIL_1>` whenever pseudonymize is
+        // active) to be cloned as-is into both the exact-match and semantic
+        // cache. A later cache hit — potentially served to a different
+        // session/request with no knowledge of the original mapping — would
+        // then return an OpenAI tool_calls JSON containing an unrestorable
+        // masked token instead of the real value, a genuine (if narrow) data
+        // leak of the masking scheme itself into a client-visible field.
+        let restored_tool_calls = match (&r.tool_calls, cache_mapping) {
+            (Some(tc), Some(m)) => Some(crate::pseudonymize::restore(tc, m)),
+            (tc, _) => tc.clone(),
+        };
         // IMP-33 streaming parity: complete_buffered scans the *restored* response
         // (real PII visible again, after any pseudonymize masking is undone) — the
         // buffered path's stats.scan(&resp.content) runs after run_completion has
@@ -1438,6 +1453,7 @@ impl Proxy {
         if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
             let mut to_cache = r.clone();
             to_cache.content = restored.clone();
+            to_cache.tool_calls = restored_tool_calls.clone();
             if let Ok(mut g) = cache.lock() {
                 g.put(key, to_cache);
             }
@@ -1445,6 +1461,7 @@ impl Proxy {
         if let (Some(emb), Some(sem_mutex)) = (query_embedding, self.semantic_cache.as_ref()) {
             let mut to_cache = r.clone();
             to_cache.content = restored;
+            to_cache.tool_calls = restored_tool_calls;
             if let Ok(mut g) = sem_mutex.lock() {
                 g.put(emb, req_model.to_string(), req_sampling, to_cache);
             }

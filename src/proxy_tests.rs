@@ -4846,6 +4846,59 @@ fn test_pseudonymize_restores_tokens_in_response_tool_calls() {
 }
 
 #[test]
+fn test_sensitive_pseudonymized_stream_never_populates_any_cache() {
+    // Regression guard for an invariant ADR-226's fix relies on being true:
+    // whenever pseudonymize actually masks something, privacy::classify() (the
+    // SAME detectors, reused) also flags the content sensitive — so cache_key
+    // (run_completion/stream_chat_to_socket) and query_embedding
+    // (embedding_step), both gated on `!sensitive`, are always None here. That
+    // makes finalize_streamed's cache-write blocks currently unreachable for
+    // sensitive+pseudonymized content, even after ADR-226's tool_calls-restore
+    // fix to those blocks. The fix is still correct defense-in-depth (it would
+    // matter the moment classify()'s categories and pseudonymize's masked
+    // categories ever diverge), but this test freezes today's actual coupling
+    // so a future change to either detector doesn't silently reopen the
+    // masked-token cache leak ADR-226 closed without anyone noticing the
+    // reachability assumption had changed. Confirmed the response IS served
+    // from cloud (tool_calls restored correctly per ADR-189) — this is not a
+    // routing failure, the cache is genuinely never touched.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100_000, true, true).with_allow_sensitive_cloud(true);
+    let proxy =
+        Proxy::new(
+            engine,
+            Some(Box::new(MockBackend::new("local", "local-reply"))),
+            Some(Box::new(ToolCallReplyBackend {
+                tool_calls_json:
+                    r#"[{"function":{"name":"send","arguments":"{\"to\":\"<EMAIL_1>\"}"}}]"#
+                        .to_string(),
+            })),
+            &log,
+        )
+        .with_pseudonymize(true)
+        .with_cache(8)
+        .with_semantic_cache(8, 0.5);
+    let body = r#"{"model":"cloud","stream":true,"messages":[{"role":"user","content":"email alice@example.com now"}]}"#;
+    let (status, sse) = roundtrip_ref(&proxy, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    assert!(
+        sse.contains("alice@example.com"),
+        "response must be served from cloud with tokens restored: {sse}"
+    );
+    let cache_len = proxy.cache.as_ref().unwrap().lock().unwrap().len();
+    let sem_len = proxy.semantic_cache.as_ref().unwrap().lock().unwrap().len();
+    assert_eq!(
+        cache_len, 0,
+        "sensitive content must never enter the exact-match cache"
+    );
+    assert_eq!(
+        sem_len, 0,
+        "sensitive content must never enter the semantic cache"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_streaming_pseudonymize_restores_tokens_in_response_tool_calls() {
     // ADR-189 (streaming path): same as the buffered case but for stream:true.
     // The cloud-generated tool_calls chunk must have tokens de-anonymized before
