@@ -423,6 +423,10 @@ pub struct RoutingEngine {
     /// Skill-profile overrides (IMP-25): `(skill_name, route)` pairs, checked
     /// before the generic hard-signal rules. E.g. `("summarize", Local)` keeps
     /// summarisation on the fast local model even when hard signals are present.
+    /// Exception (ADR-228): never overrides when the request has tools/
+    /// function-calling — that is a *capability* requirement, not a content
+    /// signal, and a skill match must not silently route it to a backend that
+    /// may not support function-calling.
     skills: Vec<(String, Route)>,
 }
 
@@ -586,7 +590,15 @@ impl RoutingEngine {
 
         // Skill-profile overrides (IMP-25): checked before generic hard signals.
         // A configured skill match short-circuits the rest of the decision.
-        if !self.skills.is_empty() {
+        // ADR-228: NOT when has_tools is set. A skill match is a setting about
+        // *text content* (e.g. "keep my code on the local model"); has_tools is
+        // a *capability* signal — the local model may not support
+        // function-calling at all. Letting a content-based skill silently
+        // override a capability requirement could route a genuine tool-calling
+        // request to a backend that cannot serve it. Falling through here lets
+        // the hard-signal logic below (which already treats `tools` as a hard
+        // signal, gated by `code_to_cloud`) make the capability-aware call.
+        if !self.skills.is_empty() && !has_tools {
             if let Some(skill) = detect_skill(text) {
                 for (name, route) in &self.skills {
                     if name == skill {
@@ -1248,6 +1260,32 @@ mod tests {
         let d = e.decide("```\ncode here\n```", None).unwrap();
         // Generic code→cloud still fires because the skill profile didn't match.
         assert_eq!(d.route, Route::Cloud);
+    }
+
+    #[test]
+    fn test_skill_profile_does_not_override_has_tools() {
+        // ADR-228: a skill match is a content-based setting ("keep my code on
+        // the local model"); has_tools is a capability requirement (the local
+        // model may not support function-calling). A request with tools must
+        // escalate to cloud even when it also matches a skill mapped to Local.
+        let e = both().with_skills(vec![("code".to_string(), Route::Local)]);
+        let d = e
+            .decide_full("```rust\nfn main(){}\n```", None, false, true)
+            .unwrap();
+        assert_eq!(d.route, Route::Cloud, "reason: {}", d.reason);
+        assert!(d.reason.contains("tools"), "reason: {}", d.reason);
+    }
+
+    #[test]
+    fn test_skill_profile_still_applies_without_tools() {
+        // Control: the same skill profile, same text, but has_tools=false —
+        // the skill override must still fire exactly as before ADR-228.
+        let e = both().with_skills(vec![("code".to_string(), Route::Local)]);
+        let d = e
+            .decide_full("```rust\nfn main(){}\n```", None, false, false)
+            .unwrap();
+        assert_eq!(d.route, Route::Local);
+        assert!(d.reason.contains("skill:code"), "reason: {}", d.reason);
     }
 
     #[test]
