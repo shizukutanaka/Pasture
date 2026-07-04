@@ -1910,14 +1910,7 @@ impl Proxy {
         let framed = self.frame_request(req);
         let req = framed.as_ref().unwrap_or(req);
 
-        let (decision, sensitive) = self.classify_and_decide(req)?;
-        if let Some(logger) = &self.decision_logger {
-            logger.log_decision(
-                &decision,
-                crate::routing::estimate_tokens(&req.routing_text()) as u64,
-                self.engine.threshold() as u64,
-            );
-        }
+        let (mut decision, sensitive) = self.classify_and_decide(req)?;
 
         // OTel span (IMP-23/ADR-144): start before the cache checks so a cache
         // hit is traced too. Cache hits return early below, so the span must
@@ -1965,6 +1958,27 @@ impl Proxy {
                     return Err(e);
                 }
             };
+        // ADR-230: log the decision AFTER the embedding step (difficulty signal)
+        // and budget guard have both had a chance to change the route, using
+        // planned_route rather than the routing engine's raw decision.route.
+        // Previously this logged immediately after classify_and_decide -- before
+        // any of that -- so a budget-guard "local-only" redirect (over-budget ->
+        // Cloud downgraded to Local) produced a decision-log entry claiming
+        // final_route:"cloud" for a request that was actually served on Local,
+        // directly contradicting decision_log's own stated purpose ("so a wrong
+        // decision can be replayed/audited"). A cache/semantic-cache hit now
+        // returns before reaching this point and gets no decision-log entry at
+        // all (previously it did, using the pre-cache-check routing decision) --
+        // a deliberate, documented trade-off: a cache hit never truly exercises
+        // the routing/budget logic this log exists to audit.
+        decision.route = planned_route;
+        if let Some(logger) = &self.decision_logger {
+            logger.log_decision(
+                &decision,
+                crate::routing::estimate_tokens(&req.routing_text()) as u64,
+                self.engine.threshold() as u64,
+            );
+        }
 
         // Pseudonymization (IMP-19): replace PII with opaque tokens before
         // sending to the cloud. Only applied to cloud-bound, non-sensitive
@@ -2987,7 +3001,7 @@ impl Proxy {
         // path does) and before classify_and_decide so framing also feeds routing.
         let framed = self.frame_request(req);
         let req = framed.as_ref().unwrap_or(req);
-        let (decision, sensitive) = match self.classify_and_decide(req) {
+        let (mut decision, sensitive) = match self.classify_and_decide(req) {
             Ok(pair) => pair,
             Err(e) => {
                 let s = e.status();
@@ -3001,13 +3015,6 @@ impl Proxy {
                 return Ok(s);
             }
         };
-        if let Some(logger) = &self.decision_logger {
-            logger.log_decision(
-                &decision,
-                crate::routing::estimate_tokens(&req.routing_text()) as u64,
-                self.engine.threshold() as u64,
-            );
-        }
         // OTel span (IMP-23): started before the cache checks so a cache hit is
         // traced too (ADR-144). Shared by the exact/semantic hit paths and the
         // backend completion below.
@@ -3080,6 +3087,19 @@ impl Proxy {
                 return Ok(s);
             }
         };
+        // ADR-230: log the decision AFTER embedding_step + apply_budget_guard have
+        // both had a chance to change the route (streaming mirror of the buffered
+        // path's fix) -- see the buffered run_completion comment for the full
+        // reasoning. Cache/semantic-cache hits above already returned before this
+        // point and get no decision-log entry (same documented trade-off).
+        decision.route = route;
+        if let Some(logger) = &self.decision_logger {
+            logger.log_decision(
+                &decision,
+                crate::routing::estimate_tokens(&req.routing_text()) as u64,
+                self.engine.threshold() as u64,
+            );
+        }
         let backend = match self.backend_for(route) {
             Ok(b) => b,
             Err(e) => {

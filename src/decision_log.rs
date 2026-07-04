@@ -111,6 +111,14 @@ fn extract_signals(reason: &str) -> Vec<String> {
         "cascade",
         "local_only",
         "injection",
+        // ADR-230: IMP-34/35's circuit breaker redirects (both directions) put
+        // "circuit open" in the reason text, but this list had no keyword for
+        // it — a decision that WAS a circuit-breaker redirect showed up with
+        // an empty hard_signals array, making it invisible to any jq/grep
+        // query filtering on hard_signals rather than parsing the free-text
+        // reason. The full reason text was never lost (it's a separate field),
+        // but the whole point of hard_signals is to avoid needing to parse it.
+        "circuit",
     ];
     for kw in &keywords {
         if reason.to_lowercase().contains(kw) {
@@ -198,6 +206,18 @@ mod tests {
         assert!(signals.contains(&"code".to_string()));
         assert!(signals.contains(&"math".to_string()));
         assert!(signals.contains(&"tools".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signals_detects_circuit_breaker_redirect() {
+        // ADR-230: a circuit-breaker redirect (either direction) must be
+        // queryable via hard_signals, not just visible in the free-text reason.
+        let local_to_cloud =
+            "estimated 5 tokens < threshold 100 (local circuit open, redirected to cloud)";
+        assert!(extract_signals(local_to_cloud).contains(&"circuit".to_string()));
+        let cloud_to_local =
+            "estimated 500 tokens >= threshold 100 (cloud circuit open, redirected to local)";
+        assert!(extract_signals(cloud_to_local).contains(&"circuit".to_string()));
     }
 
     #[test]

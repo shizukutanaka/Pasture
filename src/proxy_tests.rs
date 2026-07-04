@@ -953,6 +953,79 @@ fn test_decision_log_enabled_appends_jsonl_record() {
 }
 
 #[test]
+fn test_decision_log_reflects_budget_guard_redirect_not_raw_decision() {
+    // ADR-230: decision_log used to fire immediately after the routing engine's
+    // decision, BEFORE the budget guard could downgrade Cloud -> Local on
+    // over-budget. That produced a final_route:"cloud" entry for a request
+    // actually served on Local -- directly contradicting decision_log's own
+    // stated purpose. This confirms final_route now reflects the REAL route.
+    let log = tmp_log();
+    let decision_log_path = tmp_log();
+    let engine = RoutingEngine::new(0, true, true); // threshold 0 -> naturally cloud
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+        &log,
+    )
+    .with_decision_log(Some(&decision_log_path))
+    .with_budget(1, "local-only", 0, &log); // tiny budget: exceeded after 1 request
+                                            // First request: under budget, naturally serves cloud.
+    let resp1 = p
+        .handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    assert!(resp1.contains("cloud-reply"), "{resp1}");
+    // Second request: over budget -> apply_budget_guard's "local-only" action
+    // downgrades the routing engine's natural Cloud decision to Local.
+    let resp2 = p
+        .handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    assert!(resp2.contains("local-reply"), "{resp2}");
+    let contents = std::fs::read_to_string(&decision_log_path).unwrap();
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 2, "{contents}");
+    let entry1 = crate::json::parse(lines[0]).unwrap();
+    assert_eq!(
+        entry1.get("final_route").and_then(|x| x.as_str()),
+        Some("cloud")
+    );
+    let entry2 = crate::json::parse(lines[1]).unwrap();
+    assert_eq!(
+        entry2.get("final_route").and_then(|x| x.as_str()),
+        Some("local"),
+        "must log the route ACTUALLY served (local, post-budget-guard), not \
+         the routing engine's raw pre-guard decision (cloud): {contents}"
+    );
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&decision_log_path);
+}
+
+#[test]
+fn test_decision_log_skips_cache_hits_documented_tradeoff() {
+    // ADR-230: moving the log point past the cache check (to correctly reflect
+    // budget-guard overrides) means a cache hit -- which returns before that
+    // point -- now gets no decision-log entry at all. This documents that as
+    // a deliberate, acceptable trade-off (a cache hit never exercises the
+    // routing/budget logic this log exists to audit) rather than a silent gap.
+    let log = tmp_log();
+    let decision_log_path = tmp_log();
+    let p = proxy_with(true, false, 100, &log)
+        .with_cache(8)
+        .with_decision_log(Some(&decision_log_path));
+    let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    let _ = p.handle_chat(body).unwrap(); // miss: populates cache, 1 log entry
+    let _ = p.handle_chat(body).unwrap(); // hit: no new log entry
+    let contents = std::fs::read_to_string(&decision_log_path).unwrap();
+    assert_eq!(
+        contents.lines().count(),
+        1,
+        "cache hit must not add a second decision-log entry: {contents}"
+    );
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&decision_log_path);
+}
+
+#[test]
 fn test_decision_log_covers_streaming_requests_too() {
     // Socratic verification (same question as ADR-219/220): decision_logger
     // is called from both run_completion and stream_chat_to_socket in the
