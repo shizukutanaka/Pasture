@@ -293,6 +293,15 @@ pub struct Proxy {
     /// availability, I5); an explicit per-request model pin is never
     /// overridden either. 0 disables both breakers.
     health_cooldown_secs: u64,
+    /// Pending cache TTL in seconds (ADR-229). `with_cache_ttl` stores it here
+    /// AND applies it to whichever cache(s) already exist; `with_cache`/
+    /// `with_semantic_cache` apply any already-stored value to the cache they
+    /// just created. This makes the pair order-independent — previously
+    /// `with_cache_ttl` only wrote to caches that existed *at that point*, so
+    /// calling it before `with_semantic_cache` silently left the semantic
+    /// cache with no TTL (an ADR-160 violation with no compiler or test
+    /// signal). 0 = no TTL configured yet / disabled.
+    cache_ttl_secs: u64,
 }
 
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
@@ -367,6 +376,7 @@ impl Proxy {
             local_health: crate::health::BackendHealth::new(),
             cloud_health: crate::health::BackendHealth::new(),
             health_cooldown_secs: 30,
+            cache_ttl_secs: 0,
         }
     }
 
@@ -803,27 +813,38 @@ impl Proxy {
     /// (cap of 0 leaves the cache disabled).
     pub fn with_cache(mut self, cap: usize) -> Self {
         if cap > 0 {
-            self.cache = Some(std::sync::Mutex::new(crate::cache::ResponseCache::new(cap)));
+            let mut cache = crate::cache::ResponseCache::new(cap);
+            // ADR-229: apply any TTL already configured via with_cache_ttl,
+            // regardless of which builder call came first.
+            if self.cache_ttl_secs > 0 {
+                cache.set_max_age(self.cache_ttl_secs);
+            }
+            self.cache = Some(std::sync::Mutex::new(cache));
         }
         self
     }
 
     pub fn with_cache_ttl(self, ttl_secs: u64) -> Self {
+        // ADR-229: store the TTL regardless of whether either cache exists yet
+        // (see `cache_ttl_secs` field doc) — this is what makes the pair with
+        // `with_cache`/`with_semantic_cache` order-independent.
+        let mut this = self;
+        this.cache_ttl_secs = ttl_secs;
         if ttl_secs > 0 {
-            if let Some(ref cache_mutex) = self.cache {
+            if let Some(ref cache_mutex) = this.cache {
                 if let Ok(mut guard) = cache_mutex.lock() {
                     guard.set_max_age(ttl_secs);
                 }
             }
             // Apply the same TTL to the semantic cache (ADR-160) so PASTURE_CACHE_TTL
             // bounds staleness for both caches, not just the exact-match one.
-            if let Some(ref sem_mutex) = self.semantic_cache {
+            if let Some(ref sem_mutex) = this.semantic_cache {
                 if let Ok(mut guard) = sem_mutex.lock() {
                     guard.set_max_age(ttl_secs);
                 }
             }
         }
-        self
+        this
     }
 
     /// Enable the optional semantic cache (IMP-12). `cap` entries are stored;
@@ -832,9 +853,13 @@ impl Proxy {
     /// Disabled (cap = 0) by default so the zero-dependency build is unchanged.
     pub fn with_semantic_cache(mut self, cap: usize, threshold: f64) -> Self {
         if cap > 0 {
-            self.semantic_cache = Some(std::sync::Mutex::new(crate::cache::SemanticCache::new(
-                cap, threshold,
-            )));
+            let mut cache = crate::cache::SemanticCache::new(cap, threshold);
+            // ADR-229: apply any TTL already configured via with_cache_ttl,
+            // regardless of which builder call came first.
+            if self.cache_ttl_secs > 0 {
+                cache.set_max_age(self.cache_ttl_secs);
+            }
+            self.semantic_cache = Some(std::sync::Mutex::new(cache));
         }
         self
     }

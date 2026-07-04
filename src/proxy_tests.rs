@@ -3021,6 +3021,80 @@ fn test_streaming_difficulty_signal_escalates() {
 }
 
 #[test]
+fn test_cache_ttl_applies_regardless_of_builder_order() {
+    // ADR-229: with_cache_ttl previously only wrote to caches that already
+    // existed at the point it was called. Calling it BEFORE with_semantic_cache
+    // (the reverse of cli.rs's documented order) used to silently leave the
+    // semantic cache with no TTL at all -- an ADR-160 violation with no
+    // compiler or test signal. Both orders must now produce the same result.
+    let log1 = tmp_log();
+    let p_ttl_first = Proxy::new(
+        RoutingEngine::new(100, true, false),
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        None,
+        &log1,
+    )
+    .with_cache_ttl(1)
+    .with_cache(8)
+    .with_semantic_cache(8, 0.5);
+    assert_eq!(
+        p_ttl_first
+            .cache
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .max_age_secs(),
+        1
+    );
+    assert_eq!(
+        p_ttl_first
+            .semantic_cache
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .max_age_secs(),
+        1,
+        "semantic cache must get the TTL even though with_cache_ttl ran first"
+    );
+    let _ = std::fs::remove_file(&log1);
+
+    let log2 = tmp_log();
+    let p_ttl_last = Proxy::new(
+        RoutingEngine::new(100, true, false),
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        None,
+        &log2,
+    )
+    .with_cache(8)
+    .with_semantic_cache(8, 0.5)
+    .with_cache_ttl(1);
+    assert_eq!(
+        p_ttl_last
+            .cache
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .max_age_secs(),
+        1
+    );
+    assert_eq!(
+        p_ttl_last
+            .semantic_cache
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .max_age_secs(),
+        1,
+        "documented order (unchanged) must still apply the TTL"
+    );
+    let _ = std::fs::remove_file(&log2);
+}
+
+#[test]
 fn test_streaming_served_from_semantic_cache() {
     // ADR-150: a stream:true request must be served from the semantic cache. A
     // buffered request warms it; MockBackend embeddings are all parallel, so a
