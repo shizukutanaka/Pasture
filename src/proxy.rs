@@ -272,15 +272,26 @@ pub struct Proxy {
     /// local model within the next request instead of inferring it only from
     /// scattered error logs.
     local_health: crate::health::BackendHealth,
-    /// Circuit-breaker cooldown in seconds (IMP-34, ADR-221). Acts on
-    /// `local_health` instead of only observing it: once the local backend
-    /// is `Down`, `route_decision` redirects *non-sensitive* Local decisions
-    /// to Cloud (when available) instead of repeating a call already known
-    /// to fail — until `cooldown` elapses, at which point one probe request
-    /// is let through to detect recovery. Sensitive content is never
-    /// redirected (privacy over availability, I5), and there is no cloud
-    /// fallback if none is configured — this only ever makes an already-Local
-    /// decision faster to fail over, never a privacy override.
+    /// Cloud-backend health tracker (IMP-35, ADR-227). Symmetric to
+    /// `local_health`: every primary-cloud completion attempt (buffered,
+    /// cascade-escalation, and streaming) records success/failure here; after
+    /// 3 consecutive failures the backend is marked `Down`. The configured
+    /// secondary provider (`cloud_fallback`) is deliberately NOT tracked here
+    /// — it is a different backend, and conflating its outcomes with the
+    /// primary's would let a healthy fallback mask a dead primary (or a dead
+    /// fallback poison primary health). Exposed via `/v1/stats` alongside
+    /// `local_health`.
+    cloud_health: crate::health::BackendHealth,
+    /// Circuit-breaker cooldown in seconds (IMP-34/35, ADR-221/227). Shared by
+    /// both breakers. Acts on `local_health`/`cloud_health` instead of only
+    /// observing them: once a backend is `Down`, `route_decision` redirects a
+    /// *natural* (non-forced, non-sensitive) decision away from it toward the
+    /// other backend (when available and itself not circuit-open) instead of
+    /// repeating a call already known to fail — until `cooldown` elapses, at
+    /// which point one probe request is let through to detect recovery.
+    /// Sensitive content is never redirected off Local (privacy over
+    /// availability, I5); an explicit per-request model pin is never
+    /// overridden either. 0 disables both breakers.
     health_cooldown_secs: u64,
 }
 
@@ -354,6 +365,7 @@ impl Proxy {
             input_pii_stats: None,
             decision_logger: None,
             local_health: crate::health::BackendHealth::new(),
+            cloud_health: crate::health::BackendHealth::new(),
             health_cooldown_secs: 30,
         }
     }
@@ -1095,18 +1107,47 @@ impl Proxy {
         // choice), or `PASTURE_LOCAL_ONLY` (an explicit "never touch cloud"
         // operator setting). Requires a configured cloud backend to fall back
         // to; with none, this is a no-op (there is nowhere to redirect).
+        // ADR-227 adds `&& cloud_health.should_attempt(...)`: never redirect
+        // INTO a cloud backend already known to be Down either.
         if decision.route == Route::Local
             && !sensitive
             && forced.is_none()
             && !self.engine.is_local_only()
             && self.cloud.is_some()
             && !self.local_health.should_attempt(self.health_cooldown_secs)
+            && self.cloud_health.should_attempt(self.health_cooldown_secs)
         {
             decision.reason = format!(
                 "{} (local circuit open, redirected to cloud)",
                 decision.reason
             );
             decision.route = Route::Cloud;
+        } else if decision.route == Route::Cloud
+            // IMP-35/ADR-227: the symmetric case — a natural Cloud decision
+            // (difficulty threshold, hard signals, etc.) redirected to Local
+            // when the cloud backend is Down and outside its cooldown. No
+            // sensitive-content guard is needed here: `decide_full` only ever
+            // produces a sensitive Cloud decision when
+            // `PASTURE_ALLOW_SENSITIVE_CLOUD=1` is set, and redirecting THAT
+            // to Local is strictly more private, never less — so it is safe
+            // by construction. No `local_only` guard is needed either: that
+            // setting already forces every decision to Local upstream in
+            // `decide_full`, so a Cloud decision literally cannot occur when
+            // it is active. This is an `else if` on the ORIGINAL decision
+            // (not a second independent check), so when BOTH backends are
+            // circuit-open, neither arm's guard is satisfied and the decision
+            // keeps its original route — the request itself then becomes the
+            // recovery probe for that backend, with no ping-pong possible.
+            && forced.is_none()
+            && self.local.is_some()
+            && self.local_health.should_attempt(self.health_cooldown_secs)
+            && !self.cloud_health.should_attempt(self.health_cooldown_secs)
+        {
+            decision.reason = format!(
+                "{} (cloud circuit open, redirected to local)",
+                decision.reason
+            );
+            decision.route = Route::Local;
         }
         Ok((decision, report))
     }
@@ -1245,8 +1286,16 @@ impl Proxy {
         sensitive: bool,
         otel_span: &mut Option<crate::telemetry::Span>,
     ) -> EmbeddingStep {
-        let want_difficulty =
-            !self.hard_prompts.is_empty() && route == Route::Local && self.cloud.is_some();
+        // ADR-227 (R4): the difficulty signal's whole purpose is escalating a
+        // healthy-looking Local decision to Cloud when the prompt resembles a
+        // known-hard case. If the cloud circuit is open, that escalation would
+        // just bounce straight back to Local via route_decision's Cloud->Local
+        // arm anyway — so skip computing it (and the embeddings() call below)
+        // entirely rather than pay for a doomed round trip.
+        let want_difficulty = !self.hard_prompts.is_empty()
+            && route == Route::Local
+            && self.cloud.is_some()
+            && self.cloud_health.should_attempt(self.health_cooldown_secs);
         // Socratic follow-up to IMP-34 (ADR-224): the circuit breaker protects the
         // completion call paths (complete_direct/complete_cascade/
         // complete_cloud_with_fallback, plus streaming), but this embeddings()
@@ -1513,6 +1562,24 @@ impl Proxy {
         match &result {
             Ok(_) => self.local_health.mark_healthy(elapsed_ms),
             Err(e) => self.local_health.mark_unhealthy(e.to_string(), elapsed_ms),
+        }
+        result
+    }
+
+    /// Record the outcome of a *primary*-cloud-backend call in `cloud_health`
+    /// (IMP-35). Exact mirror of `track_local_call`. Deliberately never used
+    /// for the secondary/fallback provider (`cloud_fallback`) — see the
+    /// `cloud_health` field doc for why.
+    fn track_cloud_call<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let start = std::time::Instant::now();
+        let result = f();
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => self.cloud_health.mark_healthy(elapsed_ms),
+            Err(e) => self.cloud_health.mark_unhealthy(e.to_string(), elapsed_ms),
         }
         result
     }
@@ -1992,6 +2059,17 @@ impl Proxy {
             confidence,
             self.cascade_logprob_threshold,
         ) {
+            // IMP-35/ADR-227: skip the escalation entirely when the cloud circuit
+            // is open, BEFORE apply_budget_guard reserves any tokens — checking
+            // first means there is nothing to roll back (unlike a cloud failure,
+            // which reserves then releases). A circuit-open cloud would fail this
+            // call anyway; this just avoids paying for the retry backoff first.
+            if !self.cloud_health.should_attempt(self.health_cooldown_secs) {
+                eprintln!(
+                    "pasture: cascade escalation suppressed (cloud circuit open); using local answer"
+                );
+                return Ok((local_resp, Route::Local, confidence, 0));
+            }
             // Apply the same budget/spike guard the direct cloud path uses before
             // spending cloud tokens (ADR-161). The cascade is reached only when the
             // request was routed Local, so apply_budget_guard was a no-op upstream
@@ -2003,7 +2081,9 @@ impl Proxy {
             match self.apply_budget_guard(req, Route::Cloud) {
                 Ok((Route::Cloud, cascade_reserved)) => {
                     let cloud = self.backend_for(Route::Cloud)?;
-                    match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
+                    match self.track_cloud_call(|| {
+                        complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS)
+                    }) {
                         Ok(cloud_resp) => {
                             return Ok((cloud_resp, Route::Cloud, confidence, cascade_reserved))
                         }
@@ -2033,12 +2113,34 @@ impl Proxy {
         req: &CompletionRequest,
     ) -> Result<(CompletionResponse, Route, Option<f64>, u64), ProxyError> {
         let cloud = self.backend_for(Route::Cloud)?;
-        match complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS) {
+        // IMP-35/ADR-227: skip the primary retry loop entirely when its circuit
+        // is open AND an alternative exists (fallback provider or local) --
+        // attempting a call already known to fail just pays the retry backoff
+        // for nothing before falling through anyway. When NEITHER alternative
+        // exists, still attempt: the call is the only way to get an answer, and
+        // it doubles as the circuit breaker's own recovery probe (R1). Note a
+        // model:"cloud"-pinned request reaching here during an open circuit
+        // also gets skipped straight to fallback/local -- consistent with
+        // today's existing behavior where a pinned cloud request already
+        // silently serves fallback/local on primary failure; the fast-fail
+        // just avoids re-paying retry backoff during the cooldown window, and
+        // the half-open probe restores real attempts once it elapses.
+        let skip_primary = !self.cloud_health.should_attempt(self.health_cooldown_secs)
+            && (self.cloud_fallback.is_some() || self.local.is_some());
+        let primary_result = if skip_primary {
+            Err(BackendError::Transport("cloud circuit open".to_string()))
+        } else {
+            self.track_cloud_call(|| {
+                complete_with_retry(cloud, req, self.cloud_retry, CLOUD_RETRY_BASE_MS)
+            })
+        };
+        match primary_result {
             Ok(resp) => Ok((resp, Route::Cloud, None, 0)),
             Err(primary_err) => {
                 // IMP-9 multi-provider follow-up: try the fallback cloud provider
                 // before giving up to local. This handles a full primary-cloud
                 // outage (vs. transient errors, which the retry loop already covers).
+                // Deliberately not tracked in cloud_health -- see the field doc.
                 if let Some(fallback) = self.cloud_fallback.as_deref() {
                     eprintln!(
                         "pasture: primary cloud failed ({primary_err}); trying fallback cloud"
@@ -2082,7 +2184,7 @@ impl Proxy {
         let resp = if route == Route::Local {
             self.track_local_call(|| backend.complete(effective_req))
         } else {
-            backend.complete(effective_req)
+            self.track_cloud_call(|| backend.complete(effective_req))
         }
         .map_err(|e| ProxyError::Backend(e.to_string()))?;
         Ok((resp, route, None, 0))
@@ -2212,6 +2314,7 @@ impl Proxy {
             .map(|s| s.snapshot())
             .unwrap_or_default();
         let local_health_last_error = self.local_health.last_check().and_then(|c| c.last_error);
+        let cloud_health_last_error = self.cloud_health.last_check().and_then(|c| c.last_error);
         let injection_guard_stats = self.injection_stats.snapshot();
         Ok(build_stats_response(
             &summary,
@@ -2230,6 +2333,8 @@ impl Proxy {
             &input_pii_categories,
             local_health_last_error.as_deref(),
             &injection_guard_stats,
+            self.cloud_health.status().as_str(),
+            cloud_health_last_error.as_deref(),
         ))
     }
 
@@ -3058,16 +3163,17 @@ impl Proxy {
                 io_err = Some(e);
             }
         };
-        // IMP-30: streaming previously bypassed local-health tracking entirely —
-        // only the buffered strategies (complete_direct/complete_cascade/
-        // complete_cloud_with_fallback) called track_local_call. Since a stream:true
-        // request routed Local calls stream_complete directly, a crashed local
-        // backend never showed up in /v1/stats for streaming traffic, which is the
-        // more common path for interactive chat UIs. Record the same outcome here.
+        // IMP-30/35: streaming previously bypassed health tracking entirely for
+        // BOTH backends — only the buffered strategies (complete_direct/
+        // complete_cascade/complete_cloud_with_fallback) called track_local_call/
+        // track_cloud_call. Since a stream:true request calls stream_complete
+        // directly, a crashed backend never showed up in /v1/stats for streaming
+        // traffic, which is the more common path for interactive chat UIs.
+        // Record the same outcome here for whichever backend was routed to.
         let resp = if route == Route::Local {
             self.track_local_call(|| backend.stream_complete(req, &mut on_delta))
         } else {
-            backend.stream_complete(req, &mut on_delta)
+            self.track_cloud_call(|| backend.stream_complete(req, &mut on_delta))
         };
         // The backend stream has fully completed — it reads the upstream to the end
         // even if the client went away mid-stream, so `resp` carries the real token
@@ -3395,7 +3501,6 @@ pub fn build_model_response(models: &[String], id: &str) -> Option<String> {
 /// Build the `GET /v1/stats` JSON body (IMP-metrics): live counters from the
 /// cost log. All values are PII-free aggregates (I3). Rates are rounded to 4 dp.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn build_stats_response(
     s: &crate::cost::CostSummary,
     cache_hits: u64,
@@ -3413,6 +3518,8 @@ pub fn build_stats_response(
     input_pii_categories: &[(&'static str, u64)],
     local_health_last_error: Option<&str>,
     injection_guard_stats: &[(String, u64)],
+    cloud_health: &'static str,
+    cloud_health_last_error: Option<&str>,
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
     let fmt_cats = |cats: &[(&'static str, u64)]| -> String {
@@ -3438,6 +3545,11 @@ pub fn build_stats_response(
         Some(e) => format!("\"{}\"", escape_string(e)),
         None => "null".to_string(),
     };
+    // IMP-35/ADR-227: symmetric to local_health_last_error above.
+    let cloud_last_error_json = match cloud_health_last_error {
+        Some(e) => format!("\"{}\"", escape_string(e)),
+        None => "null".to_string(),
+    };
     format!(
         "{{\"object\":\"pasture.stats\",\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
 \"cloud_rate\":{},\"cache_rate\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\
@@ -3448,6 +3560,7 @@ pub fn build_stats_response(
 \"budget_daily_tokens_used\":{budget_used},\"budget_daily_tokens_limit\":{budget_limit},\
 \"output_pii_categories\":{{{}}},\"local_health\":\"{local_health}\",\
 \"local_health_last_error\":{last_error_json},\
+\"cloud_health\":\"{cloud_health}\",\"cloud_health_last_error\":{cloud_last_error_json},\
 \"input_pii_categories\":{{{}}},\"injection_guard_stats\":{{{}}}}}",
         s.total,
         s.local,

@@ -749,6 +749,8 @@ fn test_build_stats_response_shape() {
         &[],
         None,
         &[],
+        "healthy",
+        None,
     );
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
@@ -4632,6 +4634,465 @@ fn test_local_health_degrades_then_recovers_via_direct_completion() {
         v.get("local_health")
             .and_then(|x| x.as_str().map(String::from)),
         Some("down".to_string())
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+// ── IMP-35 cloud backend health tracking + circuit breaker (ADR-227) ────────
+
+/// Like `AlwaysFailBackend`, but counts `complete()` calls (via a shared
+/// `Arc`) so a test can prove the fast-fail path in
+/// `complete_cloud_with_fallback` genuinely skips the primary retry loop
+/// while the cloud circuit is open, rather than merely tolerating its failure.
+struct CountingCompleteFailBackend {
+    complete_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+impl Backend for CountingCompleteFailBackend {
+    fn name(&self) -> &str {
+        "counting-complete-fail"
+    }
+    fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
+        self.complete_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(BackendError::Transport("provider down".into()))
+    }
+}
+
+#[test]
+fn test_cloud_health_starts_healthy_and_last_error_null() {
+    let log = tmp_log();
+    let p = proxy_with(true, true, 0, &log);
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).unwrap();
+    assert_eq!(
+        v.get("cloud_health")
+            .and_then(|x| x.as_str().map(String::from)),
+        Some("healthy".to_string())
+    );
+    assert_eq!(
+        v.get("cloud_health_last_error"),
+        Some(&crate::json::JsonValue::Null)
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_health_degrades_then_down_then_recovers() {
+    // IMP-35: a failing cloud backend degrades cloud_health via complete_direct
+    // (Route::Cloud branch), mirroring IMP-30's local test exactly.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, false, true);
+    let p = Proxy::new(engine, None, Some(Box::new(AlwaysFailBackend)), &log);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    assert!(p.complete_direct(&req, Route::Cloud).is_err());
+    assert_eq!(
+        p.cloud_health.status(),
+        crate::health::HealthStatus::Degraded
+    );
+    assert!(p.complete_direct(&req, Route::Cloud).is_err());
+    assert!(p.complete_direct(&req, Route::Cloud).is_err());
+    assert_eq!(p.cloud_health.status(), crate::health::HealthStatus::Down);
+    // Recovery: a success resets the tracker (mirrors health.rs's own unit test).
+    p.cloud_health.mark_healthy(10);
+    assert_eq!(
+        p.cloud_health.status(),
+        crate::health::HealthStatus::Healthy
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_health_last_error_exposed_when_down() {
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, false, true);
+    let p = Proxy::new(engine, None, Some(Box::new(AlwaysFailBackend)), &log);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    let _ = p.complete_direct(&req, Route::Cloud);
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).unwrap();
+    let err = v
+        .get("cloud_health_last_error")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    assert!(err.contains("provider down"), "{err}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_circuit_redirects_natural_cloud_to_local() {
+    // Symmetric to test_circuit_breaker_redirects_to_cloud_once_local_is_down:
+    // once cloud is Down, a natural (threshold-based) Cloud decision must
+    // redirect to local instead of repeating a call known to fail.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, true, true); // threshold 0 -> naturally cloud
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    );
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Cloud);
+    }
+    assert_eq!(p.cloud_health.status(), crate::health::HealthStatus::Down);
+    let preview = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("local"));
+    assert!(
+        pv.get("reason")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .contains("circuit"),
+        "{preview}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_circuit_never_overrides_explicit_cloud_pin() {
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, true, true);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    );
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Cloud);
+    }
+    let preview = p
+        .handle_route_preview(r#"{"model":"cloud","messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("cloud"));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_circuit_disabled_with_zero_cooldown() {
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, true, true);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    )
+    .with_health_cooldown(0);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Cloud);
+    }
+    let preview = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("cloud"));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_circuit_noop_without_local_backend() {
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, false, true);
+    let p = Proxy::new(engine, None, Some(Box::new(AlwaysFailBackend)), &log);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Cloud);
+    }
+    let preview = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(pv.get("route").and_then(|x| x.as_str()), Some("cloud"));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_both_circuits_open_keeps_original_route_no_ping_pong() {
+    // The core correctness property of the if/else-if structure: when BOTH
+    // breakers are open, neither arm's guard is satisfied, so each decision
+    // keeps its original route -- the request itself becomes the probe.
+    let log = tmp_log();
+    let local_engine = RoutingEngine::new(100, true, true); // naturally local
+    let p_local = Proxy::new(
+        local_engine,
+        Some(Box::new(AlwaysFailBackend)),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    );
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p_local.complete_direct(&req, Route::Local);
+        let _ = p_local.complete_direct(&req, Route::Cloud);
+    }
+    assert_eq!(
+        p_local.local_health.status(),
+        crate::health::HealthStatus::Down
+    );
+    assert_eq!(
+        p_local.cloud_health.status(),
+        crate::health::HealthStatus::Down
+    );
+    let preview_local = p_local
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv_local = crate::json::parse(&preview_local).unwrap();
+    assert_eq!(
+        pv_local.get("route").and_then(|x| x.as_str()),
+        Some("local"),
+        "{preview_local}"
+    );
+
+    let log2 = tmp_log();
+    let cloud_engine = RoutingEngine::new(0, true, true); // naturally cloud
+    let p_cloud = Proxy::new(
+        cloud_engine,
+        Some(Box::new(AlwaysFailBackend)),
+        Some(Box::new(AlwaysFailBackend)),
+        &log2,
+    );
+    for _ in 0..3 {
+        let _ = p_cloud.complete_direct(&req, Route::Local);
+        let _ = p_cloud.complete_direct(&req, Route::Cloud);
+    }
+    let preview_cloud = p_cloud
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv_cloud = crate::json::parse(&preview_cloud).unwrap();
+    assert_eq!(
+        pv_cloud.get("route").and_then(|x| x.as_str()),
+        Some("cloud"),
+        "{preview_cloud}"
+    );
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&log2);
+}
+
+#[test]
+fn test_local_circuit_does_not_redirect_into_open_cloud_circuit() {
+    // The existing Local->Cloud arm gained a `cloud_health.should_attempt`
+    // guard (ADR-227): never redirect INTO a cloud backend already known Down.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, true); // naturally local
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(AlwaysFailBackend)),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    );
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Local);
+        let _ = p.complete_direct(&req, Route::Cloud);
+    }
+    let preview = p
+        .handle_route_preview(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let pv = crate::json::parse(&preview).unwrap();
+    assert_eq!(
+        pv.get("route").and_then(|x| x.as_str()),
+        Some("local"),
+        "{preview}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_fallback_provider_outcome_never_touches_cloud_health() {
+    // The `cloud_health` field doc's design invariant: a healthy fallback
+    // provider's success must not reset/mask the primary's degraded status,
+    // and a failing fallback must not further degrade cloud_health either --
+    // cloud_health tracks the PRIMARY only.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, true, true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    )
+    .with_cloud_retry(0)
+    .with_cloud_fallback(Some(Box::new(MockBackend::new(
+        "fallback",
+        "fallback-reply",
+    ))));
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    let (resp, route, _, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    assert_eq!(resp.content, "fallback-reply");
+    assert_eq!(route, Route::Cloud);
+    // The primary failed -> cloud_health must be Degraded (1 failure), not
+    // reset to Healthy by the fallback's unrelated success.
+    assert_eq!(
+        proxy.cloud_health.status(),
+        crate::health::HealthStatus::Degraded
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_circuit_fast_fails_primary_to_fallback() {
+    // R1: once the cloud circuit is open and an alternative exists (fallback
+    // configured here), complete_cloud_with_fallback must skip the primary's
+    // retry loop entirely rather than pay for a doomed attempt.
+    let log = tmp_log();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let engine = RoutingEngine::new(0, true, true);
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(CountingCompleteFailBackend {
+            complete_calls: counter.clone(),
+        })),
+        &log,
+    )
+    .with_cloud_retry(0)
+    .with_cloud_fallback(Some(Box::new(MockBackend::new(
+        "fallback",
+        "fallback-reply",
+    ))));
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    // Trip the breaker: 3 failed primary attempts (each increments the counter).
+    for _ in 0..3 {
+        let _ = proxy.complete_cloud_with_fallback(&req);
+    }
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
+    // Next call: circuit is open and a fallback exists -> primary must be
+    // skipped entirely (counter stays at 3), response still comes from fallback.
+    let (resp, route, _, _) = proxy.complete_cloud_with_fallback(&req).unwrap();
+    assert_eq!(resp.content, "fallback-reply");
+    assert_eq!(route, Route::Cloud);
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "primary must be fast-failed (skipped), not attempted a 4th time"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_circuit_still_attempts_primary_with_no_alternative() {
+    // R1's other half: with NEITHER a fallback provider NOR a local backend
+    // configured, the primary must still be attempted even when its circuit
+    // is open -- skipping would return an error without trying anything,
+    // strictly worse than the attempt (which also serves as the recovery probe).
+    let log = tmp_log();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let engine = RoutingEngine::new(0, false, true);
+    let proxy = Proxy::new(
+        engine,
+        None,
+        Some(Box::new(CountingCompleteFailBackend {
+            complete_calls: counter.clone(),
+        })),
+        &log,
+    )
+    .with_cloud_retry(0);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = proxy.complete_cloud_with_fallback(&req);
+    }
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
+    let _ = proxy.complete_cloud_with_fallback(&req);
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        4,
+        "with no fallback/local, the primary must still be attempted (no-op skip is strictly worse)"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cascade_escalation_skipped_when_cloud_circuit_open() {
+    // R3: cascade must skip cloud escalation (and never reserve budget tokens
+    // for it) once the cloud circuit is open, keeping the local answer.
+    let log = tmp_log();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let engine = RoutingEngine::new(100, true, true); // naturally local
+    let proxy = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "i don't know"))), // low-confidence -> escalate
+        Some(Box::new(CountingCompleteFailBackend {
+            complete_calls: counter.clone(),
+        })),
+        &log,
+    )
+    .with_cascade(true)
+    .with_cascade_logprob(-1.0);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = proxy.complete_direct(&req, Route::Cloud);
+    }
+    assert_eq!(
+        proxy.cloud_health.status(),
+        crate::health::HealthStatus::Down
+    );
+    let calls_before = counter.load(std::sync::atomic::Ordering::Relaxed);
+    let (resp, route, _, _) = proxy.complete_cascade(&req).unwrap();
+    assert_eq!(route, Route::Local);
+    assert_eq!(resp.content, "i don't know");
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        calls_before,
+        "cascade must not attempt cloud escalation while its circuit is open"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_cloud_health_tracked_for_streaming_requests_too() {
+    // Mirrors test_local_health_tracked_for_streaming_requests_too for the
+    // cloud side: a stream:true request routed Cloud must update cloud_health.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(0, false, true);
+    let p = Proxy::new(engine, None, Some(Box::new(AlwaysFailBackend)), &log);
+    let body = r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, resp) = roundtrip_ref(&p, http_post("/v1/chat/completions", body));
+    assert_eq!(status, 200);
+    assert!(resp.contains("upstream_error"), "{resp}");
+    let json = p.handle_stats().unwrap();
+    let v = crate::json::parse(&json).unwrap();
+    assert_eq!(
+        v.get("cloud_health")
+            .and_then(|x| x.as_str().map(String::from)),
+        Some("degraded".to_string())
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_difficulty_escalation_skipped_when_cloud_circuit_open() {
+    // R4: embedding_step's want_difficulty must not compute an embedding (or
+    // escalate) once the cloud circuit is open -- the escalation would only
+    // bounce straight back to local via route_decision's Cloud->Local arm.
+    let log = tmp_log();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let engine = RoutingEngine::new(100, true, true); // naturally local
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(CountingFailBackend {
+            embeddings_calls: counter.clone(),
+        })),
+        Some(Box::new(AlwaysFailBackend)),
+        &log,
+    )
+    .with_hard_prompts(vec!["known hard prompt".to_string()], 0.5);
+    let req = Proxy::parse_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    for _ in 0..3 {
+        let _ = p.complete_direct(&req, Route::Cloud);
+    }
+    assert_eq!(p.cloud_health.status(), crate::health::HealthStatus::Down);
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let _ = p.handle_chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#);
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "embeddings() must be skipped for the difficulty signal while cloud circuit is open"
     );
     let _ = std::fs::remove_file(&log);
 }
