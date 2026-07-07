@@ -250,6 +250,47 @@ Each item: **what / why / peer / arXiv / effort / risk / zero-dep default?**
 
 ---
 
+## 4c. Extended improvement backlog (IMP-28 → IMP-35, from IMPROVEMENTS.jsonl)
+
+> Source: a continuous Socratic feature-interaction audit run across this
+> project's session history — each item started from a concrete "what if two
+> shipped features compose incorrectly?" question, not a peer/arXiv survey.
+> Grounding for each item is the specific ADR(s) it produced; see
+> `IMPROVEMENTS.jsonl` for full change/reason/effect/risk detail per entry.
+> All items preserve the zero-dependency default build.
+
+| IMP | Title | Status |
+|-----|-------|--------|
+| **IMP-28** | Input-side PII category visibility in `/v1/stats` | ✅ **SHIPPED (ADR-218 — `PASTURE_INPUT_PII_SCAN`)** |
+| **IMP-29** | Routing decision audit log (JSONL, PII-free) | ✅ **SHIPPED (ADR-216/230 — `PASTURE_DECISION_LOG`)** |
+| **IMP-30** | Local-backend health tracking (Healthy/Degraded/Down) | ✅ **SHIPPED (ADR-215/219 — always-on, exposed via `/v1/stats`)** |
+| **IMP-31** | *(reserved — not used this round; see ARCHITECTURE.md ADR-145 for the pre-existing IMP-31 array-content item)* | — |
+| **IMP-32** | *(reserved — pre-existing incremental-metrics-cache item, ADR-151)* | — |
+| **IMP-33** | Output-side PII category visibility (detection-only, never mutates the response) | ✅ **SHIPPED (ADR-217/220 — `PASTURE_OUTPUT_PII_SCAN`)** |
+| **IMP-34** | Local-backend circuit breaker (half-open probe, acts on IMP-30's health data) | ✅ **SHIPPED (ADR-221/223/224 — `PASTURE_HEALTH_COOLDOWN_SECS`)** |
+| **IMP-35** | Cloud-backend health tracking + circuit breaker, symmetric to IMP-30/34 | ✅ **SHIPPED (ADR-227 — reuses `PASTURE_HEALTH_COOLDOWN_SECS`)** |
+
+**Notable fixes found by the same audit, filed as ADRs rather than new IMP numbers**
+(each closes a real inconsistency between two already-shipped items):
+
+| ADR | What it fixed |
+|-----|----------------|
+| ADR-222 | `local_health_last_error` was captured but never exposed via `/v1/stats` |
+| ADR-225 | Injection guard's `block` mode had zero observability (not even stderr) |
+| ADR-226 | Streaming path cached un-restored (masked) `tool_calls` when pseudonymize was active |
+| ADR-228 | Skill-profile overrides silently bypassed the `has_tools` capability signal |
+| ADR-229 | `with_cache_ttl` silently no-op'd on a cache created after it (builder order) |
+| ADR-230 | `decision_log` recorded the pre-budget-guard route, not the route actually served |
+
+**Methodological note:** IMP-31 and IMP-32 are intentionally left blank above —
+those numbers were already claimed by pre-existing ADRs (ADR-145 and ADR-151
+respectively, both predating this audit). Kept here as a visible gap rather
+than silently reusing the numbers, so a future contributor grepping for
+"IMP-31" or "IMP-32" finds the real pre-existing items instead of a phantom
+second definition.
+
+---
+
 ## 5. Anti-goals (deliberately *not* adopting)
 
 Keeping the wedge means saying no to several common peer features:

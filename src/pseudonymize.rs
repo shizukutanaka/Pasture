@@ -1261,9 +1261,6 @@ mod tests {
         // The old formula (token.len() - inner.len()) counted total stripped chars
         // and attributed them all to the prefix, so prefix="a" and the comma was
         // lost.  The fix uses pointer arithmetic so prefix="" and suffix=",".
-        let msgs = vec![msg("contact alice@example.com, or bob@example.com.")];
-        // Note: '.' is NOT in trim_punct, so "bob@example.com." stays as inner="bob@example.com."
-        // which does NOT match looks_like_email — only alice is affected by the bug fix.
         let msgs_comma = vec![msg("contact alice@example.com, for help")];
         let (out, mapping) = pseudonymize_messages(&msgs_comma);
         let c = &out[0].content;

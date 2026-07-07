@@ -3744,7 +3744,6 @@ pub fn build_openai_response_with_injection(
 /// metric lines. Counter names follow Prometheus naming conventions (total suffix
 /// on counters, no suffix on gauges).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn build_metrics_response(
     s: &crate::cost::CostSummary,
     cache_hits: u64,
