@@ -781,7 +781,7 @@ fn test_build_stats_response_shape() {
 
 #[test]
 fn test_spec_documents_every_stats_response_field() {
-    // ADR-232: guard against SPEC.md / implementation drift for GET /v1/stats,
+    // ADR-233: guard against SPEC.md / implementation drift for GET /v1/stats,
     // mirroring config.rs's existing env-var drift guard (ADR-190). SPEC.md
     // §3.2c previously documented only a stale ~10-field subset of the
     // response while build_stats_response actually emits ~26 fields

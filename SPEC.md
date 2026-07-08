@@ -130,7 +130,7 @@ logged). Implemented by `handle_embeddings` (IMP-8 completion).
 `200`, JSON snapshot of the cost-log counters plus live in-memory state (IMP-metrics).
 Read-only and PII-free (I3); a missing cost log reads as all-zeros. No auth
 (localhost-default, I5). Implemented by `handle_stats` (ADR-038); field-complete as
-of ADR-232 (previously this section documented only a stale subset of the response).
+of ADR-233 (previously this section documented only a stale subset of the response).
 Full field list, in response order:
 
 | Field | Type | Meaning |
