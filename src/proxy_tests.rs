@@ -2529,6 +2529,35 @@ fn test_difficulty_signal_escalates_similar_prompt() {
 }
 
 #[test]
+fn test_difficulty_signal_never_escalates_when_local_only() {
+    // ADR-231 found this exact bug class in complete_cascade: PASTURE_LOCAL_ONLY
+    // is an absolute "never touch cloud" guarantee, but the difficulty signal
+    // (IMP-14) is a SECOND, independent escalation path in embedding_step that
+    // never checked it either -- `route` arriving as Local there could be a
+    // natural difficulty-based decision or local_only's unconditional override,
+    // indistinguishable without this check. With local_only set, a prompt
+    // "similar to known-hard" (which would otherwise escalate, per the sibling
+    // test_difficulty_signal_escalates_similar_prompt) must stay local.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(100, true, true).with_local_only(true);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "local-reply"))),
+        Some(Box::new(MockBackend::new("cloud", "cloud-reply"))),
+        &log,
+    )
+    .with_hard_prompts(vec!["a prompt my local model fumbles".to_string()], 0.9);
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = p.handle_chat(body).unwrap();
+    assert!(
+        resp.contains("\"x_pasture_route\":\"local\""),
+        "must never escalate to cloud when local_only is set: {resp}"
+    );
+    assert!(!resp.contains("cloud-reply"), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_difficulty_signal_concurrent_calls_consistent() {
     // ADR-154: similar_to_hard initialises the centroids once and computes the
     // per-request cosine off-lock. Many threads hitting it simultaneously must all

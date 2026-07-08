@@ -1317,8 +1317,17 @@ impl Proxy {
         // just bounce straight back to Local via route_decision's Cloud->Local
         // arm anyway — so skip computing it (and the embeddings() call below)
         // entirely rather than pay for a doomed round trip.
+        // ADR-231 found the same "escalation path skips local_only" bug in
+        // complete_cascade; the difficulty signal is a second, independent
+        // instance of the identical pattern -- `route` reaching here as Local
+        // could be a *natural* difficulty-based decision OR local_only's
+        // unconditional override, and this code could not tell the two apart.
+        // Without this check, PASTURE_LOCAL_ONLY=1 plus PASTURE_HARD_PROMPTS
+        // configured would still silently escalate a "similar to known-hard"
+        // prompt to cloud, contradicting the operator's explicit guarantee.
         let want_difficulty = !self.hard_prompts.is_empty()
             && route == Route::Local
+            && !self.engine.is_local_only()
             && self.cloud.is_some()
             && self.cloud_health.should_attempt(self.health_cooldown_secs);
         // Socratic follow-up to IMP-34 (ADR-224): the circuit breaker protects the
