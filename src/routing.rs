@@ -1155,6 +1155,19 @@ mod tests {
     }
 
     #[test]
+    fn test_local_only_overrides_explicit_cloud_pin() {
+        // local_only's early return (before the `forced` check) means it wins
+        // even over an explicit per-request model:"cloud" pin -- the correct,
+        // safe direction for an operator's "never touch cloud" guarantee to
+        // fail in (a stronger absolute guarantee beats a weaker per-request
+        // one). This interaction had no test coverage before this case.
+        let e = both().with_local_only(true);
+        let d = e.decide(&"x".repeat(10), Some(Route::Cloud)).unwrap();
+        assert_eq!(d.route, Route::Local);
+        assert!(d.reason.contains("local-only"), "reason: {}", d.reason);
+    }
+
+    #[test]
     fn test_local_only_no_local_errors() {
         let e = RoutingEngine::new(100, false, true).with_local_only(true);
         assert_eq!(

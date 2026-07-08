@@ -2871,6 +2871,35 @@ fn test_cascade_escalates_low_confidence() {
 }
 
 #[test]
+fn test_cascade_never_escalates_when_local_only() {
+    // ADR-231: PASTURE_LOCAL_ONLY is an absolute "never touch cloud" operator
+    // guarantee (decide_full enforces it even over an explicit model:"cloud"
+    // pin). But complete_cascade's low-confidence escalation is a SEPARATE
+    // routing decision made after decide_full already returned Local -- the
+    // dispatch gate that calls complete_cascade never checked local_only, so
+    // a low-confidence local answer would silently escalate to cloud despite
+    // the operator's explicit setting. This drives an escalation-triggering
+    // local answer through local_only and confirms it stays local.
+    let log = tmp_log();
+    let engine = RoutingEngine::new(10_000, true, true).with_local_only(true);
+    let p = Proxy::new(
+        engine,
+        Some(Box::new(MockBackend::new("local", "I don't know"))),
+        Some(Box::new(MockBackend::new("cloud", "the answer is 42"))),
+        &log,
+    )
+    .with_cascade(true);
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hard"}]}"#;
+    let resp = p.handle_chat(body).unwrap();
+    assert!(
+        resp.contains("\"x_pasture_route\":\"local\""),
+        "must never escalate to cloud when local_only is set: {resp}"
+    );
+    assert!(!resp.contains("the answer is 42"), "{resp}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn test_cascade_keeps_confident_local() {
     let log = tmp_log();
     let p = cascade_proxy(

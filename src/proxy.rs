@@ -2098,6 +2098,24 @@ impl Proxy {
             confidence,
             self.cascade_logprob_threshold,
         ) {
+            // ADR-231: PASTURE_LOCAL_ONLY is documented (and enforced in
+            // decide_full, which overrides even an explicit per-request
+            // model:"cloud" pin) as an absolute "never touch cloud" operator
+            // guarantee. But complete_cascade's escalation is a SEPARATE
+            // routing decision, made after decide_full already returned --
+            // the run_completion dispatch gate that calls complete_cascade
+            // only checks `self.cascade / !sensitive / planned_route==Local /
+            // both backends configured`, none of which mention local_only. An
+            // operator running with cascade enabled AND a cloud backend still
+            // configured (e.g. kept around for when local_only is later
+            // disabled) would have every low-confidence local answer silently
+            // escalated to cloud, contradicting their explicit setting. Check
+            // first, before the circuit-breaker/budget checks below: this is
+            // a stronger, unconditional guarantee, not a soft availability
+            // trade-off.
+            if self.engine.is_local_only() {
+                return Ok((local_resp, Route::Local, confidence, 0));
+            }
             // IMP-35/ADR-227: skip the escalation entirely when the cloud circuit
             // is open, BEFORE apply_budget_guard reserves any tokens — checking
             // first means there is nothing to roll back (unlike a cloud failure,
