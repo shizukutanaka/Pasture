@@ -529,13 +529,7 @@ impl Backend for OllamaBackend {
 
     fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
         let body = Self::build_body(req);
-        let response = http_post(
-            &self.host,
-            self.port,
-            "/api/chat",
-            &body,
-            self.timeout,
-        )?;
+        let response = http_post(&self.host, self.port, "/api/chat", &body, self.timeout)?;
         let content = Self::parse_response(&response)?;
         let prompt_tokens = crate::routing::estimate_tokens(&req.estimation_text()) as u64;
         let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
@@ -585,13 +579,7 @@ impl Backend for OllamaBackend {
     fn embeddings(&self, inputs: &[String]) -> Result<EmbeddingsResponse, BackendError> {
         // Ollama `/api/embed`: {"model","input":[..]} -> {"embeddings":[[..]]}.
         let body = embeddings_body(&self.model, inputs);
-        let resp = http_post(
-            &self.host,
-            self.port,
-            "/api/embed",
-            &body,
-            self.timeout,
-        )?;
+        let resp = http_post(&self.host, self.port, "/api/embed", &body, self.timeout)?;
         let v = parse(&resp).map_err(|e| BackendError::Protocol(e.to_string()))?;
         let vectors: Vec<Vec<f64>> = v
             .get("embeddings")
@@ -676,13 +664,7 @@ impl Backend for OpenAiCompatBackend {
         let mut shaped = req.clone();
         shaped.model = self.model.clone();
         let body = Provider::OpenAI.build_body(&shaped);
-        let resp_body = http_post(
-            &self.host,
-            self.port,
-            &self.path,
-            &body,
-            self.timeout,
-        )?;
+        let resp_body = http_post(&self.host, self.port, &self.path, &body, self.timeout)?;
         let (content, tool_calls, prompt_tokens, completion_tokens) =
             Provider::OpenAI.parse_response(&resp_body)?;
         Ok(CompletionResponse {
@@ -701,13 +683,7 @@ impl Backend for OpenAiCompatBackend {
         let mut shaped = req.clone();
         shaped.model = self.model.clone();
         let body = Provider::OpenAI.build_body_logprobs(&shaped);
-        let resp_body = http_post(
-            &self.host,
-            self.port,
-            &self.path,
-            &body,
-            self.timeout,
-        )?;
+        let resp_body = http_post(&self.host, self.port, &self.path, &body, self.timeout)?;
         let (content, tool_calls, prompt_tokens, completion_tokens) =
             Provider::OpenAI.parse_response(&resp_body)?;
         let confidence = crate::cloud::mean_logprob_from_openai(&resp_body);
@@ -765,10 +741,12 @@ impl Backend for OpenAiCompatBackend {
         }
         // Use actual usage from the stream; fall back to estimate only if the
         // backend did not send a usage chunk (ADR-173).
-        let (prompt_tokens, completion_tokens) = stream_usage.unwrap_or_else(|| (
-            crate::routing::estimate_tokens(&req.estimation_text()) as u64,
-            crate::routing::estimate_tokens(&content) as u64,
-        ));
+        let (prompt_tokens, completion_tokens) = stream_usage.unwrap_or_else(|| {
+            (
+                crate::routing::estimate_tokens(&req.estimation_text()) as u64,
+                crate::routing::estimate_tokens(&content) as u64,
+            )
+        });
         Ok(CompletionResponse {
             content,
             model: self.model.clone(),
@@ -782,13 +760,7 @@ impl Backend for OpenAiCompatBackend {
         // OpenAI-compatible `/v1/embeddings`: {"data":[{"embedding":[..]},..]}.
         let path = embeddings_path(&self.path);
         let body = embeddings_body(&self.model, inputs);
-        let resp = http_post(
-            &self.host,
-            self.port,
-            &path,
-            &body,
-            self.timeout,
-        )?;
+        let resp = http_post(&self.host, self.port, &path, &body, self.timeout)?;
         let v = parse(&resp).map_err(|e| BackendError::Protocol(e.to_string()))?;
         if let Some(err) = v.get("error") {
             let msg = err
@@ -831,13 +803,12 @@ fn send_json_post(
     timeout: Duration,
 ) -> Result<TcpStream, BackendError> {
     let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| {
-            // Log the full address for the operator; omit it from the client-
-            // facing message to avoid leaking internal network topology (ADR-157).
-            eprintln!("pasture: local backend connect {addr}: {e}");
-            BackendError::Transport(format!("local backend unreachable ({e})"))
-        })?;
+    let mut stream = TcpStream::connect(&addr).map_err(|e| {
+        // Log the full address for the operator; omit it from the client-
+        // facing message to avoid leaking internal network topology (ADR-157).
+        eprintln!("pasture: local backend connect {addr}: {e}");
+        BackendError::Transport(format!("local backend unreachable ({e})"))
+    })?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| BackendError::Transport(e.to_string()))?;
@@ -1050,8 +1021,14 @@ mod tests {
             ..Default::default()
         });
         let privacy = r.privacy_text();
-        assert!(privacy.contains("4111111111111111"), "tool-call args must be scanned");
-        assert!(!privacy.contains("SECRETSCHEMA"), "tool definitions must be excluded");
+        assert!(
+            privacy.contains("4111111111111111"),
+            "tool-call args must be scanned"
+        );
+        assert!(
+            !privacy.contains("SECRETSCHEMA"),
+            "tool definitions must be excluded"
+        );
         // The credit card is now visible to the classifier.
         assert!(crate::privacy::classify(&privacy).is_sensitive());
         assert!(!crate::privacy::classify(&r.routing_text()).is_sensitive());

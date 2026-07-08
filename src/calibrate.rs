@@ -222,15 +222,12 @@ pub fn load_labeled_logprobs(path: &str) -> Result<Vec<LabeledLogprob>, String> 
             continue;
         }
         let val = crate::json::parse(line).map_err(|e| format!("{path}:{}: {e}", lineno + 1))?;
-        let logprob = val
-            .get("logprob")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| {
-                format!(
-                    "{path}:{}: missing or non-numeric 'logprob' field",
-                    lineno + 1
-                )
-            })?;
+        let logprob = val.get("logprob").and_then(|v| v.as_f64()).ok_or_else(|| {
+            format!(
+                "{path}:{}: missing or non-numeric 'logprob' field",
+                lineno + 1
+            )
+        })?;
         if !logprob.is_finite() {
             return Err(format!("{path}:{}: 'logprob' must be finite", lineno + 1));
         }
@@ -312,7 +309,10 @@ mod tests {
             actual <= 0.5 + 1e-9,
             "achieved {actual} must not exceed target 0.5 (threshold {thr})"
         );
-        assert!((rate - actual).abs() < 1e-9, "reported rate must match actual");
+        assert!(
+            (rate - actual).abs() < 1e-9,
+            "reported rate must match actual"
+        );
     }
 
     #[test]
@@ -471,12 +471,19 @@ mod tests {
         for (name, body, want) in [
             ("missing_lp", "{\"correct\": true}\n", "logprob"),
             ("missing_c", "{\"logprob\": -0.5}\n", "correct"),
-            ("string_c", "{\"logprob\": -0.5, \"correct\": \"yes\"}\n", "correct"),
+            (
+                "string_c",
+                "{\"logprob\": -0.5, \"correct\": \"yes\"}\n",
+                "correct",
+            ),
             ("not_json", "not json\n", ""),
         ] {
             let p = tmp_labels(name, body);
             let err = load_labeled_logprobs(p.to_str().unwrap()).unwrap_err();
-            assert!(err.contains(":1:"), "{name}: error must cite the line: {err}");
+            assert!(
+                err.contains(":1:"),
+                "{name}: error must cite the line: {err}"
+            );
             assert!(err.contains(want), "{name}: {err}");
             let _ = std::fs::remove_file(&p);
         }

@@ -177,10 +177,7 @@ mod tests {
         let v = crate::json::parse(&line);
         assert!(v.is_ok(), "span JSONL must be valid JSON: {line}");
         let v = v.unwrap();
-        assert_eq!(
-            v.get("name").and_then(|x| x.as_str()),
-            Some("gen_ai.chat")
-        );
+        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("gen_ai.chat"));
     }
 
     #[test]
@@ -191,15 +188,9 @@ mod tests {
         span.output_tokens = 5;
         span.route = "cloud";
         let line = span.to_jsonl();
-        assert!(
-            line.contains("\"gen_ai.system\":\"anthropic\""),
-            "{line}"
-        );
+        assert!(line.contains("\"gen_ai.system\":\"anthropic\""), "{line}");
         assert!(line.contains("\"pasture.route\":\"cloud\""), "{line}");
-        assert!(
-            line.contains("\"gen_ai.usage.input_tokens\":10"),
-            "{line}"
-        );
+        assert!(line.contains("\"gen_ai.usage.input_tokens\":10"), "{line}");
         assert!(line.contains("\"status\":\"ok\""), "{line}");
     }
 

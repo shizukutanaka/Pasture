@@ -173,7 +173,14 @@ impl Improvement {
             "breaking change",
         ];
         const MEDIUM: &[&str] = &[
-            "routing", "route", "cache", "cloud", "escalat", "threshold", "backend", "model",
+            "routing",
+            "route",
+            "cache",
+            "cloud",
+            "escalat",
+            "threshold",
+            "backend",
+            "model",
         ];
         if HIGH.iter().any(|k| hay.contains(k)) {
             Risk::High
@@ -258,7 +265,10 @@ pub fn parse_line(line: &str) -> Option<Improvement> {
         effect: s("effect"),
         status,
         grounding: s("grounding"),
-        risk: v.get("risk").and_then(JsonValue::as_str).and_then(Risk::from_str),
+        risk: v
+            .get("risk")
+            .and_then(JsonValue::as_str)
+            .and_then(Risk::from_str),
     })
 }
 

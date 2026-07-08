@@ -223,8 +223,7 @@ pub fn run_eval_owned(engine: &RoutingEngine, cases: &[OwnedEvalCase]) -> EvalRe
 /// ```
 pub fn load_eval_cases(path: &str) -> Result<Vec<OwnedEvalCase>, String> {
     use std::io::{BufRead, BufReader};
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
     let reader = BufReader::new(file);
     let mut cases = Vec::new();
     for (lineno, line_res) in reader.lines().enumerate() {
@@ -233,13 +232,15 @@ pub fn load_eval_cases(path: &str) -> Result<Vec<OwnedEvalCase>, String> {
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
-        let val = crate::json::parse(line)
-            .map_err(|e| format!("{path}:{}: {e}", lineno + 1))?;
+        let val = crate::json::parse(line).map_err(|e| format!("{path}:{}: {e}", lineno + 1))?;
         let prompt = val
             .get("prompt")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                format!("{path}:{}: missing or non-string 'prompt' field", lineno + 1)
+                format!(
+                    "{path}:{}: missing or non-string 'prompt' field",
+                    lineno + 1
+                )
             })?
             .to_string();
         if prompt.is_empty() {
@@ -249,7 +250,10 @@ pub fn load_eval_cases(path: &str) -> Result<Vec<OwnedEvalCase>, String> {
             .get("expected")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                format!("{path}:{}: missing or non-string 'expected' field", lineno + 1)
+                format!(
+                    "{path}:{}: missing or non-string 'expected' field",
+                    lineno + 1
+                )
             })?;
         let expected = match expected_str {
             "local" => Route::Local,
@@ -332,7 +336,10 @@ mod tests {
         assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(18.0));
         assert_eq!(v.get("correct").and_then(|x| x.as_f64()), Some(18.0));
         assert_eq!(v.get("threshold").and_then(|x| x.as_f64()), Some(300.0));
-        assert_eq!(v.get("missed_escalations").and_then(|x| x.as_f64()), Some(0.0));
+        assert_eq!(
+            v.get("missed_escalations").and_then(|x| x.as_f64()),
+            Some(0.0)
+        );
         assert!((v.get("accuracy").and_then(|x| x.as_f64()).unwrap() - 1.0).abs() < 1e-9);
     }
 
@@ -395,7 +402,11 @@ mod tests {
         let p = tmp_path("basic");
         let mut f = std::fs::File::create(&p).unwrap();
         writeln!(f, r#"{{"prompt":"hi","expected":"local"}}"#).unwrap();
-        writeln!(f, r#"{{"prompt":"prove sqrt(2) irrational","expected":"cloud"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"prompt":"prove sqrt(2) irrational","expected":"cloud"}}"#
+        )
+        .unwrap();
         let cases = load_eval_cases(p.to_str().unwrap()).unwrap();
         assert_eq!(cases.len(), 2);
         assert_eq!(cases[0].prompt, "hi");
@@ -448,13 +459,15 @@ mod tests {
                 expected: Route::Local,
             },
             OwnedEvalCase {
-                prompt: "prove that the square root of two is irrational, step by step"
-                    .to_string(),
+                prompt: "prove that the square root of two is irrational, step by step".to_string(),
                 expected: Route::Cloud,
             },
         ];
         let report = run_eval_owned(&engine, &cases);
         assert_eq!(report.total, 2);
-        assert_eq!(report.correct, 2, "run_eval_owned should match built-in routing");
+        assert_eq!(
+            report.correct, 2,
+            "run_eval_owned should match built-in routing"
+        );
     }
 }

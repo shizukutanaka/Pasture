@@ -142,7 +142,7 @@ mod tests {
             assert!(rl.step(0.0));
         }
         assert!(!rl.step(0.0)); // empty
-        // Need one whole token at 1/sec -> 1 second.
+                                // Need one whole token at 1/sec -> 1 second.
         assert_eq!(rl.retry_after_secs(), 1);
     }
 
@@ -153,7 +153,7 @@ mod tests {
             assert!(rl.step(0.0));
         }
         assert!(!rl.step(0.0)); // empty
-        // Need one token at 0.5/sec -> 2 seconds.
+                                // Need one token at 0.5/sec -> 2 seconds.
         assert_eq!(rl.retry_after_secs(), 2);
     }
 

@@ -165,7 +165,13 @@ impl SemanticCache {
     /// Store an embedding → response pair, evicting the oldest when over capacity.
     /// `model` (ADR-158) and `sampling` (ADR-159, from `sampling_key`) are stored
     /// to prevent cross-model and cross-sampling hits.
-    pub fn put(&mut self, embedding: Vec<f64>, model: String, sampling: u64, resp: CompletionResponse) {
+    pub fn put(
+        &mut self,
+        embedding: Vec<f64>,
+        model: String,
+        sampling: u64,
+        resp: CompletionResponse,
+    ) {
         if self.cap == 0 {
             return;
         }
@@ -411,7 +417,10 @@ mod tests {
         // Leading/trailing whitespace should not produce different keys.
         assert_eq!(request_key(&req("m", "hi")), request_key(&req("m", "hi ")));
         assert_eq!(request_key(&req("m", "hi")), request_key(&req("m", " hi")));
-        assert_eq!(request_key(&req("m", "hi")), request_key(&req("m", "  hi  ")));
+        assert_eq!(
+            request_key(&req("m", "hi")),
+            request_key(&req("m", "  hi  "))
+        );
         // But distinct content must still differ.
         assert_ne!(request_key(&req("m", "hi")), request_key(&req("m", "bye")));
     }
@@ -430,11 +439,15 @@ mod tests {
         // otherwise a book(NYC) conversation could be served a cached book(LON) reply.
         let base = req("m", "book a flight");
         let mut with_nyc = req("m", "book a flight");
-        with_nyc.messages[0].tool_calls_json =
-            Some(r#"[{"id":"c1","function":{"name":"book","arguments":"{\"to\":\"NYC\"}"}}]"#.to_string());
+        with_nyc.messages[0].tool_calls_json = Some(
+            r#"[{"id":"c1","function":{"name":"book","arguments":"{\"to\":\"NYC\"}"}}]"#
+                .to_string(),
+        );
         let mut with_lon = req("m", "book a flight");
-        with_lon.messages[0].tool_calls_json =
-            Some(r#"[{"id":"c1","function":{"name":"book","arguments":"{\"to\":\"LON\"}"}}]"#.to_string());
+        with_lon.messages[0].tool_calls_json = Some(
+            r#"[{"id":"c1","function":{"name":"book","arguments":"{\"to\":\"LON\"}"}}]"#
+                .to_string(),
+        );
         // tool_calls present must differ from none, and the two argument sets must differ.
         assert_ne!(request_key(&base), request_key(&with_nyc));
         assert_ne!(request_key(&with_nyc), request_key(&with_lon));
@@ -542,7 +555,7 @@ mod tests {
         let mut c = ResponseCache::new(4);
         c.max_age = Some(Duration::from_nanos(1)); // effectively instant expiry
         c.put(1, resp("a")); // inserted now
-        // Yield to let the Instant advance past 1ns.
+                             // Yield to let the Instant advance past 1ns.
         std::thread::sleep(Duration::from_millis(1));
         // Entry should be expired.
         let result = c.get(1);
@@ -561,7 +574,11 @@ mod tests {
         c.put(2, resp("b"));
         std::thread::sleep(Duration::from_millis(1));
         let _ = c.get(1); // expired, removed
-        assert_eq!(c.len(), 1, "expired entry should be removed, leaving only key 2");
+        assert_eq!(
+            c.len(),
+            1,
+            "expired entry should be removed, leaving only key 2"
+        );
     }
 
     #[test]
@@ -576,8 +593,12 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1));
         let _ = c.get(1); // expired → must remove from both map and order
         let _ = c.get(2); // expired → must remove from both map and order
-        // After both expire and are evicted on get(), the order deque must be empty.
-        assert_eq!(c.order.len(), 0, "order deque must not retain ghost entries after TTL expiry");
+                          // After both expire and are evicted on get(), the order deque must be empty.
+        assert_eq!(
+            c.order.len(),
+            0,
+            "order deque must not retain ghost entries after TTL expiry"
+        );
         // Re-fill to capacity: FIFO eviction must still work correctly (no phantom pops).
         c.max_age = None;
         c.put(3, resp("c"));
@@ -586,7 +607,10 @@ mod tests {
         c.put(6, resp("f"));
         assert_eq!(c.len(), 4);
         c.put(7, resp("g")); // evicts key 3
-        assert!(c.get(3).is_none(), "FIFO eviction must still work after TTL-expiry cleanup");
+        assert!(
+            c.get(3).is_none(),
+            "FIFO eviction must still work after TTL-expiry cleanup"
+        );
         assert!(c.get(7).is_some());
     }
 
@@ -712,7 +736,12 @@ mod tests {
         let mut c = SemanticCache::new(4, 0.9);
         let v = vec![1.0_f64, 0.0];
         // Stored under sampling signature 111 (e.g. temperature:0, deterministic).
-        c.put(v.clone(), "m".to_string(), 111, resp("deterministic answer"));
+        c.put(
+            v.clone(),
+            "m".to_string(),
+            111,
+            resp("deterministic answer"),
+        );
         // Same embedding + model but a different sampling signature → miss.
         let hit = c.find_similar(&v, "m", 222);
         assert!(
@@ -762,10 +791,27 @@ mod tests {
     #[test]
     fn test_sampling_key_distinguishes_temperature() {
         use crate::backend::SamplingParams;
-        let t0 = SamplingParams { temperature: Some(0.0), ..Default::default() };
-        let t1 = SamplingParams { temperature: Some(1.0), ..Default::default() };
-        let t0b = SamplingParams { temperature: Some(0.0), ..Default::default() };
-        assert_ne!(sampling_key(&t0), sampling_key(&t1), "temp 0 vs 1 must differ");
-        assert_eq!(sampling_key(&t0), sampling_key(&t0b), "same params must match");
+        let t0 = SamplingParams {
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        let t1 = SamplingParams {
+            temperature: Some(1.0),
+            ..Default::default()
+        };
+        let t0b = SamplingParams {
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        assert_ne!(
+            sampling_key(&t0),
+            sampling_key(&t1),
+            "temp 0 vs 1 must differ"
+        );
+        assert_eq!(
+            sampling_key(&t0),
+            sampling_key(&t0b),
+            "same params must match"
+        );
     }
 }

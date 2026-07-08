@@ -595,7 +595,10 @@ mod tests {
             logprob: Some(f64::NAN),
         };
         let line = r.to_jsonl();
-        assert!(crate::json::parse(&line).is_ok(), "line must be valid JSON: {line}");
+        assert!(
+            crate::json::parse(&line).is_ok(),
+            "line must be valid JSON: {line}"
+        );
         assert!(!line.contains("inf"), "inf must not appear in JSONL");
         assert!(!line.contains("NaN"), "NaN must not appear in JSONL");
     }

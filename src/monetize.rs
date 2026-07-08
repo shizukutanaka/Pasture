@@ -173,9 +173,13 @@ mod tests {
         let r2 = referral_url("openrouter", |_| Some("ftp://example.com".to_string()));
         assert!(r2.is_none(), "non-HTTP scheme should be None");
         // HTTP and HTTPS are accepted.
-        let r3 = referral_url("openrouter", |_| Some("https://openrouter.ai/?ref=x".to_string()));
+        let r3 = referral_url("openrouter", |_| {
+            Some("https://openrouter.ai/?ref=x".to_string())
+        });
         assert!(r3.is_some());
-        let r4 = referral_url("openrouter", |_| Some("http://openrouter.ai/?ref=x".to_string()));
+        let r4 = referral_url("openrouter", |_| {
+            Some("http://openrouter.ai/?ref=x".to_string())
+        });
         assert!(r4.is_some());
     }
 

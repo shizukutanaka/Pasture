@@ -424,7 +424,9 @@ pub fn parse_openai_stream_line(line: &str) -> Option<OpenAiStreamEvent> {
     {
         return Some(OpenAiStreamEvent::ToolCallDelta(tc.to_json_string()));
     }
-    let content = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str());
+    let content = delta
+        .and_then(|d| d.get("content"))
+        .and_then(|c| c.as_str());
     match content {
         Some(c) if !c.is_empty() => Some(OpenAiStreamEvent::Delta(c.to_string())),
         _ => None,
@@ -550,7 +552,10 @@ pub fn parse_anthropic_stream_line(line: &str) -> Option<OpenAiStreamEvent> {
                 // input_json_delta: partial_json is a raw JSON fragment; escape it
                 // into an arguments string delta for ToolCallAccumulator (ADR-179).
                 Some("input_json_delta") => {
-                    let partial = delta.get("partial_json").and_then(|v| v.as_str()).unwrap_or("");
+                    let partial = delta
+                        .get("partial_json")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let frag = format!(
                         "[{{\"index\":{idx},\"function\":{{\"arguments\":\"{}\"}}}}]",
                         escape_string(partial)
@@ -677,7 +682,15 @@ pub fn read_sse_body<R: std::io::Read>(
     let mut line_buf: Vec<u8> = Vec::new();
     let mut stream_usage: Option<(u64, u64)> = None;
     let mut tool_acc = ToolCallAccumulator::default();
-    emit_sse_lines(provider, &mut line_buf, &pending, &mut content, on_delta, &mut stream_usage, &mut tool_acc);
+    emit_sse_lines(
+        provider,
+        &mut line_buf,
+        &pending,
+        &mut content,
+        on_delta,
+        &mut stream_usage,
+        &mut tool_acc,
+    );
     loop {
         let n = reader
             .read(&mut chunk)
@@ -685,7 +698,15 @@ pub fn read_sse_body<R: std::io::Read>(
         if n == 0 {
             break;
         }
-        emit_sse_lines(provider, &mut line_buf, &chunk[..n], &mut content, on_delta, &mut stream_usage, &mut tool_acc);
+        emit_sse_lines(
+            provider,
+            &mut line_buf,
+            &chunk[..n],
+            &mut content,
+            on_delta,
+            &mut stream_usage,
+            &mut tool_acc,
+        );
     }
     let tool_calls = tool_acc.finish();
     // A pure tool-call stream has empty content but a tool_calls array, so the
@@ -757,7 +778,10 @@ fn translate_openai_tool_calls_to_anthropic_blocks(tool_calls_json: &str) -> Vec
             let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
             // `arguments` is a JSON-stringified object; parse it back so Anthropic
             // receives a proper object in `input` (not a string).
-            let args_str = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+            let args_str = func
+                .get("arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
             let input_json = if let Ok(parsed) = parse(args_str) {
                 parsed.to_json_string()
             } else {
@@ -797,7 +821,10 @@ fn translate_tool_choice_to_anthropic(tc: &JsonValue) -> String {
             if name.is_empty() {
                 return String::new();
             }
-            format!(",\"tool_choice\":{{\"type\":\"tool\",\"name\":\"{}\"}}", escape_string(name))
+            format!(
+                ",\"tool_choice\":{{\"type\":\"tool\",\"name\":\"{}\"}}",
+                escape_string(name)
+            )
         }
         _ => String::new(),
     }
@@ -816,7 +843,10 @@ fn translate_tools_to_anthropic(tools: &JsonValue) -> String {
         .filter_map(|t| {
             let func = t.get("function")?;
             let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let desc = func.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = func
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             // OpenAI `parameters` → Anthropic `input_schema` (same JSON Schema object).
             let schema_json = func
                 .get("parameters")
@@ -1026,10 +1056,12 @@ mod transport {
             let result = read_sse_body(&mut stream, self.provider, on_delta)?;
             // Use actual usage from the stream; fall back to estimate only if
             // the backend did not send a usage chunk (ADR-173).
-            let (prompt_tokens, completion_tokens) = result.usage.unwrap_or_else(|| (
-                crate::routing::estimate_tokens(&req.estimation_text()) as u64,
-                crate::routing::estimate_tokens(&result.content) as u64,
-            ));
+            let (prompt_tokens, completion_tokens) = result.usage.unwrap_or_else(|| {
+                (
+                    crate::routing::estimate_tokens(&req.estimation_text()) as u64,
+                    crate::routing::estimate_tokens(&result.content) as u64,
+                )
+            });
             Ok(CompletionResponse {
                 content: result.content,
                 model: self.model.clone(),
@@ -1050,13 +1082,12 @@ mod transport {
     ) -> Result<native_tls::TlsStream<TcpStream>, BackendError> {
         let connector = native_tls::TlsConnector::new()
             .map_err(|e| BackendError::Transport(format!("tls init: {e}")))?;
-        let tcp = TcpStream::connect((host, 443))
-            .map_err(|e| {
-                // Log the full hostname for the operator; sanitize the client-
-                // facing message to avoid leaking internal topology (ADR-157).
-                eprintln!("pasture: cloud backend connect {host}: {e}");
-                BackendError::Transport(format!("cloud backend unreachable ({e})"))
-            })?;
+        let tcp = TcpStream::connect((host, 443)).map_err(|e| {
+            // Log the full hostname for the operator; sanitize the client-
+            // facing message to avoid leaking internal topology (ADR-157).
+            eprintln!("pasture: cloud backend connect {host}: {e}");
+            BackendError::Transport(format!("cloud backend unreachable ({e})"))
+        })?;
         let mut stream = connector
             .connect(host, tcp)
             .map_err(|e| BackendError::Transport(format!("tls handshake: {e}")))?;
@@ -1186,8 +1217,14 @@ mod tests {
             r#"[{"type":"function","function":{"name":"get_weather","description":"Get the weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}}]"#,
         ).unwrap());
         let b = Provider::Anthropic.build_body(&r);
-        assert!(b.contains("\"input_schema\""), "Anthropic format uses input_schema, not parameters: {b}");
-        assert!(!b.contains("\"parameters\""), "parameters must be renamed to input_schema: {b}");
+        assert!(
+            b.contains("\"input_schema\""),
+            "Anthropic format uses input_schema, not parameters: {b}"
+        );
+        assert!(
+            !b.contains("\"parameters\""),
+            "parameters must be renamed to input_schema: {b}"
+        );
         assert!(b.contains("\"name\":\"get_weather\""), "{b}");
         assert!(b.contains("\"description\":\"Get the weather\""), "{b}");
         assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
@@ -1205,7 +1242,10 @@ mod tests {
         // ADR-179: Anthropic rejects stream_options; only "stream":true should be added.
         let b = Provider::Anthropic.build_body_stream(&req());
         assert!(b.contains("\"stream\":true"), "{b}");
-        assert!(!b.contains("stream_options"), "stream_options is OpenAI-only: {b}");
+        assert!(
+            !b.contains("stream_options"),
+            "stream_options is OpenAI-only: {b}"
+        );
         assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
     }
 
@@ -1260,7 +1300,10 @@ mod tests {
     fn test_anthropic_body_translates_tool_choice_auto() {
         // ADR-180: tool_choice:"auto" → {"type":"auto"}
         let mut r = req();
-        r.sampling.tools = Some(crate::json::parse(r#"[{"type":"function","function":{"name":"f","parameters":{}}}]"#).unwrap());
+        r.sampling.tools = Some(
+            crate::json::parse(r#"[{"type":"function","function":{"name":"f","parameters":{}}}]"#)
+                .unwrap(),
+        );
         r.sampling.tool_choice = Some(crate::json::parse(r#""auto""#).unwrap());
         let b = Provider::Anthropic.build_body(&r);
         assert!(b.contains("\"tool_choice\":{\"type\":\"auto\"}"), "{b}");
@@ -1271,7 +1314,10 @@ mod tests {
     fn test_anthropic_body_translates_tool_choice_required() {
         // ADR-180: tool_choice:"required" → {"type":"any"}
         let mut r = req();
-        r.sampling.tools = Some(crate::json::parse(r#"[{"type":"function","function":{"name":"f","parameters":{}}}]"#).unwrap());
+        r.sampling.tools = Some(
+            crate::json::parse(r#"[{"type":"function","function":{"name":"f","parameters":{}}}]"#)
+                .unwrap(),
+        );
         r.sampling.tool_choice = Some(crate::json::parse(r#""required""#).unwrap());
         let b = Provider::Anthropic.build_body(&r);
         assert!(b.contains("\"tool_choice\":{\"type\":\"any\"}"), "{b}");
@@ -1282,10 +1328,20 @@ mod tests {
     fn test_anthropic_body_translates_tool_choice_named_function() {
         // ADR-180: {"type":"function","function":{"name":"get_weather"}} → {"type":"tool","name":"get_weather"}
         let mut r = req();
-        r.sampling.tools = Some(crate::json::parse(r#"[{"type":"function","function":{"name":"get_weather","parameters":{}}}]"#).unwrap());
-        r.sampling.tool_choice = Some(crate::json::parse(r#"{"type":"function","function":{"name":"get_weather"}}"#).unwrap());
+        r.sampling.tools = Some(
+            crate::json::parse(
+                r#"[{"type":"function","function":{"name":"get_weather","parameters":{}}}]"#,
+            )
+            .unwrap(),
+        );
+        r.sampling.tool_choice = Some(
+            crate::json::parse(r#"{"type":"function","function":{"name":"get_weather"}}"#).unwrap(),
+        );
         let b = Provider::Anthropic.build_body(&r);
-        assert!(b.contains("\"tool_choice\":{\"type\":\"tool\",\"name\":\"get_weather\"}"), "{b}");
+        assert!(
+            b.contains("\"tool_choice\":{\"type\":\"tool\",\"name\":\"get_weather\"}"),
+            "{b}"
+        );
         assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");
     }
 
@@ -1313,12 +1369,18 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut cur = std::io::Cursor::new(resp.as_bytes().to_vec());
         let r = read_sse_body(&mut cur, Provider::Anthropic, &mut |_| {}).unwrap();
         assert_eq!(r.content, "", "pure tool_use has empty text content");
-        let tc = r.tool_calls.expect("tool_calls accumulated from Anthropic stream");
+        let tc = r
+            .tool_calls
+            .expect("tool_calls accumulated from Anthropic stream");
         assert!(tc.contains("\"name\":\"get_weather\""), "{tc}");
         assert!(tc.contains("\"id\":\"toolu_01\""), "{tc}");
         // arguments: the two partial_json fragments concatenated
         assert!(tc.contains("location"), "{tc}");
-        assert_eq!(r.usage, Some((20, 15)), "usage from message_start+message_delta");
+        assert_eq!(
+            r.usage,
+            Some((20, 15)),
+            "usage from message_start+message_delta"
+        );
     }
 
     #[test]
@@ -1531,7 +1593,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut acc = ToolCallAccumulator::default();
         acc.push(r#"[{"index":0,"id":"a","type":"function","function":{"name":"f","arguments":"{\"x\":"}}]"#);
         acc.push(r#"[{"index":0,"function":{"arguments":"1}"}}]"#);
-        acc.push(r#"[{"index":1,"id":"b","type":"function","function":{"name":"g","arguments":"{}"}}]"#);
+        acc.push(
+            r#"[{"index":1,"id":"b","type":"function","function":{"name":"g","arguments":"{}"}}]"#,
+        );
         let out = acc.finish().unwrap();
         let v = parse(&out).unwrap();
         let arr = v.as_array().unwrap();
@@ -1638,7 +1702,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         // "a\r\n" declares 10 bytes but only 5 ("hello") follow.
         let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\nhello";
         let err = parse_http_response(raw);
-        assert!(err.is_err(), "truncated chunk must be an error, not silent partial data");
+        assert!(
+            err.is_err(),
+            "truncated chunk must be an error, not silent partial data"
+        );
     }
 
     #[test]
@@ -1709,7 +1776,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         ];
         let b = Provider::Anthropic.build_body(&r);
         // Must be role:"user" (Anthropic form), not role:"tool"
-        assert!(!b.contains("\"role\":\"tool\""), "Anthropic must not emit role:tool: {b}");
+        assert!(
+            !b.contains("\"role\":\"tool\""),
+            "Anthropic must not emit role:tool: {b}"
+        );
         assert!(b.contains("\"role\":\"user\""), "{b}");
         assert!(b.contains("\"type\":\"tool_result\""), "{b}");
         assert!(b.contains("\"tool_use_id\":\"toolu_01\""), "{b}");
@@ -1744,7 +1814,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
         let b = Provider::OpenAI.build_body(&r);
-        assert!(b.contains("\"content\":null"), "content must be null for tool-call assistant: {b}");
+        assert!(
+            b.contains("\"content\":null"),
+            "content must be null for tool-call assistant: {b}"
+        );
         assert!(b.contains("\"tool_calls\":["), "{b}");
         assert!(b.contains("get_weather"), "{b}");
         assert!(crate::json::parse(&b).is_ok(), "valid JSON: {b}");

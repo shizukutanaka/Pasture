@@ -291,9 +291,7 @@ impl Parser<'_> {
                                     self.pos += 2; // consume the "\u"
                                     let low = self.parse_unicode_escape()?;
                                     if (0xDC00..=0xDFFF).contains(&low) {
-                                        let c = 0x10000
-                                            + ((code - 0xD800) << 10)
-                                            + (low - 0xDC00);
+                                        let c = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
                                         // ADR-108: c ∈ U+10000..U+10FFFF, always valid.
                                         char::from_u32(c).unwrap()
                                     } else {

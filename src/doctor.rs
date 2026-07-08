@@ -125,8 +125,9 @@ fn tcp_get(host: &str, port: u16, path: &str, timeout: Duration) -> Option<Strin
     // RFC 7230 §5.4: the Host header must include the port for non-standard
     // ports. Keep the original `host` (with brackets if IPv6) for the header.
     let host_header = format!("{host}:{port}");
-    let req =
-        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nAccept: */*\r\n\r\n");
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nAccept: */*\r\n\r\n"
+    );
     stream.write_all(req.as_bytes()).ok()?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).ok()?;
@@ -245,13 +246,14 @@ mod tests {
             if let Ok((mut s, _)) = listener.accept() {
                 let mut buf = [0u8; 512];
                 let _ = s.read(&mut buf);
-                let _ = s.write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}\n",
-                );
+                let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}\n");
             }
         });
         let st = probe_ollama("127.0.0.1", addr.port());
-        assert!(!st.reachable, "404 response must not be treated as reachable");
+        assert!(
+            !st.reachable,
+            "404 response must not be treated as reachable"
+        );
         assert!(st.models.is_empty());
     }
 }
