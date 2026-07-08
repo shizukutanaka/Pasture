@@ -780,6 +780,69 @@ fn test_build_stats_response_shape() {
 }
 
 #[test]
+fn test_spec_documents_every_stats_response_field() {
+    // ADR-232: guard against SPEC.md / implementation drift for GET /v1/stats,
+    // mirroring config.rs's existing env-var drift guard (ADR-190). SPEC.md
+    // §3.2c previously documented only a stale ~10-field subset of the
+    // response while build_stats_response actually emits ~26 fields
+    // (cache/semantic-cache occupancy, budget, PII tallies, local_health,
+    // and the IMP-35 cloud_health fields were all undocumented). This parses
+    // the literal `"field_name":` keys out of build_stats_response's own
+    // format string and asserts each one appears as a `` `field_name` ``
+    // markdown code span somewhere in SPEC.md, so a future field addition
+    // that forgets the doc update fails CI instead of silently drifting.
+    let src = include_str!("proxy.rs");
+    let start = src
+        .find("pub fn build_stats_response(")
+        .expect("build_stats_response must exist");
+    let body_start = src[start..].find("format!(").map(|i| start + i).unwrap();
+    let end = body_start
+        + src[body_start..]
+            .find("\n    )\n}")
+            .expect("format! call must end with `\\n    )\\n}`");
+    let body = &src[body_start..end];
+    // Walk `\"..\"` quote pairs (the literal two-byte `\"` escape as it
+    // appears in this source file's raw text) and keep a candidate only when
+    // immediately followed by `\":` -- i.e. it is a JSON *key*, not a value
+    // like `\"pasture.stats\"` or `\"healthy\"`.
+    let mut fields = std::collections::BTreeSet::new();
+    let mut pos = 0usize;
+    while let Some(rel) = body[pos..].find("\\\"") {
+        let key_start = pos + rel + 2;
+        let Some(rel2) = body[key_start..].find("\\\"") else {
+            break;
+        };
+        let key_end = key_start + rel2;
+        let name = &body[key_start..key_end];
+        if body[key_end..].starts_with("\\\":")
+            && !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
+        {
+            fields.insert(name.to_string());
+        }
+        pos = key_end + 2;
+    }
+    assert!(
+        fields.len() >= 20,
+        "sanity check: expected ~26 stats fields, parsed only {fields:?} -- \
+         did build_stats_response's format string shape change?"
+    );
+    let spec_path = concat!(env!("CARGO_MANIFEST_DIR"), "/SPEC.md");
+    let spec = std::fs::read_to_string(spec_path).expect("SPEC.md must be readable");
+    let undocumented: Vec<&String> = fields
+        .iter()
+        .filter(|f| !spec.contains(&format!("`{f}`")))
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "these /v1/stats response fields are emitted by build_stats_response \
+         but undocumented in SPEC.md §3.2c: {undocumented:?}"
+    );
+}
+
+#[test]
 fn test_handle_stats_empty_log_is_zeros() {
     // A non-existent cost log reads as all-zeros (no error).
     let p = proxy_with(true, false, 100, "/no/such/cost-log.jsonl");

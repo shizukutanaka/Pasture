@@ -127,11 +127,35 @@ Privacy rules do not apply to embeddings (the vector is returned to the caller, 
 logged). Implemented by `handle_embeddings` (IMP-8 completion).
 
 ### 3.2c `GET /v1/stats`
-`200`, JSON snapshot of the cost-log counters (IMP-metrics):
-`{"object":"pasture.stats","total","local","cloud","cache","cloud_rate","cache_rate",`
-`"prompt_tokens","completion_tokens","cloud_cost_usd"}`. Read-only and PII-free (I3);
-a missing cost log reads as all-zeros. No auth (localhost-default, I5). Implemented by
-`handle_stats` (ADR-038).
+`200`, JSON snapshot of the cost-log counters plus live in-memory state (IMP-metrics).
+Read-only and PII-free (I3); a missing cost log reads as all-zeros. No auth
+(localhost-default, I5). Implemented by `handle_stats` (ADR-038); field-complete as
+of ADR-232 (previously this section documented only a stale subset of the response).
+Full field list, in response order:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `object` | string | always `"pasture.stats"` |
+| `total` | int | requests served, all routes |
+| `local` | int | requests served locally |
+| `cloud` | int | requests served by cloud |
+| `cache` | int | requests served from the exact-match cache |
+| `cloud_rate` | float | `cloud / total`, 4dp |
+| `cache_rate` | float | `cache / total`, 4dp |
+| `prompt_tokens` / `completion_tokens` | int | cumulative, from the cost log |
+| `cloud_cost_usd` | float | cumulative estimated cloud spend, 4dp |
+| `cache_hits` / `cache_misses` | int | exact-match cache (IMP-11) |
+| `cache_size` / `cache_capacity` | int | exact-match cache occupancy |
+| `semantic_cache_hits` / `semantic_cache_misses` | int | semantic cache (IMP-12) |
+| `semantic_cache_size` / `semantic_cache_capacity` | int | semantic cache occupancy |
+| `budget_daily_tokens_used` / `budget_daily_tokens_limit` | int | IMP-26 daily budget gauge; `limit:0` means unset |
+| `output_pii_categories` | object | category → count tally, response text (IMP-33) |
+| `input_pii_categories` | object | category → count tally, request text that triggered local-only routing (IMP-28) |
+| `local_health` | string | `"healthy"` \| `"degraded"` \| `"down"` (IMP-30) |
+| `local_health_last_error` | string \| null | last local-backend failure message (ADR-222) |
+| `cloud_health` | string | `"healthy"` \| `"degraded"` \| `"down"` (IMP-35, ADR-227) |
+| `cloud_health_last_error` | string \| null | last primary-cloud failure message; never set by the secondary/fallback provider |
+| `injection_guard_stats` | object | `"label:action"` → count tally, e.g. `"role_switch:blocked"` (IMP-20, ADR-225) |
 
 ### 3.2d `POST /v1/route`
 Routing **preview / dry-run** (ADR-198). Request body: a chat-completions body
