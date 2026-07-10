@@ -6,6 +6,11 @@ name = "pasture-donate"
 main = "donate-worker.js"
 compatibility_date = "2026-01-01"
 
+# SUCCESS_URL / CANCEL_URL: set these to YOUR OWN redirect pages below —
+# there is no default domain here (a placeholder like example.com would
+# silently redirect a real donor to a page that doesn't exist if you forgot
+# to edit it before deploying). requireEnv() in donate-worker.js rejects a
+# missing value with a clear 500 rather than falling back to a fake one.
 [vars]
-SUCCESS_URL = "https://example.com/thanks"
-CANCEL_URL  = "https://example.com/"
+SUCCESS_URL = ""
+CANCEL_URL  = ""
