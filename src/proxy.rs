@@ -2426,7 +2426,12 @@ impl Proxy {
 
     /// Serve `GET /metrics` in Prometheus text exposition format (IMP-metrics-prom).
     /// Exposes the same counters as `/v1/stats` but in the standard text format
-    /// consumed by Prometheus scrape targets and Grafana agent.
+    /// consumed by Prometheus scrape targets and Grafana agent. Also emits a
+    /// second, OTel GenAI semantic-convention-aligned series (`gen_ai_*` labels,
+    /// IMP-39) alongside the original `pasture_*` names so any Grafana
+    /// dashboard/collector built against the emerging OTel GenAI vocabulary
+    /// works against Pasture without translation. Both series are kept — no
+    /// existing metric name is removed or renamed.
     pub fn handle_metrics(&self) -> Result<String, ProxyError> {
         let s = self.live_cost_summary()?;
         let (live_hits, live_misses, cache_size, cache_cap) = self
@@ -3877,7 +3882,16 @@ pasture_budget_daily_tokens_used {budget_used}\n\
 pasture_budget_daily_tokens_limit {budget_limit}\n\
 # HELP pasture_estimated_savings_usd_total Estimated USD saved by serving requests locally, priced at the configured cloud rate\n\
 # TYPE pasture_estimated_savings_usd_total counter\n\
-pasture_estimated_savings_usd_total {savings}\n",
+pasture_estimated_savings_usd_total {savings}\n\
+# HELP gen_ai_client_token_usage_total Cumulative GenAI client token usage (IMP-39: OTel GenAI semantic-convention alias of pasture_prompt_tokens_total/pasture_completion_tokens_total, labelled per the gen_ai.token.type attribute; Pasture exposes cumulative counters here, not per-request histogram buckets, since it has no OTel SDK)\n\
+# TYPE gen_ai_client_token_usage_total counter\n\
+gen_ai_client_token_usage_total{{gen_ai_token_type=\"input\"}} {prompt_tokens}\n\
+gen_ai_client_token_usage_total{{gen_ai_token_type=\"output\"}} {completion_tokens}\n\
+# HELP gen_ai_requests_total Total requests by GenAI provider (IMP-39: OTel GenAI semantic-convention alias of pasture_requests_total, labelled per the gen_ai.provider.name attribute; \"cache\" is a Pasture-specific extension, not part of the OTel provider vocabulary)\n\
+# TYPE gen_ai_requests_total counter\n\
+gen_ai_requests_total{{gen_ai_provider_name=\"local\"}} {local}\n\
+gen_ai_requests_total{{gen_ai_provider_name=\"cloud\"}} {cloud}\n\
+gen_ai_requests_total{{gen_ai_provider_name=\"cache\"}} {cache}\n",
         local = s.local,
         cloud = s.cloud,
         cache = s.cache,

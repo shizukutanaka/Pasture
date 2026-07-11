@@ -311,6 +311,7 @@ second definition.
 |-----|-------|--------|
 | **IMP-36** | Embedded zero-dependency web dashboard at `GET /dashboard` | ✅ **SHIPPED (ADR-235)** — single self-contained HTML page, polls `/v1/stats`, no build step / no external assets |
 | **IMP-37** | `estimated_savings_usd` — money saved by local routing, priced at the configured cloud rate | ✅ **SHIPPED (ADR-236)** — `/v1/stats`, `/metrics`, and the dashboard |
+| **IMP-39** | OTel GenAI semantic-convention metric aliases on `/metrics` | ✅ **SHIPPED (ADR-237)** — `gen_ai_client_token_usage_total{gen_ai_token_type=…}` and `gen_ai_requests_total{gen_ai_provider_name=…}`, additive alongside the existing `pasture_*` series |
 
 **Found already-implemented by the survey (no work needed — recorded so the
 question is not re-opened):** cache-key correctness for `tools`/`response_format`
@@ -326,7 +327,6 @@ zero-dep/single-user/privacy wedge):**
 | IMP | Candidate | So-what / grounding |
 |-----|-----------|---------------------|
 | **IMP-38** | `POST /v1/responses` compatibility shim | OpenAI's Responses API is now the recommended surface; Codex CLI dropped chat/completions (early 2026). Clients pointed at chat-completions-only proxies get tool calls rendered as raw text. Translate `input`↔`messages` / `max_output_tokens`↔`max_tokens` in std-only JSON — highest-urgency compatibility item. |
-| **IMP-39** | OTel GenAI semantic-convention metric aliases | Alias `/metrics` names/labels to the OTel GenAI SemConv vocabulary (`gen_ai.usage.input_tokens`, `gen_ai.client.operation.duration`, …). No OTel SDK — Prometheus text suffices. Makes standard Grafana/collector dashboards work against Pasture. |
 | **IMP-40** | Task-shaped routing table (task-type × token-band → bias) | SLMs (Qwen3-4B/Phi-4, 2025-26) now sit within a few points of frontier models on JSON-extraction/classification but 15-20 behind on multi-step reasoning — *independent of length*. Token count is becoming the wrong sole axis; add cheap deterministic intent signals (JSON-schema regex, sequencing-marker counting) as a 2-D lookup that biases route. |
 | **IMP-41** | Category-aware cache TTL / temporal-bypass | Per-category cache policy keyed on the existing hard-signal classifier: temporal-keyword prompts ("today", "latest", a date) get short TTL or bypass; long-lived (code-explanation) get long TTL. Prevents stale semantic-cache answers. std-only regex + lookup. |
 | **IMP-42** | `pasture calibrate`-style routing-threshold report | RouteLLM's operational lesson: no universal threshold — calibrate on the user's own traffic. Replay logged prompts and report "at threshold X, Y% stay local." Extends the existing `calibrate` command. |

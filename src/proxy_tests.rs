@@ -1964,6 +1964,51 @@ fn test_metrics_response_shape() {
 }
 
 #[test]
+fn test_metrics_includes_otel_genai_aliases() {
+    // IMP-39: /metrics also emits an OTel GenAI semantic-convention-aligned
+    // series (gen_ai_* labels) alongside the original pasture_* names, so a
+    // dashboard built against the OTel vocabulary works without translation.
+    let s = crate::cost::CostSummary {
+        total: 10,
+        local: 7,
+        cloud: 2,
+        cache: 1,
+        prompt_tokens: 200,
+        completion_tokens: 100,
+        cloud_cost_usd: 0.005,
+        local_prompt_tokens: 140,
+        local_completion_tokens: 70,
+    };
+    let body = build_metrics_response(&s, 3, 8, 5, 50, 0, 0, 0, 0, 4200, 1_000_000, 0.0031);
+    assert!(
+        body.contains("gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"} 200"),
+        "{body}"
+    );
+    assert!(
+        body.contains("gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"} 100"),
+        "{body}"
+    );
+    assert!(
+        body.contains("gen_ai_requests_total{gen_ai_provider_name=\"local\"} 7"),
+        "{body}"
+    );
+    assert!(
+        body.contains("gen_ai_requests_total{gen_ai_provider_name=\"cloud\"} 2"),
+        "{body}"
+    );
+    assert!(
+        body.contains("gen_ai_requests_total{gen_ai_provider_name=\"cache\"} 1"),
+        "{body}"
+    );
+    // The original pasture_* series must still be present — this is an
+    // addition, not a rename (existing scrapers must not break).
+    assert!(
+        body.contains("pasture_requests_total{route=\"local\"} 7"),
+        "pasture_* series must remain: {body}"
+    );
+}
+
+#[test]
 fn test_metrics_wrong_method_returns_405() {
     let p = proxy_with(true, false, 100, "unused");
     let (status, _) = roundtrip(
