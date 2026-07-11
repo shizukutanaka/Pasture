@@ -292,6 +292,47 @@ second definition.
 
 ---
 
+## 4d. 2026 research refresh (IMP-36 → , from external survey)
+
+> Source: a mid-2026 web survey across three axes — (a) LLM routing/cascade/
+> confidence/semantic-cache **research**, (b) LLM-gateway **product** landscape
+> (LiteLLM, Portkey, OpenRouter, Cloudflare/Kong AI Gateway, vLLM Semantic
+> Router), and (c) **practitioner** signal (r/LocalLLaMA, KubeCon/engineering
+> blogs). Unlike §4c (an internal feature-interaction audit), these come from
+> outside the codebase. **Citation caveat:** several sources were reached via
+> search-result synthesis, not full-text fetch (arxiv.org/huggingface.co egress
+> was blocked during the survey); arXiv IDs below should be spot-checked against
+> the PDF before being treated as authoritative. All items preserve the
+> zero-dependency default build.
+
+**Shipped this round:**
+
+| IMP | Title | Status |
+|-----|-------|--------|
+| **IMP-36** | Embedded zero-dependency web dashboard at `GET /dashboard` | ✅ **SHIPPED (ADR-235)** — single self-contained HTML page, polls `/v1/stats`, no build step / no external assets |
+| **IMP-37** | `estimated_savings_usd` — money saved by local routing, priced at the configured cloud rate | ✅ **SHIPPED (ADR-236)** — `/v1/stats`, `/metrics`, and the dashboard |
+
+**Found already-implemented by the survey (no work needed — recorded so the
+question is not re-opened):** cache-key correctness for `tools`/`response_format`
+(already hashed, ADR-177/186); credential/API-key detection in cloud-bound text
+(already in `privacy.rs`: `sk-`, `ghp_`, `AKIA`, `AIza`, JWT, URL creds);
+sensitive prompts already bypass the semantic cache entirely (embedding is only
+computed when `!sensitive`); tool-capability routing signal (`has_tools`,
+ADR-228).
+
+**Candidate backlog (not yet built — priority order, each judged against the
+zero-dep/single-user/privacy wedge):**
+
+| IMP | Candidate | So-what / grounding |
+|-----|-----------|---------------------|
+| **IMP-38** | `POST /v1/responses` compatibility shim | OpenAI's Responses API is now the recommended surface; Codex CLI dropped chat/completions (early 2026). Clients pointed at chat-completions-only proxies get tool calls rendered as raw text. Translate `input`↔`messages` / `max_output_tokens`↔`max_tokens` in std-only JSON — highest-urgency compatibility item. |
+| **IMP-39** | OTel GenAI semantic-convention metric aliases | Alias `/metrics` names/labels to the OTel GenAI SemConv vocabulary (`gen_ai.usage.input_tokens`, `gen_ai.client.operation.duration`, …). No OTel SDK — Prometheus text suffices. Makes standard Grafana/collector dashboards work against Pasture. |
+| **IMP-40** | Task-shaped routing table (task-type × token-band → bias) | SLMs (Qwen3-4B/Phi-4, 2025-26) now sit within a few points of frontier models on JSON-extraction/classification but 15-20 behind on multi-step reasoning — *independent of length*. Token count is becoming the wrong sole axis; add cheap deterministic intent signals (JSON-schema regex, sequencing-marker counting) as a 2-D lookup that biases route. |
+| **IMP-41** | Category-aware cache TTL / temporal-bypass | Per-category cache policy keyed on the existing hard-signal classifier: temporal-keyword prompts ("today", "latest", a date) get short TTL or bypass; long-lived (code-explanation) get long TTL. Prevents stale semantic-cache answers. std-only regex + lookup. |
+| **IMP-42** | `pasture calibrate`-style routing-threshold report | RouteLLM's operational lesson: no universal threshold — calibrate on the user's own traffic. Replay logged prompts and report "at threshold X, Y% stay local." Extends the existing `calibrate` command. |
+| **IMP-43** | Per-session consistent PII placeholders + SSE-boundary de-pseudonymization | Presidio/PII-Shield industry pattern: number placeholders consistently (`EMAIL_1`) across a conversation and restore across SSE chunk boundaries (a placeholder may split across two deltas). Extends `pseudonymize.rs`; adds Luhn/IBAN checksum recognizers to cut false positives. |
+| **IMP-44** | Declarative fallback chain + model-suffix routing (`model:local`, `auto:cheap`) | Every 2025-era gateway converged on declarative fallback chains and OpenRouter-style model-suffix intent. Parse suffixes off the incoming `model`; make the backend fallback list config-driven with per-hop timeout — composes with existing circuit breakers. |
+
 ## 5. Anti-goals (deliberately *not* adopting)
 
 Keeping the wedge means saying no to several common peer features:
