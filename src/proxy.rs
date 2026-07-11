@@ -2416,6 +2416,11 @@ impl Proxy {
             &injection_guard_stats,
             self.cloud_health.status().as_str(),
             cloud_health_last_error.as_deref(),
+            // IMP-37: price the local-route tokens at the configured cloud rate —
+            // "what these locally-served requests would have cost on the cloud
+            // backend." Same pricing function as real cloud spend (ADR-166), so
+            // it is 0 when no price is configured, never an invented number.
+            self.cloud_cost_usd(summary.local_prompt_tokens, summary.local_completion_tokens),
         ))
     }
 
@@ -2449,6 +2454,7 @@ impl Proxy {
             sem_cap,
             budget_used,
             budget_limit,
+            self.cloud_cost_usd(s.local_prompt_tokens, s.local_completion_tokens),
         ))
     }
 
@@ -3622,6 +3628,7 @@ pub fn build_stats_response(
     injection_guard_stats: &[(String, u64)],
     cloud_health: &'static str,
     cloud_health_last_error: Option<&str>,
+    estimated_savings_usd: f64,
 ) -> String {
     let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
     let fmt_cats = |cats: &[(&'static str, u64)]| -> String {
@@ -3663,7 +3670,8 @@ pub fn build_stats_response(
 \"output_pii_categories\":{{{}}},\"local_health\":\"{local_health}\",\
 \"local_health_last_error\":{last_error_json},\
 \"cloud_health\":\"{cloud_health}\",\"cloud_health_last_error\":{cloud_last_error_json},\
-\"input_pii_categories\":{{{}}},\"injection_guard_stats\":{{{}}}}}",
+\"input_pii_categories\":{{{}}},\"injection_guard_stats\":{{{}}},\
+\"estimated_savings_usd\":{}}}",
         s.total,
         s.local,
         s.cloud,
@@ -3676,6 +3684,11 @@ pub fn build_stats_response(
         fmt_cats(output_pii_categories),
         fmt_cats(input_pii_categories),
         injection_json.join(","),
+        round4(if estimated_savings_usd.is_finite() {
+            estimated_savings_usd
+        } else {
+            0.0
+        }),
     )
 }
 
@@ -3813,6 +3826,7 @@ pub fn build_metrics_response(
     sem_cap: usize,
     budget_used: u64,
     budget_limit: u64,
+    estimated_savings_usd: f64,
 ) -> String {
     // Prometheus text exposition format v0.0.4.
     // Braces in label selectors are literal Prometheus syntax — not format args.
@@ -3860,13 +3874,21 @@ pasture_semantic_cache_capacity {sem_cap}\n\
 pasture_budget_daily_tokens_used {budget_used}\n\
 # HELP pasture_budget_daily_tokens_limit Daily cloud token budget (0=unlimited)\n\
 # TYPE pasture_budget_daily_tokens_limit gauge\n\
-pasture_budget_daily_tokens_limit {budget_limit}\n",
+pasture_budget_daily_tokens_limit {budget_limit}\n\
+# HELP pasture_estimated_savings_usd_total Estimated USD saved by serving requests locally, priced at the configured cloud rate\n\
+# TYPE pasture_estimated_savings_usd_total counter\n\
+pasture_estimated_savings_usd_total {savings}\n",
         local = s.local,
         cloud = s.cloud,
         cache = s.cache,
         prompt_tokens = s.prompt_tokens,
         completion_tokens = s.completion_tokens,
         cloud_cost = s.cloud_cost_usd,
+        savings = if estimated_savings_usd.is_finite() {
+            estimated_savings_usd
+        } else {
+            0.0
+        },
     )
 }
 

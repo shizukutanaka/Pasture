@@ -731,6 +731,8 @@ fn test_build_stats_response_shape() {
         prompt_tokens: 100,
         completion_tokens: 50,
         cloud_cost_usd: 0.0123,
+        local_prompt_tokens: 40,
+        local_completion_tokens: 20,
     };
     let json = build_stats_response(
         &s,
@@ -751,6 +753,7 @@ fn test_build_stats_response_shape() {
         &[],
         "healthy",
         None,
+        0.0246,
     );
     let v = crate::json::parse(&json).expect("valid json");
     assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(4.0));
@@ -776,6 +779,11 @@ fn test_build_stats_response_shape() {
     assert_eq!(
         v.get("budget_daily_tokens_limit").and_then(|x| x.as_f64()),
         Some(1_000_000.0)
+    );
+    // IMP-37: estimated savings from local routing, priced at the cloud rate.
+    assert_eq!(
+        v.get("estimated_savings_usd").and_then(|x| x.as_f64()),
+        Some(0.0246)
     );
 }
 
@@ -1917,8 +1925,10 @@ fn test_metrics_response_shape() {
         prompt_tokens: 200,
         completion_tokens: 100,
         cloud_cost_usd: 0.005,
+        local_prompt_tokens: 140,
+        local_completion_tokens: 70,
     };
-    let body = build_metrics_response(&s, 3, 8, 5, 50, 0, 0, 0, 0, 4200, 1_000_000);
+    let body = build_metrics_response(&s, 3, 8, 5, 50, 0, 0, 0, 0, 4200, 1_000_000, 0.0031);
     assert!(
         body.contains("pasture_requests_total{route=\"local\"} 7"),
         "{body}"

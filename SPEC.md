@@ -156,6 +156,7 @@ Full field list, in response order:
 | `cloud_health` | string | `"healthy"` \| `"degraded"` \| `"down"` (IMP-35, ADR-227) |
 | `cloud_health_last_error` | string \| null | last primary-cloud failure message; never set by the secondary/fallback provider |
 | `injection_guard_stats` | object | `"label:action"` → count tally, e.g. `"role_switch:blocked"` (IMP-20, ADR-225) |
+| `estimated_savings_usd` | float | cumulative estimated savings from local routing, 4dp (IMP-37): the local-route prompt+completion tokens priced at `PASTURE_CLOUD_PRICE_PER_1M`, i.e. what those requests would have cost on the configured cloud backend. `0` when no cloud price is set. Cache hits are excluded (ambiguous counterfactual) |
 
 ### 3.2d `POST /v1/route`
 Routing **preview / dry-run** (ADR-198). Request body: a chat-completions body

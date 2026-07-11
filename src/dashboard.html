@@ -76,6 +76,7 @@
   .health .pill .dot { width: 8px; height: 8px; border-radius: 50%; }
   .health .name { color: var(--muted); width: 52px; }
   .health .err { color: var(--down); font-size: 12px; word-break: break-word; }
+  .saved { color: var(--ok); font-weight: 600; }
   .s-ok   { color: var(--ok); }   .d-ok   { background: var(--ok); }
   .s-warn { color: var(--warn); } .d-warn { background: var(--warn); }
   .s-down { color: var(--down); } .d-down { background: var(--down); }
@@ -147,7 +148,7 @@
     <div class="card">
       <h2>Cloud spend &amp; budget</h2>
       <div class="big">$<span id="cost">0.00</span></div>
-      <div class="sub">estimated cloud cost so far</div>
+      <div class="sub">estimated cloud cost so far · <span class="saved">saved $<span id="savings">0.00</span> local</span></div>
       <div class="bar" title="daily token budget used"><span class="fill" id="bar-budget" style="width:0%"></span></div>
       <div class="sub" id="budget-text">budget: unlimited</div>
     </div>
@@ -284,6 +285,7 @@
     txt("cloud-rate", Math.round((d.cloud_rate || 0) * 100));
 
     txt("cost", (d.cloud_cost_usd || 0).toFixed(4));
+    txt("savings", (d.estimated_savings_usd || 0).toFixed(4));
     var used = d.budget_daily_tokens_used || 0, limit = d.budget_daily_tokens_limit || 0;
     if (limit > 0) {
       $("bar-budget").style.width = Math.min(100, pct(used, limit)) + "%";

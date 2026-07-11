@@ -160,6 +160,15 @@ pub struct CostSummary {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cloud_cost_usd: f64,
+    /// Prompt/completion tokens attributable to **local** routes only (IMP-37).
+    /// Kept separate from the global token totals so the proxy can price them at
+    /// the configured cloud rate to estimate "what these requests would have
+    /// cost on the cloud backend" — the savings from routing local. Cache hits
+    /// are excluded: their counterfactual (would it have been local or cloud?)
+    /// is ambiguous, so only unambiguously-local work is counted. Price-agnostic
+    /// here; the proxy owns the price and does the multiplication (ADR-166).
+    pub local_prompt_tokens: u64,
+    pub local_completion_tokens: u64,
 }
 
 impl CostSummary {
@@ -247,7 +256,12 @@ pub fn logprob_summary(records: &[LoggedRecord]) -> Option<LogprobStats> {
 pub fn fold_record(s: &mut CostSummary, r: &LoggedRecord) {
     s.total += 1;
     match r.route.as_str() {
-        "local" => s.local += 1,
+        "local" => {
+            s.local += 1;
+            // Accumulate local-route tokens for the savings estimate (IMP-37).
+            s.local_prompt_tokens += r.prompt_tokens;
+            s.local_completion_tokens += r.completion_tokens;
+        }
         "cloud" => s.cloud += 1,
         // Both the exact-match ("cache") and semantic ("semantic_cache", ADR-150)
         // caches serve a request without a backend call at zero cost, so both count
@@ -275,6 +289,8 @@ pub fn summarize(records: &[LoggedRecord]) -> CostSummary {
         prompt_tokens: 0,
         completion_tokens: 0,
         cloud_cost_usd: 0.0,
+        local_prompt_tokens: 0,
+        local_completion_tokens: 0,
     };
     for r in records {
         fold_record(&mut s, r);
@@ -565,6 +581,56 @@ mod tests {
         let v = crate::json::parse(&json).expect("empty stats --json must be valid JSON");
         assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(0.0));
         assert_eq!(v.get("cloud_rate").and_then(|x| x.as_f64()), Some(0.0));
+    }
+
+    #[test]
+    fn test_summary_accumulates_local_tokens_only() {
+        // IMP-37: local_prompt/completion_tokens must sum ONLY local-route
+        // tokens (they price the "savings from routing local" estimate). Cloud
+        // and cache tokens must not leak in, or savings would be overstated.
+        let recs = vec![
+            LoggedRecord {
+                ts_secs: 0,
+                route: "local".into(),
+                prompt_tokens: 1000,
+                completion_tokens: 500,
+                cost_usd: 0.0,
+                logprob: None,
+            },
+            LoggedRecord {
+                ts_secs: 0,
+                route: "local".into(),
+                prompt_tokens: 2000,
+                completion_tokens: 1000,
+                cost_usd: 0.0,
+                logprob: None,
+            },
+            LoggedRecord {
+                ts_secs: 0,
+                route: "cloud".into(),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cost_usd: 0.01,
+                logprob: None,
+            },
+            LoggedRecord {
+                ts_secs: 0,
+                route: "semantic_cache".into(),
+                prompt_tokens: 999,
+                completion_tokens: 999,
+                cost_usd: 0.0,
+                logprob: None,
+            },
+        ];
+        let s = summarize(&recs);
+        assert_eq!(s.local_prompt_tokens, 3000, "only local prompt tokens");
+        assert_eq!(
+            s.local_completion_tokens, 1500,
+            "only local completion tokens"
+        );
+        // Global totals still include every route (unchanged behaviour).
+        assert_eq!(s.prompt_tokens, 1000 + 2000 + 100 + 999);
+        assert_eq!(s.completion_tokens, 500 + 1000 + 50 + 999);
     }
 
     #[test]
