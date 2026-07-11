@@ -58,6 +58,7 @@ Legend: ✅ yes · ➖ partial / opt-in · ❌ no · — N/A
 | Auth / API keys (proxy side) | ❌ **(gap)** | ✅ | — | ➖ | — | ✅ | ✅ |
 | Rate-limit / quota | ❌ **(gap)** | ✅ | — | ➖ | — | ✅ | ✅ |
 | Live metrics endpoint | ➖ (`stats` from JSONL) | ✅ | ❌ | ✅ | ➖ | ✅ | ✅ |
+| Web dashboard / UI | ✅ (embedded, zero-asset) | ✅ | ❌ | ➖ | ❌ | ✅ (SaaS) | ✅ (SaaS) |
 | Cost logging | ✅ (PII-free JSONL) | ✅ | ➖ | ➖ | — | ✅ | ✅ |
 | Dependencies / footprint | **zero-dep, 1 binary** | Python + deps | Python + ML | Python + vLLM | Python + vector DB | SaaS/agent | SaaS |
 

@@ -664,6 +664,10 @@ impl Proxy {
             Some("GET, OPTIONS")
         } else if path.starts_with("/health") {
             Some("GET, HEAD")
+        } else if path == "/dashboard" || path == "/" {
+            // Embedded dashboard (IMP-36): GET-only. Exact match — the caller
+            // passes the query-stripped path, and "/" must not match every route.
+            Some("GET")
         } else if path.starts_with("/v1/audio") || path.starts_with("/v1/images") {
             // Recognised but not implemented; allow POST so the 405 vs 501 distinction is correct.
             Some("POST, OPTIONS")
@@ -674,7 +678,8 @@ impl Proxy {
 
     /// Apply rate-limit then auth gating for a request path (IMP-15). Returns
     /// `Some((status, message, type))` when the request must be rejected, else
-    /// `None`. `/health` is always exempt so liveness probes work unauthenticated.
+    /// `None`. `/health` and the dashboard shell (`/dashboard`, `/`) are always
+    /// exempt so liveness probes and the browser UI shell work unauthenticated.
     /// Build the `X-RateLimit-*` response header block (IMP-ratelimit-headers).
     /// Empty when rate limiting is disabled (the localhost default) so there is
     /// zero overhead and no header noise in the common case. When enabled, every
@@ -705,6 +710,16 @@ impl Proxy {
         auth: Option<&str>,
     ) -> Option<(u16, &'static str, &'static str, Option<u64>)> {
         if path.starts_with("/health") {
+            return None;
+        }
+        // The dashboard HTML shell (IMP-36) is auth-exempt like /health: a
+        // browser navigating to it cannot attach an Authorization header, so
+        // gating the shell would 401 into a dead end. The shell is static markup
+        // with no data; the /v1/stats fetch it makes is gated normally below.
+        // EXACT match on the query-stripped path — starts_with("/") would exempt
+        // every route. `path` here still carries the query string, so strip it.
+        let gate_path = path.split('?').next().unwrap_or(path);
+        if gate_path == "/dashboard" || gate_path == "/" {
             return None;
         }
         // Authenticate BEFORE metering: an unauthenticated request is rejected
@@ -2549,7 +2564,7 @@ impl Proxy {
             .unwrap_or(4)
             .clamp(2, 32);
         eprintln!(
-            "pasture: listening on http://{addr} ({workers} workers, POST /v1/chat/completions, GET /v1/models, GET /v1/stats)"
+            "pasture: listening on http://{addr} ({workers} workers, POST /v1/chat/completions, GET /v1/models, GET /v1/stats, dashboard at http://{addr}/dashboard)"
         );
 
         let proxy = Arc::new(self);
@@ -2706,6 +2721,12 @@ impl Proxy {
                 ($s:expr, $l:expr, $e:expr, $ka:expr) => {{
                     access_log!($s);
                     write_head_response(stream, $s, $l, $e, $ka)?;
+                }};
+            }
+            macro_rules! wrhtml {
+                ($b:expr, $e:expr, $ka:expr) => {{
+                    access_log!(200u16);
+                    write_html_response(stream, $b, $e, $ka)?;
                 }};
             }
             // Handler error: write the OpenAI error envelope and close.
@@ -2889,6 +2910,15 @@ impl Proxy {
                 } else {
                     wr!(200, HEALTH_BODY, &te(), keep_alive);
                 }
+            } else if method == "GET" && (norm_path == "/dashboard" || norm_path == "/") {
+                // Embedded web dashboard (IMP-36/ADR-235): a static HTML shell
+                // that polls GET /v1/stats client-side. Match on the query-
+                // stripped `norm_path` with EXACT equality — `path.starts_with`
+                // would make "/" swallow every route, and `/dashboard` must not
+                // also catch `/dashboardX`. The shell itself carries no data and
+                // is auth-exempt (see check_gate); the /v1/stats fetch it issues
+                // still passes the normal auth gate unchanged.
+                wrhtml!(crate::dashboard::DASHBOARD_HTML, &te(), keep_alive);
             } else if method == "POST"
                 && (path.starts_with("/v1/audio") || path.starts_with("/v1/images"))
             {
@@ -4235,6 +4265,25 @@ fn write_plain_response(
     let conn = if keep_alive { "keep-alive" } else { "close" };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: {conn}\r\n{extra}\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())
+}
+
+/// Write an HTTP/1.1 `200 OK` with `Content-Type: text/html` (for the embedded
+/// dashboard at `GET /dashboard`). Kept separate from `write_response` (which
+/// hardcodes `application/json`) and `write_plain_response` (Prometheus text)
+/// so each endpoint family advertises the correct media type. The body is
+/// compile-time constant HTML, so `body.len()` is the exact byte length.
+fn write_html_response(
+    stream: &mut std::net::TcpStream,
+    body: &str,
+    extra: &str,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: {conn}\r\n{extra}\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes())

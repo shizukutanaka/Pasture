@@ -73,6 +73,7 @@ base_url = http://127.0.0.1:8645/v1
 - `GET /v1/models/{id}` — retrieve one configured model (or 404), OpenAI-compatible.
 - `GET /v1/stats` — live JSON snapshot of the cost-log counters (routes, rates, tokens, spend).
 - `GET /health` — liveness check.
+- `GET /dashboard` (or `GET /`) — embedded web dashboard: a single self-contained page (no build step, no external assets) that polls `/v1/stats` and shows the local/cloud split, spend vs. budget, cache hit rates, and backend health. Open `http://127.0.0.1:8645/dashboard` in a browser.
 
 The response includes an `x_pasture_route` field telling you which way the request went.
 Errors use the OpenAI envelope `{"error":{"message","type"}}`. The full API/routing

@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<!--
+  Pasture dashboard — a single self-contained page (inline CSS + vanilla JS,
+  zero external references) embedded into the binary via include_str! and served
+  at GET /dashboard. It is a pure presentation layer: it polls the existing
+  GET /v1/stats JSON endpoint and renders it. No backend data plumbing lives
+  here, and nothing is fetched from any third-party origin (invariant I1:
+  zero-dependency). Keep it that way — any external script or stylesheet
+  reference to another host breaks the self-containment test in dashboard.rs.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Pasture</title>
+<style>
+  :root {
+    --bg: #f6f7f8; --card: #ffffff; --ink: #1a1d21; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #2f6f4f; --local: #2f6f4f; --cloud: #b8791f;
+    --ok: #2f9e5f; --warn: #c9922b; --down: #c0392b; --track: #eceef0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --card: #1c2024; --ink: #e6e8ea; --muted: #9aa2ab;
+      --line: #2b3138; --accent: #4bbd7f; --local: #4bbd7f; --cloud: #d9a24a;
+      --ok: #4bbd7f; --warn: #d9a24a; --down: #e06c5c; --track: #262c33;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: 1px solid var(--line); background: var(--card);
+  }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: .3px; }
+  header .tag { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  #status { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  #status.stale .dot { background: var(--warn); }
+  #status.down .dot { background: var(--down); }
+  main { max-width: 1120px; margin: 0 auto; padding: 24px; }
+  .grid {
+    display: grid; gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .card h2 {
+    margin: 0 0 12px; font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .6px; color: var(--muted);
+  }
+  .big { font-size: 30px; font-weight: 650; line-height: 1.1; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .bar { height: 8px; border-radius: 5px; background: var(--track); overflow: hidden; margin: 12px 0 6px; display: flex; }
+  .bar > span { display: block; height: 100%; }
+  .bar .local { background: var(--local); }
+  .bar .cloud { background: var(--cloud); }
+  .bar .fill { background: var(--accent); }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); }
+  .legend .k { display: inline-flex; align-items: center; gap: 5px; }
+  .legend .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .health { display: flex; flex-direction: column; gap: 10px; }
+  .health .row { display: flex; align-items: center; gap: 10px; }
+  .health .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+    border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--line);
+  }
+  .health .pill .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .health .name { color: var(--muted); width: 52px; }
+  .health .err { color: var(--down); font-size: 12px; word-break: break-word; }
+  .s-ok   { color: var(--ok); }   .d-ok   { background: var(--ok); }
+  .s-warn { color: var(--warn); } .d-warn { background: var(--warn); }
+  .s-down { color: var(--down); } .d-down { background: var(--down); }
+  section.detail { margin-top: 28px; }
+  section.detail h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--muted); margin: 0 0 12px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .tables { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 10px; }
+  .auth {
+    display: none; margin: 0 auto 20px; max-width: 1120px; padding: 14px 18px;
+    background: var(--card); border: 1px solid var(--warn); border-radius: 12px;
+  }
+  .auth.show { display: block; }
+  .auth label { font-size: 13px; color: var(--muted); }
+  .auth .in { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .auth input {
+    flex: 1; min-width: 200px; padding: 8px 10px; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--bg); color: var(--ink); font: inherit;
+  }
+  .auth button {
+    padding: 8px 16px; border: 0; border-radius: 8px; background: var(--accent);
+    color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 24px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pasture</h1>
+  <span class="tag" id="version"></span>
+  <span class="spacer"></span>
+  <span id="status"><span class="dot"></span><span id="status-text">connecting…</span></span>
+</header>
+
+<div class="auth" id="auth">
+  <label for="token">This proxy requires an API token. Enter it to view live stats
+    (kept only in this browser tab's session storage).</label>
+  <div class="in">
+    <input id="token" type="password" autocomplete="off" placeholder="Bearer token">
+    <button id="token-save">Connect</button>
+  </div>
+</div>
+
+<main>
+  <div class="grid">
+    <!-- Local / cloud split -->
+    <div class="card">
+      <h2>Local / Cloud split</h2>
+      <div class="big"><span id="local-pct">–</span>% local</div>
+      <div class="bar" title="share of routed requests">
+        <span class="local" id="bar-local" style="width:0%"></span>
+        <span class="cloud" id="bar-cloud" style="width:0%"></span>
+      </div>
+      <div class="legend">
+        <span class="k"><span class="sw" style="background:var(--local)"></span>local <span id="n-local">0</span></span>
+        <span class="k"><span class="sw" style="background:var(--cloud)"></span>cloud <span id="n-cloud">0</span></span>
+      </div>
+      <div class="sub"><span id="n-total">0</span> requests routed · <span id="cloud-rate">0</span>% to cloud</div>
+    </div>
+
+    <!-- Spend & budget -->
+    <div class="card">
+      <h2>Cloud spend &amp; budget</h2>
+      <div class="big">$<span id="cost">0.00</span></div>
+      <div class="sub">estimated cloud cost so far</div>
+      <div class="bar" title="daily token budget used"><span class="fill" id="bar-budget" style="width:0%"></span></div>
+      <div class="sub" id="budget-text">budget: unlimited</div>
+    </div>
+
+    <!-- Cache -->
+    <div class="card">
+      <h2>Cache hit rate</h2>
+      <div class="big"><span id="cache-pct">0</span>%</div>
+      <div class="sub">exact: <span id="cache-hm">0 / 0</span> · <span id="cache-occ">0 / 0</span> stored</div>
+      <div class="sub">semantic: <span id="sem-hm">0 / 0</span> · <span id="sem-occ">0 / 0</span> stored</div>
+    </div>
+
+    <!-- Backend health -->
+    <div class="card">
+      <h2>Backend health</h2>
+      <div class="health">
+        <div class="row">
+          <span class="name">local</span>
+          <span class="pill" id="pill-local"><span class="dot"></span><span class="t">–</span></span>
+        </div>
+        <div class="err" id="err-local" hidden></div>
+        <div class="row">
+          <span class="name">cloud</span>
+          <span class="pill" id="pill-cloud"><span class="dot"></span><span class="t">–</span></span>
+        </div>
+        <div class="err" id="err-cloud" hidden></div>
+      </div>
+    </div>
+  </div>
+
+  <section class="detail">
+    <h2>Detail</h2>
+    <div class="tables">
+      <div class="card">
+        <h2>Tokens</h2>
+        <table>
+          <tbody>
+            <tr><td>Prompt tokens</td><td class="num" id="tok-prompt">0</td></tr>
+            <tr><td>Completion tokens</td><td class="num" id="tok-completion">0</td></tr>
+            <tr><td>Budget used (today)</td><td class="num" id="tok-budget">0</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>PII categories detected</h2>
+        <table>
+          <thead><tr><th>Category</th><th class="num">In</th><th class="num">Out</th></tr></thead>
+          <tbody id="pii-body"></tbody>
+        </table>
+        <div class="empty" id="pii-empty">None detected.</div>
+      </div>
+      <div class="card">
+        <h2>Injection guard</h2>
+        <table>
+          <thead><tr><th>Signal</th><th>Action</th><th class="num">Count</th></tr></thead>
+          <tbody id="inj-body"></tbody>
+        </table>
+        <div class="empty" id="inj-empty">No injection signals recorded.</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>Pasture · local-first LLM routing · polling <code>GET /v1/stats</code> every 5s</footer>
+
+<script>
+(function () {
+  "use strict";
+  var TOKEN_KEY = "pasture_token";
+  var POLL_MS = 5000;
+  var lastOk = 0;
+
+  function tok() { try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; } }
+  function setTok(v) { try { sessionStorage.setItem(TOKEN_KEY, v); } catch (e) {} }
+
+  function $(id) { return document.getElementById(id); }
+  // Every field below is written with textContent — never innerHTML — so any
+  // backend-sourced string (a *_last_error message, a PII/injection key) cannot
+  // inject markup. This is a structural guarantee, not a filtering one.
+  function txt(id, v) { var el = $(id); if (el) el.textContent = v; }
+  function pct(n, d) { return d > 0 ? Math.round((n / d) * 100) : 0; }
+  function fmt(n) { return (n == null ? 0 : n).toLocaleString(); }
+
+  function setStatus(kind, text) {
+    var el = $("status");
+    el.className = kind === "ok" ? "" : kind;
+    txt("status-text", text);
+  }
+
+  var HEALTH = {
+    healthy: { cls: "ok", label: "Healthy" },
+    degraded: { cls: "warn", label: "Degraded" },
+    down: { cls: "down", label: "Down" },
+    unknown: { cls: "warn", label: "Unknown" }
+  };
+  function renderHealth(pillId, errId, state, lastErr) {
+    var meta = HEALTH[String(state || "unknown").toLowerCase()] || HEALTH.unknown;
+    var pill = $(pillId);
+    var dot = pill.querySelector(".dot");
+    var t = pill.querySelector(".t");
+    dot.className = "dot d-" + meta.cls;
+    t.className = "t s-" + meta.cls;
+    t.textContent = meta.label;
+    var err = $(errId);
+    if (lastErr) { err.textContent = "last error: " + lastErr; err.hidden = false; }
+    else { err.textContent = ""; err.hidden = true; }
+  }
+
+  function fillRows(bodyId, emptyId, rows) {
+    var body = $(bodyId);
+    body.textContent = "";
+    if (!rows.length) { $(emptyId).style.display = "block"; return; }
+    $(emptyId).style.display = "none";
+    rows.forEach(function (cells) {
+      var tr = document.createElement("tr");
+      cells.forEach(function (c) {
+        var td = document.createElement("td");
+        if (c.num) td.className = "num";
+        td.textContent = c.v;
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+  }
+
+  function render(d) {
+    var total = d.total || 0, local = d.local || 0, cloud = d.cloud || 0;
+    txt("local-pct", pct(local, total));
+    $("bar-local").style.width = pct(local, total) + "%";
+    $("bar-cloud").style.width = pct(cloud, total) + "%";
+    txt("n-local", fmt(local));
+    txt("n-cloud", fmt(cloud));
+    txt("n-total", fmt(total));
+    txt("cloud-rate", Math.round((d.cloud_rate || 0) * 100));
+
+    txt("cost", (d.cloud_cost_usd || 0).toFixed(4));
+    var used = d.budget_daily_tokens_used || 0, limit = d.budget_daily_tokens_limit || 0;
+    if (limit > 0) {
+      $("bar-budget").style.width = Math.min(100, pct(used, limit)) + "%";
+      txt("budget-text", "budget: " + fmt(used) + " / " + fmt(limit) + " tokens today (" + pct(used, limit) + "%)");
+    } else {
+      $("bar-budget").style.width = "0%";
+      txt("budget-text", "budget: unlimited (" + fmt(used) + " tokens today)");
+    }
+
+    txt("cache-pct", Math.round((d.cache_rate || 0) * 100));
+    txt("cache-hm", fmt(d.cache_hits) + " hits / " + fmt(d.cache_misses) + " miss");
+    txt("cache-occ", fmt(d.cache_size) + " / " + fmt(d.cache_capacity));
+    txt("sem-hm", fmt(d.semantic_cache_hits) + " hits / " + fmt(d.semantic_cache_misses) + " miss");
+    txt("sem-occ", fmt(d.semantic_cache_size) + " / " + fmt(d.semantic_cache_capacity));
+
+    renderHealth("pill-local", "err-local", d.local_health, d.local_health_last_error);
+    renderHealth("pill-cloud", "err-cloud", d.cloud_health, d.cloud_health_last_error);
+
+    txt("tok-prompt", fmt(d.prompt_tokens));
+    txt("tok-completion", fmt(d.completion_tokens));
+    txt("tok-budget", fmt(used));
+
+    var inp = d.input_pii_categories || {}, out = d.output_pii_categories || {};
+    var cats = {};
+    Object.keys(inp).forEach(function (k) { cats[k] = true; });
+    Object.keys(out).forEach(function (k) { cats[k] = true; });
+    var piiRows = Object.keys(cats).sort().map(function (k) {
+      return [{ v: k }, { v: fmt(inp[k] || 0), num: true }, { v: fmt(out[k] || 0), num: true }];
+    });
+    fillRows("pii-body", "pii-empty", piiRows);
+
+    var inj = d.injection_guard_stats || {};
+    var injRows = Object.keys(inj).sort().map(function (k) {
+      var parts = k.split(":");
+      var signal = parts[0] || k;
+      var action = parts.length > 1 ? parts.slice(1).join(":") : "—";
+      return [{ v: signal }, { v: action }, { v: fmt(inj[k]), num: true }];
+    });
+    fillRows("inj-body", "inj-empty", injRows);
+  }
+
+  function poll() {
+    var headers = {};
+    var t = tok();
+    if (t) headers["Authorization"] = "Bearer " + t;
+    fetch("/v1/stats", { headers: headers, cache: "no-store" }).then(function (r) {
+      if (r.status === 401) {
+        $("auth").classList.add("show");
+        setStatus("down", "authorization required");
+        return null;
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      $("auth").classList.remove("show");
+      return r.json();
+    }).then(function (d) {
+      if (!d) return;
+      render(d);
+      lastOk = Date.now();
+      setStatus("ok", "live · updated just now");
+    }).catch(function () {
+      // Keep the last-rendered values on the screen (no flicker to zero); just
+      // flag that we are stale so the operator knows the numbers are frozen.
+      var ago = lastOk ? Math.round((Date.now() - lastOk) / 1000) : null;
+      setStatus("stale", ago == null ? "disconnected" : "disconnected · last update " + ago + "s ago");
+    });
+  }
+
+  $("token-save").addEventListener("click", function () {
+    var v = $("token").value.trim();
+    if (v) { setTok(v); $("token").value = ""; poll(); }
+  });
+  $("token").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") $("token-save").click();
+  });
+
+  // Show the version from GET /health (unauthenticated) in the header.
+  fetch("/health", { cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (h) { if (h && h.version) txt("version", "v" + h.version); }).catch(function () {});
+
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

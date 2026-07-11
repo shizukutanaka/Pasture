@@ -2277,6 +2277,77 @@ fn test_health_includes_version() {
 }
 
 #[test]
+fn test_dashboard_serves_html() {
+    let p = proxy_with(true, false, 100, "unused");
+    let raw = roundtrip_raw(
+        p,
+        "GET /dashboard HTTP/1.1\r\nConnection: close\r\n\r\n".to_string(),
+    );
+    assert!(raw.starts_with("HTTP/1.1 200"), "status line: {raw:.40}");
+    assert!(
+        raw.contains("Content-Type: text/html"),
+        "wrong content-type in: {}",
+        raw.lines().take(6).collect::<Vec<_>>().join(" | ")
+    );
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+    assert!(body.contains("<html"), "no html shell in body");
+    assert!(
+        body.contains("/v1/stats"),
+        "dashboard must reference /v1/stats"
+    );
+    assert!(body.contains("fetch("), "dashboard must fetch client-side");
+}
+
+#[test]
+fn test_dashboard_root_path_serves_same_html() {
+    let p = proxy_with(true, false, 100, "unused");
+    let (status, body) = roundtrip(p, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n".to_string());
+    assert_eq!(status, 200, "root path should serve the dashboard");
+    assert_eq!(
+        body,
+        crate::dashboard::DASHBOARD_HTML,
+        "GET / must serve the identical dashboard body"
+    );
+}
+
+#[test]
+fn test_dashboard_post_returns_405() {
+    let p = proxy_with(true, false, 100, "unused");
+    let raw = roundtrip_raw(p, http_post("/dashboard", "{}"));
+    assert!(
+        raw.starts_with("HTTP/1.1 405"),
+        "POST /dashboard should be 405, got: {:.40}",
+        raw
+    );
+    assert!(
+        raw.contains("Allow: GET"),
+        "405 must advertise Allow: GET, headers: {}",
+        raw.lines().take(8).collect::<Vec<_>>().join(" | ")
+    );
+}
+
+#[test]
+fn test_dashboard_shell_is_auth_exempt() {
+    // The HTML shell must load without a token even when auth is configured —
+    // a browser navigation cannot send Authorization, and the shell carries no
+    // data (the /v1/stats fetch it makes is gated normally).
+    let p = proxy_with(true, false, 100, "unused").with_auth_token(Some("s3cret".to_string()));
+    assert!(p.check_gate("/dashboard", None).is_none());
+    assert!(p.check_gate("/", None).is_none());
+    // But the data endpoint the page fetches is still gated.
+    assert_eq!(p.check_gate("/v1/stats", None).map(|g| g.0), Some(401));
+}
+
+#[test]
+fn test_dashboard_shell_bypasses_rate_limit() {
+    let p = proxy_with(true, false, 100, "unused").with_rate_limit(1);
+    // Repeated shell loads never consume a rate-limit token (like /health).
+    assert!(p.check_gate("/dashboard", None).is_none());
+    assert!(p.check_gate("/dashboard", None).is_none());
+    assert!(p.check_gate("/", None).is_none());
+}
+
+#[test]
 fn test_audio_returns_501() {
     let p = proxy_with(true, false, 100, "unused");
     let raw = http_post(

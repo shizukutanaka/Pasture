@@ -186,6 +186,21 @@ The CLI seeds the read-only budget/spike check from today's `cost_log` records
 ### 3.3 `GET /health`
 `200`, `{"status":"ok"}`.
 
+### 3.3a `GET /dashboard` (and `GET /`)
+`200`, `Content-Type: text/html; charset=utf-8`. Returns the embedded web
+dashboard: a single self-contained HTML page (inline CSS + vanilla JS, no
+external references) that polls `GET /v1/stats` client-side every 5 seconds and
+renders the local/cloud split, cloud spend vs. daily budget, exact + semantic
+cache hit rates, and both backends' circuit-breaker health. `GET /` serves the
+identical page. The page is **read-only** — it issues no mutating requests.
+
+Like `/health`, the HTML shell is **exempt from auth and rate limiting** (a
+browser navigation cannot attach an `Authorization` header, and the shell
+carries no data). When auth (§7) is configured, the shell still loads; its
+`fetch('/v1/stats')` receives `401`, and the page then prompts for a token and
+stores it in the browser tab's `sessionStorage` for subsequent polls. Only
+`GET` is allowed; other methods ⇒ `405` with `Allow: GET`.
+
 ### 3.4 Streaming (SSE)
 When `stream:true`: `200`, `Content-Type: text/event-stream`. Each frame is
 `data: <chat.completion.chunk>\n\n` with `id` (one unique id shared by all chunks of
