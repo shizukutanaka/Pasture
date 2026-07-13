@@ -322,6 +322,12 @@ false negative = data leak (unacceptable).
   caches sensitive prompts (I2). Applies to both buffered and `stream:true` requests
   (IMP-31b): a streamed hit replays the cached content as SSE; a streamed miss
   populates the cache. The semantic cache remains buffered-only.
+  **Time-sensitive bypass (IMP-41):** a prompt whose correct answer changes over
+  time (detected by deterministic EN+JA markers -- "today", "latest", "current
+  price", 今日, 最新, … -- via `routing::is_time_sensitive`) is never served
+  from nor stored into **either** cache, on both the buffered and streaming
+  paths: an exact text match on "what's the weather today?" is still a stale
+  answer. Orthogonal to routing: such prompts may still route local.
 - **Backends.** Local: Ollama (default) or any OpenAI-compatible server
   (`PASTURE_LOCAL_BACKEND`). Cloud (`cloud` feature, BYOK): OpenAI or Anthropic over
   HTTPS. Both support streaming. **Cloud resilience (IMP-9):** a transient failure

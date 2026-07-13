@@ -409,6 +409,63 @@ pub fn is_simple_prompt(text: &str, threshold: usize) -> bool {
     hard_signals(text).is_empty() && estimate_tokens(text) < threshold
 }
 
+/// Markers for a time-sensitive prompt (EN + JA, IMP-41): its correct answer
+/// changes over time — "what's the weather today", "latest exchange rate",
+/// "現在の株価". A cache hit (exact-match text OR semantic/cosine) on such a
+/// prompt is a silent staleness bug, not a genuine hit: the request text can
+/// match perfectly while the real-world fact it asks about has moved on. This
+/// is deliberately narrower than a bare "now"/"current" match (which would
+/// also fire on "current directory", "current implementation", etc. and gut
+/// the cache hit rate for ordinary coding prompts) — it targets phrases that
+/// specifically anchor to the present moment.
+const TIME_SENSITIVE_MARKERS: &[&str] = &[
+    "today",
+    "tonight",
+    "tomorrow",
+    "yesterday",
+    "currently",
+    "right now",
+    "as of now",
+    "up to date",
+    "up-to-date",
+    "this week",
+    "this month",
+    "latest",
+    "breaking news",
+    "current price",
+    "current weather",
+    "current time",
+    "current date",
+    "what time is it",
+    "what day is it",
+    "what's the date",
+    "whats the date",
+    "stock price",
+    "exchange rate",
+    "今日",
+    "今夜",
+    "明日",
+    "昨日",
+    "現在",
+    "最新",
+    "今週",
+    "今月",
+    "為替レート",
+    "株価",
+    "天気",
+];
+
+/// True when `text` asks about something whose correct answer changes over
+/// time (IMP-41). Callers use this to bypass both the exact-match and
+/// semantic caches — for read (never serve a stale cached fact) and for write
+/// (never store an answer whose correctness has an expiry the cache doesn't
+/// track). This is orthogonal to `hard_signals`: a time-sensitive prompt can
+/// still be routed local (it may be trivially easy) — it is just never
+/// cached, regardless of route.
+pub fn is_time_sensitive(text: &str) -> bool {
+    has_marker(&text.to_lowercase(), TIME_SENSITIVE_MARKERS)
+}
+
 /// The deterministic routing engine, parameterised by available backends and a
 /// hardware-adaptive token threshold.
 #[derive(Debug, Clone)]
@@ -1046,6 +1103,38 @@ mod tests {
         assert!(hard_signals("output as XML").contains(&"format"));
         // A plain factual prompt is still untouched (no false escalation).
         assert!(hard_signals("what time is it in Tokyo").is_empty());
+    }
+
+    #[test]
+    fn test_is_time_sensitive_detects_en_and_ja() {
+        assert!(is_time_sensitive("what's the weather today?"));
+        assert!(is_time_sensitive("What is the LATEST exchange rate?"));
+        assert!(is_time_sensitive("what time is it right now"));
+        assert!(is_time_sensitive("今日の天気は？"));
+        assert!(is_time_sensitive("現在の株価を教えて"));
+        assert!(!is_time_sensitive("explain how binary search works"));
+        assert!(!is_time_sensitive("write a function to reverse a string"));
+    }
+
+    #[test]
+    fn test_is_time_sensitive_ignores_coding_current_usage() {
+        // "current" alone is deliberately excluded from the marker list:
+        // routine coding prompts say "current directory"/"current
+        // implementation" constantly, and none of those are asking about a
+        // real-world fact with an expiry — treating them as time-sensitive
+        // would gut the cache hit rate for ordinary coding sessions.
+        assert!(!is_time_sensitive("list files in the current directory"));
+        assert!(!is_time_sensitive("refactor the current implementation"));
+    }
+
+    #[test]
+    fn test_is_time_sensitive_orthogonal_to_hard_signals() {
+        // A time-sensitive prompt can still be a SIMPLE prompt for routing
+        // purposes (it may be trivially easy to answer) — the cache-bypass
+        // axis and the local/cloud-complexity axis are independent.
+        let text = "what's the weather today";
+        assert!(is_time_sensitive(text));
+        assert!(hard_signals(text).is_empty());
     }
 
     #[test]

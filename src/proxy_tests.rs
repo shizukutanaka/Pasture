@@ -3233,6 +3233,93 @@ fn test_cache_hit_emits_otel_span() {
     let _ = std::fs::remove_file(&otel);
 }
 
+// ── IMP-41 time-sensitive cache bypass ──────────────────────────────────────
+
+#[test]
+fn test_time_sensitive_never_hits_exact_cache() {
+    // IMP-41: an identical time-sensitive prompt must never be served from the
+    // exact-match cache. The request text matches perfectly (it's the SAME
+    // request repeated), which is exactly why this must be tested: the cache's
+    // usual key would hit here if the bypass were missing, silently serving a
+    // stale answer to "what's the weather today" on the second call.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_cache(8);
+    let body =
+        r#"{"model":"m","messages":[{"role":"user","content":"what's the weather today?"}]}"#;
+    let first = p.handle_chat(body).unwrap();
+    assert!(first.contains("\"x_pasture_route\":\"local\""), "{first}");
+    let second = p.handle_chat(body).unwrap();
+    assert!(
+        second.contains("\"x_pasture_route\":\"local\""),
+        "a time-sensitive prompt must miss the cache even on an identical repeat: {second}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_time_sensitive_never_populates_semantic_cache() {
+    // IMP-41: a time-sensitive prompt must not be stored in the semantic
+    // cache. MockBackend's embeddings are all parallel ([char_count, 0.0]), so
+    // ANY two non-empty prompts cosine-match at this threshold — if the
+    // bypass were missing, the differently-worded second request below would
+    // hit.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_semantic_cache(8, 0.5);
+    let _ = p
+        .handle_chat(
+            r#"{"model":"m","messages":[{"role":"user","content":"what's the latest news today"}]}"#,
+        )
+        .unwrap();
+    let second = p
+        .handle_chat(
+            r#"{"model":"m","messages":[{"role":"user","content":"completely different words"}]}"#,
+        )
+        .unwrap();
+    assert!(
+        !second.contains("\"x_pasture_route\":\"semantic_cache\""),
+        "a time-sensitive prompt must not populate the semantic cache: {second}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_time_sensitive_skips_exact_cache() {
+    // IMP-41 streaming parity: mirrors the buffered exact-match bypass above.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_cache(8);
+    let body =
+        r#"{"model":"m","messages":[{"role":"user","content":"what's the weather today?"}]}"#;
+    let _ = p.handle_chat(body).unwrap(); // would normally warm the cache
+    let stream = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"what's the weather today?"}]}"#;
+    let (status, sse) = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    assert_eq!(status, 200);
+    assert!(
+        !sse.contains("\"x_pasture_route\":\"cache\""),
+        "a time-sensitive stream must not be served from cache: {sse}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_streaming_time_sensitive_skips_semantic_cache() {
+    // IMP-41: the streaming path's semantic-cache write must also skip
+    // time-sensitive prompts — symmetric to test_streaming_sensitive_skips_semantic_cache.
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log).with_semantic_cache(8, 0.5);
+    let stream = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"what's the weather right now"}]}"#;
+    let _ = roundtrip_ref(&p, http_post("/v1/chat/completions", stream));
+    let resp = p
+        .handle_chat(
+            r#"{"model":"m","messages":[{"role":"user","content":"unrelated query text"}]}"#,
+        )
+        .unwrap();
+    assert!(
+        !resp.contains("\"x_pasture_route\":\"semantic_cache\""),
+        "a time-sensitive stream must not populate the semantic cache: {resp}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── ADR-147 streaming exact-match cache parity ──────────────────────────────
 
 #[test]

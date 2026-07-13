@@ -1324,6 +1324,7 @@ impl Proxy {
         req: &CompletionRequest,
         route: Route,
         sensitive: bool,
+        time_sensitive: bool,
         otel_span: &mut Option<crate::telemetry::Span>,
     ) -> EmbeddingStep {
         // ADR-227 (R4): the difficulty signal's whole purpose is escalating a
@@ -1369,14 +1370,21 @@ impl Proxy {
             } else {
                 None
             };
-        if let (Some(emb), Some(sem_mutex)) =
-            (query_embedding.as_ref(), self.semantic_cache.as_ref())
-        {
-            if let Ok(mut guard) = sem_mutex.lock() {
-                let samp = crate::cache::sampling_key(&req.sampling);
-                if let Some(hit) = guard.find_similar(emb, &req.model, samp) {
-                    self.emit_cache_hit_span(otel_span, &hit, "semantic_cache");
-                    return EmbeddingStep::SemanticHit(hit);
+        // IMP-41: a time-sensitive prompt is never served from the semantic
+        // cache — cosine similarity matches the TEXT, not whether the cached
+        // answer's underlying fact ("today's weather") is still true. The
+        // embedding above is still computed (want_difficulty needs it below);
+        // only the cache lookup itself is skipped.
+        if !time_sensitive {
+            if let (Some(emb), Some(sem_mutex)) =
+                (query_embedding.as_ref(), self.semantic_cache.as_ref())
+            {
+                if let Ok(mut guard) = sem_mutex.lock() {
+                    let samp = crate::cache::sampling_key(&req.sampling);
+                    if let Some(hit) = guard.find_similar(emb, &req.model, samp) {
+                        self.emit_cache_hit_span(otel_span, &hit, "semantic_cache");
+                        return EmbeddingStep::SemanticHit(hit);
+                    }
                 }
             }
         }
@@ -1935,6 +1943,11 @@ impl Proxy {
         let req = framed.as_ref().unwrap_or(req);
 
         let (mut decision, sensitive) = self.classify_and_decide(req)?;
+        // IMP-41: a time-sensitive prompt's correct answer changes over time,
+        // so a cache hit (exact-match OR semantic) would silently serve a
+        // stale fact even though the request text matches perfectly. Computed
+        // once and threaded through every cache read/write below.
+        let time_sensitive = crate::routing::is_time_sensitive(&req.routing_text());
 
         // OTel span (IMP-23/ADR-144): start before the cache checks so a cache
         // hit is traced too. Cache hits return early below, so the span must
@@ -1944,8 +1957,8 @@ impl Proxy {
             .as_deref()
             .map(|_| crate::telemetry::Span::start("", &req.model));
 
-        // Exact-match cache (never for sensitive content; I5).
-        let cache_key = if !sensitive {
+        // Exact-match cache (never for sensitive OR time-sensitive content; I5, IMP-41).
+        let cache_key = if !sensitive && !time_sensitive {
             Some(crate::cache::request_key(req))
         } else {
             None
@@ -1962,11 +1975,16 @@ impl Proxy {
         // Semantic cache (IMP-12) + difficulty signal (IMP-14), via the shared
         // embedding step (ADR-150). Returns a cached answer or the route to use
         // (possibly escalated) plus the query embedding for store-on-miss.
-        let (planned_route, query_embedding) =
-            match self.embedding_step(req, decision.route, sensitive, &mut otel_span) {
-                EmbeddingStep::SemanticHit(hit) => return Ok((hit, "semantic_cache", None, 0)),
-                EmbeddingStep::Proceed { route, embedding } => (route, embedding),
-            };
+        let (planned_route, query_embedding) = match self.embedding_step(
+            req,
+            decision.route,
+            sensitive,
+            time_sensitive,
+            &mut otel_span,
+        ) {
+            EmbeddingStep::SemanticHit(hit) => return Ok((hit, "semantic_cache", None, 0)),
+            EmbeddingStep::Proceed { route, embedding } => (route, embedding),
+        };
 
         // Budget / spike guard (IMP-26): only applies when routing to cloud and
         // budget or spike detection is configured. Sensitive content was excluded
@@ -2088,17 +2106,22 @@ impl Proxy {
             }
         }
 
-        // Store on miss (exact-match).
+        // Store on miss (exact-match). cache_key is already None above when
+        // time_sensitive, so this is naturally skipped for such prompts.
         if let (Some(key), Some(cache)) = (cache_key, self.cache.as_ref()) {
             if let Ok(mut guard) = cache.lock() {
                 guard.put(key, resp.clone());
             }
         }
-        // Store on miss (semantic).
-        if let (Some(emb), Some(sem_mutex)) = (query_embedding, self.semantic_cache.as_ref()) {
-            if let Ok(mut guard) = sem_mutex.lock() {
-                let samp = crate::cache::sampling_key(&req.sampling);
-                guard.put(emb, req.model.clone(), samp, resp.clone());
+        // Store on miss (semantic). IMP-41: never persist a time-sensitive
+        // answer into the semantic cache — its correctness has an expiry the
+        // cache does not track, so storing it just primes a future stale hit.
+        if !time_sensitive {
+            if let (Some(emb), Some(sem_mutex)) = (query_embedding, self.semantic_cache.as_ref()) {
+                if let Ok(mut guard) = sem_mutex.lock() {
+                    let samp = crate::cache::sampling_key(&req.sampling);
+                    guard.put(emb, req.model.clone(), samp, resp.clone());
+                }
             }
         }
 
@@ -3083,6 +3106,11 @@ impl Proxy {
                 return Ok(s);
             }
         };
+        // IMP-41: symmetric to the buffered path — a time-sensitive prompt's
+        // correct answer changes over time, so it must never be served from or
+        // stored into either cache, regardless of how well the text matches.
+        let time_sensitive = crate::routing::is_time_sensitive(&req.routing_text());
+
         // OTel span (IMP-23): started before the cache checks so a cache hit is
         // traced too (ADR-144). Shared by the exact/semantic hit paths and the
         // backend completion below.
@@ -3095,8 +3123,8 @@ impl Proxy {
         // stream:true request is served from cache without a backend call. Checked
         // BEFORE the budget guard (a cache hit costs nothing, so it is served even
         // when over the cloud budget — matching the buffered ordering). Never for
-        // sensitive content (I5); keyed on the original request.
-        let cache_key = if sensitive {
+        // sensitive OR time-sensitive content (I5, IMP-41); keyed on the original request.
+        let cache_key = if sensitive || time_sensitive {
             None
         } else {
             Some(crate::cache::request_key(req))
@@ -3120,21 +3148,26 @@ impl Proxy {
         // embedding step (ADR-150): parity with the buffered path. A semantic hit
         // is replayed as SSE; otherwise the route may be escalated and the query
         // embedding is kept to store the streamed answer on a miss.
-        let (decided_route, query_embedding) =
-            match self.embedding_step(req, decision.route, sensitive, &mut otel_span) {
-                EmbeddingStep::SemanticHit(hit) => {
-                    self.write_cached_stream(
-                        sock,
-                        cors,
-                        &hit,
-                        "semantic_cache",
-                        include_usage,
-                        injection_label.as_deref(),
-                    )?;
-                    return Ok(200);
-                }
-                EmbeddingStep::Proceed { route, embedding } => (route, embedding),
-            };
+        let (decided_route, query_embedding) = match self.embedding_step(
+            req,
+            decision.route,
+            sensitive,
+            time_sensitive,
+            &mut otel_span,
+        ) {
+            EmbeddingStep::SemanticHit(hit) => {
+                self.write_cached_stream(
+                    sock,
+                    cors,
+                    &hit,
+                    "semantic_cache",
+                    include_usage,
+                    injection_label.as_deref(),
+                )?;
+                return Ok(200);
+            }
+            EmbeddingStep::Proceed { route, embedding } => (route, embedding),
+        };
         // Budget / spike guard (IMP-26): mirror the buffered path so a stream:true
         // request cannot bypass the daily cap or spike redirect. May downgrade to
         // local or, in "block" mode, reject before the stream starts.
@@ -3302,7 +3335,15 @@ impl Proxy {
                     route_label,
                     &mut otel_span,
                     cache_key,
-                    query_embedding,
+                    // IMP-41: cache_key is already None above when
+                    // time_sensitive; do the same for the semantic-cache
+                    // embedding here so finalize_streamed's store-on-miss
+                    // never persists a time-sensitive answer.
+                    if time_sensitive {
+                        None
+                    } else {
+                        query_embedding
+                    },
                     cache_mapping.as_ref(),
                     &req.model,
                     crate::cache::sampling_key(&req.sampling),
