@@ -5,6 +5,30 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-07-17
+
+### Added — external research refresh: dashboard, savings, OTel aliases, cache safety, calibrate sweep (IMP-36/37/39/41/42, ADR-235–239)
+
+- **Embedded web dashboard** at `GET /dashboard` (and `GET /`): a single
+  self-contained HTML page (inline CSS + vanilla JS, zero external assets, no
+  build step) that polls `GET /v1/stats` and shows the local/cloud split, cloud
+  spend vs. budget, cache hit rates, and both backends' circuit-breaker health.
+  The static shell is auth/rate-limit exempt like `/health`; its `/v1/stats`
+  fetch is gated normally. (IMP-36, ADR-235)
+- **`estimated_savings_usd`** on `/v1/stats`, `/metrics`, and the dashboard: the
+  local-route tokens priced at the configured cloud rate — "what these locally
+  served requests would have cost on your cloud backend." (IMP-37, ADR-236)
+- **OTel GenAI semantic-convention metric aliases** on `/metrics`
+  (`gen_ai_client_token_usage_total`, `gen_ai_requests_total`), additive
+  alongside the existing `pasture_*` series. (IMP-39, ADR-237)
+- **Time-sensitive cache bypass**: prompts whose answer changes over time
+  (deterministic EN+JA markers) are never served from or stored into either the
+  exact-match or semantic cache, on both the buffered and streaming paths.
+  (IMP-41, ADR-238)
+- **`calibrate --sweep`** (and `--sweep --logprob`): recommend `PASTURE_THRESHOLD`
+  / `PASTURE_CASCADE_LOGPROB` at several target rates at once instead of one
+  `--target` point. (IMP-42, ADR-239)
+
 ### Added — `/v1/route` preview is now budget/spike-aware (ADR-200)
 
 - The `/v1/route` dry-run previewed the routing-engine decision but ignored the
