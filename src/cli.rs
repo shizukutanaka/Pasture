@@ -30,6 +30,7 @@ COMMANDS:
     improvements --review    Show only entries the machine gate cannot auto-approve
     config                   Print the effective configuration (no secrets)
     calibrate [--target R]   Recommend PASTURE_THRESHOLD from your logged usage (R=cloud rate, default 0.2)
+    calibrate --sweep         Show recommended thresholds at several target rates at once (add --logprob for cascade)
     calibrate --logprob       Recommend PASTURE_CASCADE_LOGPROB from logged cascade confidence
     calibrate --error --labels <f.jsonl> [--target E]
                              Recommend PASTURE_CASCADE_LOGPROB for a target error rate E
@@ -1267,6 +1268,11 @@ fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
         return run_calibrate_error(lang, rest);
     }
     let logprob_mode = rest.iter().any(|a| a == "--logprob");
+    // IMP-42: --sweep shows several candidate thresholds at once instead of one
+    // point chosen by --target. Composes with --logprob to sweep the cascade axis.
+    if rest.iter().any(|a| a == "--sweep") {
+        return run_calibrate_sweep(config, lang, logprob_mode);
+    }
     let target = option_value(rest, "--target")
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.2)
@@ -1363,6 +1369,99 @@ fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// `calibrate --sweep [--logprob]` (IMP-42): print the recommended threshold at
+/// each of several target rates in one table, rather than the single point
+/// `--target` picks. RouteLLM's operational lesson is that no threshold is
+/// universally right — the correct one depends on the user's own traffic and
+/// cost tolerance — so the sweep hands the operator the whole curve to choose
+/// from. Advisory and read-only, like every other calibrate mode; reuses the
+/// same per-target math (`calibrate::sweep_*`) the `--target` path uses.
+fn run_calibrate_sweep(config: &Config, lang: crate::i18n::Lang, logprob_mode: bool) -> i32 {
+    use crate::i18n::{t, tf};
+    let records = match crate::cost::read_log(&config.cost_log_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cannot read cost log: {e}");
+            return 1;
+        }
+    };
+    let targets = crate::calibrate::DEFAULT_SWEEP_TARGETS;
+    if logprob_mode {
+        let lps: Vec<f64> = records.iter().filter_map(|r| r.logprob).collect();
+        if lps.is_empty() {
+            println!("{}", t(lang, "calibrate.logprob.empty"));
+            return 0;
+        }
+        let n = lps.len().to_string();
+        println!(
+            "{}",
+            tf(lang, "calibrate.logprob.sweep.header", &[("n", &n)])
+        );
+        if lps.len() < MIN_CALIBRATE_SAMPLE {
+            println!(
+                "{}",
+                tf(
+                    lang,
+                    "calibrate.small_sample",
+                    &[("n", &n), ("min", &MIN_CALIBRATE_SAMPLE.to_string())]
+                )
+            );
+        }
+        for (target, threshold, achieved) in
+            crate::calibrate::sweep_logprob_thresholds(&lps, targets)
+        {
+            println!(
+                "{}",
+                tf(
+                    lang,
+                    "calibrate.logprob.sweep.row",
+                    &[
+                        ("target", &format!("{:.0}", target * 100.0)),
+                        ("threshold", &format!("{threshold:.3}")),
+                        ("rate", &format!("{:.1}", achieved * 100.0)),
+                    ]
+                )
+            );
+        }
+        return 0;
+    }
+    let tokens: Vec<u64> = records.iter().map(|r| r.prompt_tokens).collect();
+    if tokens.is_empty() {
+        println!(
+            "{}",
+            tf(lang, "calibrate.empty", &[("path", &config.cost_log_path)])
+        );
+        return 0;
+    }
+    let n = tokens.len().to_string();
+    println!("{}", tf(lang, "calibrate.sweep.header", &[("n", &n)]));
+    if tokens.len() < MIN_CALIBRATE_SAMPLE {
+        println!(
+            "{}",
+            tf(
+                lang,
+                "calibrate.small_sample",
+                &[("n", &n), ("min", &MIN_CALIBRATE_SAMPLE.to_string())]
+            )
+        );
+    }
+    for (target, threshold, achieved) in crate::calibrate::sweep_thresholds(&tokens, targets) {
+        println!(
+            "{}",
+            tf(
+                lang,
+                "calibrate.sweep.row",
+                &[
+                    ("target", &format!("{:.0}", target * 100.0)),
+                    ("threshold", &threshold.to_string()),
+                    ("rate", &format!("{:.1}", achieved * 100.0)),
+                ]
+            )
+        );
+    }
+    0
 }
 
 /// `calibrate --error --labels <file> [--target <rate>]` (IMP-13, UCCI-style):

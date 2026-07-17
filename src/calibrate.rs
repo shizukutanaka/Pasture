@@ -104,6 +104,42 @@ pub fn calibrate_logprob_threshold(logprobs: &[f64], target_escalation_rate: f64
     (threshold, escalate as f64 / n as f64)
 }
 
+/// Standard target rates for `--sweep` reports (IMP-42): enough points to see
+/// the whole cost/quality curve in one table without overwhelming the
+/// terminal. RouteLLM's operational finding is that there is no universally
+/// correct threshold — the right one depends on the user's own traffic and
+/// cost tolerance — so showing several candidate rates side by side, instead
+/// of one point picked via `--target`, is the actionable form of that advice.
+pub const DEFAULT_SWEEP_TARGETS: &[f64] = &[0.05, 0.10, 0.20, 0.30, 0.50];
+
+/// `calibrate_threshold` evaluated at each of `targets` (IMP-42). Returns
+/// `(target, threshold, achieved_rate)` triples in `targets` order. Each
+/// target is an independent call to the unmodified `calibrate_threshold` (a
+/// fresh sort of `tokens` per target) — fine for the cost-log sizes this CLI
+/// tool operates on; not a hot path.
+pub fn sweep_thresholds(tokens: &[u64], targets: &[f64]) -> Vec<(f64, usize, f64)> {
+    targets
+        .iter()
+        .map(|&target| {
+            let (threshold, achieved) = calibrate_threshold(tokens, target);
+            (target, threshold, achieved)
+        })
+        .collect()
+}
+
+/// `calibrate_logprob_threshold` evaluated at each of `targets` (IMP-42): the
+/// same sweep idea applied to the cascade escalation-rate axis instead of the
+/// length-routing axis.
+pub fn sweep_logprob_thresholds(logprobs: &[f64], targets: &[f64]) -> Vec<(f64, f64, f64)> {
+    targets
+        .iter()
+        .map(|&target| {
+            let (threshold, achieved) = calibrate_logprob_threshold(logprobs, target);
+            (target, threshold, achieved)
+        })
+        .collect()
+}
+
 /// A labelled confidence observation (IMP-13): the local model's mean token
 /// log-probability for one answer, and whether that answer was judged correct.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -265,6 +301,55 @@ mod tests {
         assert_eq!(calibrate_logprob_threshold(&[], 0.2), (0.0, 0.0));
         assert_eq!(calibrate_logprob_threshold(&lps, 1.0), (0.0, 1.0));
         assert_eq!(calibrate_logprob_threshold(&lps, 0.0).1, 0.0);
+    }
+
+    #[test]
+    fn test_sweep_thresholds_matches_individual_calls() {
+        // IMP-42: a sweep row for target T must equal calibrate_threshold(_, T)
+        // exactly — the sweep is a thin loop, not a re-derivation.
+        let tokens: Vec<u64> = (1..=100).collect();
+        let targets = [0.1, 0.25, 0.5];
+        let sweep = sweep_thresholds(&tokens, &targets);
+        assert_eq!(sweep.len(), targets.len());
+        for (i, &t) in targets.iter().enumerate() {
+            let (thr, achieved) = calibrate_threshold(&tokens, t);
+            assert_eq!(sweep[i], (t, thr, achieved), "row {i}");
+        }
+    }
+
+    #[test]
+    fn test_sweep_logprob_matches_individual_calls() {
+        let lps: Vec<f64> = (1..=10).map(|i| -(i as f64) / 10.0).collect();
+        let targets = [0.1, 0.3, 0.5];
+        let sweep = sweep_logprob_thresholds(&lps, &targets);
+        assert_eq!(sweep.len(), targets.len());
+        for (i, &t) in targets.iter().enumerate() {
+            let (thr, achieved) = calibrate_logprob_threshold(&lps, t);
+            assert_eq!(sweep[i], (t, thr, achieved), "row {i}");
+        }
+    }
+
+    #[test]
+    fn test_sweep_preserves_target_order_and_handles_empty() {
+        // Order in == order out (the report renders rows in the caller's order),
+        // and an empty sample yields one row per target, none of them panicking.
+        let targets = [0.5, 0.1, 0.3];
+        let sweep = sweep_thresholds(&[], &targets);
+        let out_targets: Vec<f64> = sweep.iter().map(|(t, _, _)| *t).collect();
+        assert_eq!(out_targets, targets);
+        // Empty sample: calibrate_threshold returns (0, 0.0) for every target.
+        assert!(sweep.iter().all(|&(_, thr, rate)| thr == 0 && rate == 0.0));
+    }
+
+    #[test]
+    fn test_default_sweep_targets_sorted_and_in_range() {
+        // The report reads top-to-bottom as "cheaper … pricier"; keep the
+        // defaults strictly ascending and inside (0,1) so no row is a degenerate
+        // all-local / all-cloud extreme.
+        let d = DEFAULT_SWEEP_TARGETS;
+        assert!(!d.is_empty());
+        assert!(d.windows(2).all(|w| w[0] < w[1]), "must be strictly ascending");
+        assert!(d.iter().all(|&t| t > 0.0 && t < 1.0), "must be within (0,1)");
     }
 
     #[test]
