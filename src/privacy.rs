@@ -187,6 +187,9 @@ pub fn classify(text: &str) -> SensitivityReport {
     if contains_my_number(&normalized) {
         categories.push("my_number");
     }
+    if contains_iban(&normalized) {
+        categories.push("iban");
+    }
     if normalized.split_whitespace().any(looks_like_phone) || contains_intl_phone(&normalized) {
         categories.push("phone");
     }
@@ -725,6 +728,97 @@ fn my_number_check_valid(digits: &[u8]) -> bool {
     check == digits[11] as u32
 }
 
+/// Detect an IBAN (International Bank Account Number) *value* anywhere in the
+/// text (ADR-240). Distinct from the `"iban"` keyword (which only fires when the
+/// literal word appears): this catches a bare account number like
+/// `DE89370400440532013000` that carries no keyword, mirroring how bare
+/// Luhn-valid credit cards are caught without the words "credit card". Any hit
+/// → sensitive (kept local) and → masked as `<IBAN_n>` before any cloud call.
+pub fn contains_iban(text: &str) -> bool {
+    !iban_spans(text).is_empty()
+}
+
+/// Byte ranges of checksum-valid IBANs in `text`. Detection is limited to the
+/// **compact** form (no internal spaces): 2 letters (country) + 2 check digits +
+/// 11–30 alphanumeric BBAN, 15–34 chars total, validated by the ISO 7064
+/// MOD-97-10 checksum so a random alphanumeric run passes with probability
+/// ~1/97. Run as a pre-pass *before* credit-card masking (ADR-196) because a
+/// short all-digit IBAN (e.g. a 15-char Norwegian IBAN = NO + 13 digits) would
+/// otherwise fall inside the 13–19-digit card window; masking the whole IBAN
+/// (including its `NO` prefix) first removes those digits from the card scan.
+/// The grouped print form (`DE89 3704 …`) is intentionally out of scope here:
+/// gluing a trailing word onto a space-separated run is hard to bound without a
+/// per-country length table, and the compact form is the safe, unambiguous
+/// subset. Shared by `contains_iban` (any hit → sensitive) and the pseudonymizer
+/// so IBAN detection has a single source of truth.
+pub fn iban_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Anchor on <alpha><alpha><digit><digit> at an alphanumeric boundary so a
+        // longer identifier ending in that shape is not mistaken for an IBAN start.
+        let boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        if boundary
+            && i + 4 <= bytes.len()
+            && bytes[i].is_ascii_alphabetic()
+            && bytes[i + 1].is_ascii_alphabetic()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+        {
+            // Consume the maximal alphanumeric run (compact form; a space or any
+            // punctuation ends it, so a trailing word is never glued on).
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
+                j += 1;
+            }
+            let count = j - i;
+            if (15..=34).contains(&count) {
+                let upper: Vec<u8> = bytes[i..j].iter().map(|b| b.to_ascii_uppercase()).collect();
+                if iban_check_valid(&upper) {
+                    spans.push((i, j));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    spans
+}
+
+/// ISO 7064 MOD-97-10 validation of an uppercase ASCII-alphanumeric IBAN
+/// (country[2] + check[2] + BBAN). Move the first four characters to the end,
+/// map each letter to two digits (A=10 … Z=35), and the resulting integer is
+/// valid iff it is ≡ 1 (mod 97). The integer is folded digit-by-digit so no
+/// big-integer type is needed (std-only).
+fn iban_check_valid(chars: &[u8]) -> bool {
+    if !(15..=34).contains(&chars.len()) {
+        return false;
+    }
+    // Rearranged order: BBAN (chars[4..]) then country+check (chars[0..4]).
+    let mut rem: u32 = 0;
+    let mut fold = |c: u8| -> bool {
+        if c.is_ascii_digit() {
+            rem = (rem * 10 + (c - b'0') as u32) % 97;
+            true
+        } else if c.is_ascii_uppercase() {
+            let v = (c - b'A') as u32 + 10; // 10..=35, always two digits
+            rem = (rem * 10 + v / 10) % 97;
+            rem = (rem * 10 + v % 10) % 97;
+            true
+        } else {
+            false
+        }
+    };
+    for &c in chars[4..].iter().chain(chars[0..4].iter()) {
+        if !fold(c) {
+            return false;
+        }
+    }
+    rem == 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +895,47 @@ mod tests {
     #[test]
     fn test_credit_card_short_digits_ignored() {
         assert!(!contains_credit_card("order 12345 shipped"));
+    }
+
+    // --- IBAN value detection (ADR-240) ---
+
+    #[test]
+    fn test_iban_check_valid_mod97() {
+        // Published valid example IBANs (compact, uppercase).
+        assert!(iban_check_valid(b"DE89370400440532013000"));
+        assert!(iban_check_valid(b"GB82WEST12345698765432"));
+        assert!(iban_check_valid(b"NO9386011117947")); // 15 chars, all-digit BBAN
+        // Flip one digit → checksum fails.
+        assert!(!iban_check_valid(b"DE89370400440532013001"));
+        // Too short / too long → rejected outright.
+        assert!(!iban_check_valid(b"DE8937"));
+    }
+
+    #[test]
+    fn test_iban_detected_without_keyword() {
+        // A bare IBAN with no "iban" keyword must still be caught (→ sensitive).
+        assert!(contains_iban("please wire to DE89370400440532013000 today"));
+        assert!(contains_iban("GB82WEST12345698765432"));
+        // Lowercase country code is accepted (normalised to uppercase for the check).
+        assert!(contains_iban("acct gb82west12345698765432 ok"));
+    }
+
+    #[test]
+    fn test_iban_rejects_non_iban_runs() {
+        // A random alphanumeric run of IBAN-ish length must not validate.
+        assert!(!contains_iban("token AB12CDEF34567890QRSTUVWX is not a bank code"));
+        // A plain long digit run (no 2-letter country prefix) is not an IBAN.
+        assert!(!contains_iban("id 370400440532013000 here"));
+    }
+
+    #[test]
+    fn test_iban_span_excludes_trailing_word() {
+        // The compact scan ends at the first non-alphanumeric byte, so a following
+        // word is never glued onto the span.
+        let spans = iban_spans("to DE89370400440532013000 now");
+        assert_eq!(spans.len(), 1);
+        let (s, e) = spans[0];
+        assert_eq!(&"to DE89370400440532013000 now"[s..e], "DE89370400440532013000");
     }
 
     // --- My Number (マイナンバー, ADR-212) ---

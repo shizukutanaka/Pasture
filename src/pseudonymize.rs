@@ -146,6 +146,7 @@ struct Ctx {
     env_n: usize,      // ADR-203: env-var secret values
     pem_n: usize,      // ADR-204: PEM private-key blocks
     mynumber_n: usize, // ADR-212: Japanese My Number (マイナンバー)
+    iban_n: usize,     // ADR-240: IBAN bank account numbers
 }
 
 impl Ctx {
@@ -162,6 +163,7 @@ impl Ctx {
             env_n: 0,
             pem_n: 0,
             mynumber_n: 0,
+            iban_n: 0,
         }
     }
 
@@ -206,6 +208,10 @@ impl Ctx {
             "MYNUMBER" => {
                 self.mynumber_n += 1;
                 self.mynumber_n
+            }
+            "IBAN" => {
+                self.iban_n += 1;
+                self.iban_n
             }
             _ => {
                 self.key_n += 1;
@@ -392,6 +398,14 @@ fn mask_credit_cards(text: &str, ctx: &mut Ctx) -> String {
     apply_spans(text, crate::privacy::credit_card_spans(text), ctx, "CARD")
 }
 
+/// Mask IBAN bank account numbers with `<IBAN_n>` tokens (ADR-240). Runs before
+/// `mask_credit_cards` so a short all-digit IBAN's digit run is claimed here (as
+/// part of the whole IBAN, prefix letters included) rather than partially caught
+/// by the 13–19-digit card scan. Compact form only; see `privacy::iban_spans`.
+fn mask_ibans(text: &str, ctx: &mut Ctx) -> String {
+    apply_spans(text, crate::privacy::iban_spans(text), ctx, "IBAN")
+}
+
 /// Mask Japanese My Numbers (マイナンバー) with `<MYNUMBER_n>` tokens (ADR-212).
 /// A 12-digit My Number may be written with space/hyphen separators
 /// (`1234 5678 9018`), spanning multiple whitespace tokens, so it needs a
@@ -440,6 +454,8 @@ fn mask_pem_keys(text: &str, ctx: &mut Ctx) -> String {
 /// Replace PII in `text` token by token, preserving original whitespace.
 fn replace_in_text(text: &str, ctx: &mut Ctx) -> String {
     // Pre-passes in order of specificity:
+    //  0. IBANs (2 letters + 2 check digits + BBAN, MOD-97, ADR-240) — FIRST, so
+    //     a short all-digit IBAN is masked whole before the card scan sees it.
     //  1. Credit-card numbers (13-19 digits, may span whitespace, ADR-196)
     //  2. My Numbers (マイナンバー, exactly 12 digits + check digit, ADR-212)
     //  3. International phone numbers (`+1 555 123 4567`, span whitespace, ADR-207)
@@ -448,10 +464,11 @@ fn replace_in_text(text: &str, ctx: &mut Ctx) -> String {
     //  6. PEM private-key blocks (multi-line, ADR-204)
     // Each pass chains its output into the next; the per-token loop then handles
     // the remaining single-token PII (email, IP, domestic phone, API key, JWT).
-    // Cards (13-19 digits) and My Numbers (exactly 12) are length-disjoint, and
-    // both are digit-anchored while phones are '+'-anchored, so no pre-pass
-    // contends with another for the same bytes.
-    let masked = mask_credit_cards(text, ctx);
+    // IBANs are letter-anchored; cards (13-19 digits) and My Numbers (exactly 12)
+    // are length-disjoint and digit-anchored while phones are '+'-anchored, so
+    // no pre-pass contends with another for the same bytes.
+    let masked = mask_ibans(text, ctx);
+    let masked = mask_credit_cards(&masked, ctx);
     let masked = mask_my_numbers(&masked, ctx);
     let masked = mask_phones(&masked, ctx);
     let masked = mask_url_credentials(&masked, ctx);
@@ -651,6 +668,72 @@ mod tests {
             out[0].content
         );
         assert!(out[0].content.contains("12345"), "short number preserved");
+    }
+
+    #[test]
+    fn test_iban_is_pseudonymized_and_restored() {
+        // ADR-240: a checksum-valid IBAN must be masked before the cloud and
+        // restored after, with surrounding words preserved.
+        let msgs = vec![msg("wire to DE89370400440532013000 today")];
+        let (out, mapping) = pseudonymize_messages(&msgs);
+        assert!(
+            out[0].content.contains("<IBAN_1>"),
+            "IBAN must be masked: {}",
+            out[0].content
+        );
+        assert!(
+            !out[0].content.contains("DE89370400440532013000"),
+            "raw IBAN must not remain: {}",
+            out[0].content
+        );
+        assert!(out[0].content.starts_with("wire to "));
+        assert!(out[0].content.ends_with(" today"));
+        let restored = restore(&out[0].content, &mapping);
+        assert!(
+            restored.contains("DE89370400440532013000"),
+            "IBAN must restore: {restored}"
+        );
+    }
+
+    #[test]
+    fn test_short_all_digit_iban_masked_whole_not_as_card() {
+        // A 15-char Norwegian IBAN = NO + 13 digits: the digit run alone is in
+        // the 13-19 card window, so IBAN masking MUST run first and claim the
+        // whole thing (prefix included) as one <IBAN> token, never a <CARD>.
+        let msgs = vec![msg("acct NO9386011117947 ok")];
+        let (out, _) = pseudonymize_messages(&msgs);
+        assert!(
+            out[0].content.contains("<IBAN_1>"),
+            "short IBAN masked whole: {}",
+            out[0].content
+        );
+        assert!(
+            !out[0].content.contains("<CARD"),
+            "must not be split into a card token: {}",
+            out[0].content
+        );
+    }
+
+    #[test]
+    fn test_iban_in_tool_call_arguments_masked() {
+        // An IBAN inside tool-call argument JSON is masked too (via replace_in_text).
+        let tc = r#"[{"function":{"name":"pay","arguments":"{\"iban\":\"DE89370400440532013000\"}"}}]"#;
+        let msgs = vec![Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls_json: Some(tc.to_string()),
+            ..Default::default()
+        }];
+        let (out, _) = pseudonymize_messages(&msgs);
+        let tc_out = out[0].tool_calls_json.as_deref().unwrap_or("");
+        assert!(
+            tc_out.contains("<IBAN_1>"),
+            "IBAN in tool-call args must be masked: {tc_out}"
+        );
+        assert!(
+            !tc_out.contains("DE89370400440532013000"),
+            "raw IBAN must not remain in tool-call args: {tc_out}"
+        );
     }
 
     #[test]

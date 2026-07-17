@@ -288,6 +288,7 @@ to text three different ways, each matched to its job (ADR-184/187):
 | `ip` | Four-octet IPv4 in 0–255 |
 | `credit_card` | 13–19 digit run passing Luhn check |
 | `my_number` | Japanese My Number (マイナンバー): exactly 12 digits passing the check-digit (検査用数字) test (ADR-212) |
+| `iban` | IBAN bank account **value** (compact form, 15–34 chars) passing the ISO 7064 MOD-97-10 checksum, independent of the `iban` keyword (ADR-240) |
 | `phone` | International `+`-form (8–15 digits) and JP domestic mobile/hyphenated landline |
 | `api_key` | Known vendor prefix + min length (20+ prefixes: OpenAI, GitHub, Stripe, SendGrid, AWS, Google OAuth, npm, …) |
 | `jwt` | `eyJ…` + 3 base64url segments |
@@ -296,7 +297,7 @@ to text three different ways, each matched to its job (ADR-184/187):
 | `env_secret` | `KEY=value` / `export KEY=value` where KEY name suggests a secret (password/secret/token/auth/…) |
 
 **Full-width normalization (ADR-213/214):** before running the digit-based
-detectors (`ip`, `credit_card`, `my_number`, `phone`), the classifier normalizes
+detectors (`ip`, `credit_card`, `my_number`, `iban`, `phone`), the classifier normalizes
 to ASCII: full-width digits (`０`–`９`, U+FF10–FF19), the full-width full stop
 (`．` → `.`), the full-width hyphen and Unicode dash family (`－‐‑‒–—―` → `-`),
 and the ideographic space (`　` → ` `). So numeric PII typed in full-width form
@@ -515,7 +516,10 @@ pre-pass, ADR-207), `<KEY_n>`, `<CARD_n>` (Luhn-valid credit cards, ADR-196),
 `<JWT_n>` (ADR-197), `<URL_n>` (userinfo in `scheme://user:pass@host`, ADR-203),
 `<ENV_n>` (secret value in `KEY=value` / `export KEY=value` assignments, ADR-203),
 `<PEM_n>` (complete PEM private-key block, header + body + footer, ADR-204),
-`<MYNUMBER_n>` (Japanese My Number / マイナンバー — 12 digits + check digit, ADR-212).
+`<MYNUMBER_n>` (Japanese My Number / マイナンバー — 12 digits + check digit, ADR-212),
+`<IBAN_n>` (IBAN bank account value, compact form, MOD-97 checksum — masked by a
+span pre-pass that runs **before** credit-card masking so a short all-digit IBAN
+is claimed whole rather than partially caught by the 13–19-digit card scan, ADR-240).
 Coverage:
 
 - **Message content** — tokenised and restored (buffered + SSE, the latter handling a
