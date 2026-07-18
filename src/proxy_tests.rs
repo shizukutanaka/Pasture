@@ -4582,6 +4582,102 @@ fn test_legacy_completion_wrong_method_returns_405() {
     assert_eq!(status, 405);
 }
 
+// ── IMP-38 Responses API shim (ADR-241) ─────────────────────────────────────
+
+#[test]
+fn test_build_responses_response_shape() {
+    let resp = CompletionResponse {
+        content: "hi there".to_string(),
+        model: "local-model".to_string(),
+        prompt_tokens: 5,
+        completion_tokens: 3,
+        tool_calls: None,
+    };
+    let json = build_responses_response(&resp, "local");
+    let v = crate::json::parse(&json).expect("valid JSON");
+    assert_eq!(v.get("object").and_then(|x| x.as_str()), Some("response"));
+    assert_eq!(v.get("status").and_then(|x| x.as_str()), Some("completed"));
+    assert_eq!(v.get("output_text").and_then(|x| x.as_str()), Some("hi there"));
+    // Canonical nested shape: output[0].content[0].text.
+    let text = v
+        .get("output")
+        .and_then(|o| o.as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str());
+    assert_eq!(text, Some("hi there"));
+    // Responses-style usage names.
+    assert_eq!(
+        v.get("usage").and_then(|u| u.get("input_tokens")).and_then(|x| x.as_f64()),
+        Some(5.0)
+    );
+    assert_eq!(
+        v.get("usage").and_then(|u| u.get("output_tokens")).and_then(|x| x.as_f64()),
+        Some(3.0)
+    );
+    assert!(json.contains("\"x_pasture_route\":\"local\""), "{json}");
+}
+
+#[test]
+fn test_responses_string_input_roundtrip() {
+    let p = proxy_with(true, false, 100, "unused");
+    let body = r#"{"model":"m","input":"hello there"}"#;
+    let (status, resp_body) = roundtrip(p, http_post("/v1/responses", body));
+    assert_eq!(status, 200, "body: {resp_body}");
+    assert!(
+        resp_body.contains("\"object\":\"response\""),
+        "body: {resp_body}"
+    );
+    assert!(resp_body.contains("\"output_text\":"), "body: {resp_body}");
+}
+
+#[test]
+fn test_responses_array_input_with_input_text_parts() {
+    // The Responses API tags text parts `input_text`; the shim must accept them.
+    let p = proxy_with(true, false, 100, "unused");
+    let body = r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+    let (status, resp_body) = roundtrip(p, http_post("/v1/responses", body));
+    assert_eq!(status, 200, "body: {resp_body}");
+    assert!(resp_body.contains("\"object\":\"response\""), "body: {resp_body}");
+}
+
+#[test]
+fn test_responses_stream_true_rejected() {
+    let p = proxy_with(true, false, 100, "unused");
+    let body = r#"{"model":"m","input":"hi","stream":true}"#;
+    let (status, resp_body) = roundtrip(p, http_post("/v1/responses", body));
+    assert_eq!(status, 400, "streaming Responses must be rejected: {resp_body}");
+    assert!(resp_body.contains("streaming"), "body: {resp_body}");
+}
+
+#[test]
+fn test_responses_tools_rejected_not_silently_dropped() {
+    // Silently dropping tools is the exact Responses-migration failure mode
+    // (a tool call rendered as raw text); the shim must reject instead.
+    let p = proxy_with(true, false, 100, "unused");
+    let body = r#"{"model":"m","input":"hi","tools":[{"type":"function","name":"f"}]}"#;
+    let (status, resp_body) = roundtrip(p, http_post("/v1/responses", body));
+    assert_eq!(status, 400, "tools must be rejected: {resp_body}");
+    assert!(resp_body.contains("tool"), "body: {resp_body}");
+}
+
+#[test]
+fn test_responses_missing_input_returns_400() {
+    let p = proxy_with(true, false, 100, "unused");
+    let (status, _) = roundtrip(p, http_post("/v1/responses", r#"{"model":"m"}"#));
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn test_responses_wrong_method_returns_405() {
+    let p = proxy_with(true, false, 100, "unused");
+    let (status, raw) = roundtrip(p, "GET /v1/responses HTTP/1.1\r\nConnection: close\r\n\r\n".to_string());
+    assert_eq!(status, 405, "{raw}");
+}
+
 #[test]
 fn test_fast_model_used_for_simple_prompt() {
     let log = tmp_log();

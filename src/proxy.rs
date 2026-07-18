@@ -651,6 +651,7 @@ impl Proxy {
     /// send 405 Method Not Allowed. Returns `None` for unknown paths (→ 404).
     fn route_allowed_methods(path: &str) -> Option<&'static str> {
         if path.starts_with("/v1/chat/completions")
+            || path.starts_with("/v1/responses")
             || path.starts_with("/v1/completions")
             || path.starts_with("/v1/embeddings")
             || path.starts_with("/v1/moderations")
@@ -2552,6 +2553,174 @@ impl Proxy {
         Ok(build_legacy_completion_response(&resp, label))
     }
 
+    /// Extract plain text from a Responses-API content value (IMP-38): a string,
+    /// or an array of parts. Unlike the Chat Completions parts (`type:"text"`),
+    /// the Responses API tags text parts `input_text` / `output_text`; both are
+    /// accepted, as is a bare `{"text": …}`. A non-text part (image/file/audio)
+    /// is rejected — Pasture routes text only, same as `extract_message_content`.
+    fn extract_responses_content(c: &JsonValue) -> Result<String, ProxyError> {
+        match c {
+            JsonValue::Str(s) => Ok(s.clone()),
+            JsonValue::Array(parts) => {
+                let mut out: Vec<String> = Vec::with_capacity(parts.len());
+                for part in parts {
+                    let kind = part.get("type").and_then(|t| t.as_str());
+                    let text = part.get("text").and_then(|t| t.as_str());
+                    match (kind, text) {
+                        (Some("input_text"), Some(t))
+                        | (Some("output_text"), Some(t))
+                        | (Some("text"), Some(t))
+                        | (None, Some(t)) => out.push(t.to_string()),
+                        (Some(other), _) => {
+                            return Err(ProxyError::BadRequest(format!(
+                                "unsupported content part '{other}'; Pasture routes text only"
+                            )));
+                        }
+                        _ => {
+                            return Err(ProxyError::BadRequest(
+                                "content part missing 'text'".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok(out.join("\n"))
+            }
+            _ => Err(ProxyError::BadRequest(
+                "'input' content must be a string or array of text parts".to_string(),
+            )),
+        }
+    }
+
+    /// Parse a `POST /v1/responses` request (IMP-38, ADR-241) into the internal
+    /// chat shape. Translates the OpenAI Responses surface: `input` (a string, or
+    /// an array of `{role, content}` items) → `messages`; a top-level
+    /// `instructions` string → a leading system message; `max_output_tokens` →
+    /// `max_tokens`. Text-only, non-streaming: `stream:true` and a non-empty
+    /// `tools` array are rejected with a clear 400 pointing at
+    /// `/v1/chat/completions` (rather than silently dropping tools, the failure
+    /// mode the Responses migration is known to cause — a tool call rendered as
+    /// raw text). `developer` role maps to `system`.
+    fn parse_responses_request(body: &str) -> Result<CompletionRequest, ProxyError> {
+        let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
+        if v.get("stream").and_then(JsonValue::as_bool).unwrap_or(false) {
+            return Err(ProxyError::BadRequest(
+                "streaming is not supported on /v1/responses; omit \"stream\" or use POST /v1/chat/completions"
+                    .to_string(),
+            ));
+        }
+        if v.get("tools")
+            .is_some_and(|t| matches!(t, JsonValue::Array(a) if !a.is_empty()))
+        {
+            return Err(ProxyError::BadRequest(
+                "tool use is not supported on /v1/responses; use POST /v1/chat/completions"
+                    .to_string(),
+            ));
+        }
+        let model = v
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("default")
+            .to_string();
+        let mut messages: Vec<Message> = Vec::new();
+        // `instructions` is the Responses API's system-prompt field.
+        if let Some(instr) = v.get("instructions").and_then(JsonValue::as_str) {
+            if !instr.is_empty() {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: instr.to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+        match v.get("input") {
+            Some(JsonValue::Str(s)) => {
+                if s.is_empty() {
+                    return Err(ProxyError::BadRequest("empty 'input'".to_string()));
+                }
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: s.clone(),
+                    ..Default::default()
+                });
+            }
+            Some(JsonValue::Array(items)) => {
+                for item in items {
+                    let role = match item.get("role").and_then(JsonValue::as_str) {
+                        Some("developer") => "system".to_string(),
+                        Some(r) => r.to_string(),
+                        None => "user".to_string(),
+                    };
+                    let content = match item.get("content") {
+                        Some(c) => Self::extract_responses_content(c)?,
+                        None => {
+                            return Err(ProxyError::BadRequest(
+                                "input item missing 'content'".to_string(),
+                            ))
+                        }
+                    };
+                    messages.push(Message {
+                        role,
+                        content,
+                        ..Default::default()
+                    });
+                }
+            }
+            _ => {
+                return Err(ProxyError::BadRequest(
+                    "missing or invalid 'input' (expected a string or array)".to_string(),
+                ))
+            }
+        }
+        if messages.iter().all(|m| m.role == "system") {
+            return Err(ProxyError::BadRequest(
+                "'input' produced no user/assistant message".to_string(),
+            ));
+        }
+        let mut sampling = Self::parse_sampling(&v);
+        // Responses names the output cap `max_output_tokens`; honour it over the
+        // chat-style `max_tokens` when present.
+        if let Some(mo) = v
+            .get("max_output_tokens")
+            .and_then(JsonValue::as_f64)
+            .filter(|x| x.is_finite() && *x >= 0.0)
+        {
+            sampling.max_tokens = Some(mo as u64);
+        }
+        Ok(CompletionRequest {
+            model,
+            messages,
+            stream: false,
+            has_tools: false,
+            sampling,
+        })
+    }
+
+    /// Handle `POST /v1/responses` (IMP-38): route through the normal pipeline and
+    /// re-format the reply as a Responses `object:"response"`. Mirrors the legacy
+    /// completion shim (injection guard, cost log) so behaviour is identical bar
+    /// the request/response translation.
+    fn handle_responses(&self, body: &str) -> Result<String, ProxyError> {
+        let req = Self::parse_responses_request(body)?;
+        if self.injection_guard != "off" {
+            let text = req.routing_text();
+            if let crate::guard::InjectionRisk::Flag(label) =
+                crate::guard::classify_injection(&text)
+            {
+                if self.injection_guard == "block" {
+                    self.injection_stats.tally(&label, "blocked");
+                    return Err(ProxyError::BadRequest(format!(
+                        "request blocked by injection guard: {label}"
+                    )));
+                }
+                eprintln!("pasture: injection_flag:{label} (flag mode, responses request proceeds)");
+                self.injection_stats.tally(&label, "flagged");
+            }
+        }
+        let (resp, label, logprob, reserved) = self.run_completion(&req)?;
+        self.log_cost(label, &resp, logprob, reserved);
+        Ok(build_responses_response(&resp, label))
+    }
+
     /// Parse an OpenAI embeddings `input`: a string or an array of strings.
     fn parse_embeddings_request(body: &str) -> Result<Vec<String>, ProxyError> {
         let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
@@ -2873,6 +3042,10 @@ impl Proxy {
                     Ok(req) => wr_result!(self.complete_buffered(&req)),
                     Err(e) => wr_err!(e),
                 }
+            } else if method == "POST" && path.starts_with("/v1/responses") {
+                // OpenAI Responses API shim (IMP-38): translate input→messages,
+                // route through the same pipeline, return object:"response".
+                wr_result!(self.handle_responses(&body));
             } else if method == "POST" && path.starts_with("/v1/completions") {
                 // Legacy text-completion API shim — maps prompt→chat message,
                 // routes through the same pipeline, returns object:"text_completion".
@@ -3983,6 +4156,31 @@ pub fn build_legacy_completion_response(resp: &CompletionResponse, route_label: 
         unix_now(),
         escape_string(&resp.model),
         escape_string(&resp.content),
+        resp.prompt_tokens,
+        resp.completion_tokens,
+        total,
+    )
+}
+
+/// Build an OpenAI Responses-API reply (`object:"response"`) for
+/// `POST /v1/responses` (IMP-38, ADR-241). The generated text is placed in the
+/// canonical `output[0].content[0]` (`type:"output_text"`) and also mirrored in
+/// the top-level `output_text` convenience field the SDKs expose. Usage uses the
+/// Responses names (`input_tokens`/`output_tokens`), not the chat names.
+pub fn build_responses_response(resp: &CompletionResponse, route_label: &str) -> String {
+    let total = resp.prompt_tokens + resp.completion_tokens;
+    let resp_id = next_completion_id().replace("chatcmpl-", "resp_");
+    let msg_id = next_completion_id().replace("chatcmpl-", "msg_");
+    let text = escape_string(&resp.content);
+    format!(
+        "{{\"id\":\"{resp_id}\",\"object\":\"response\",\"created_at\":{},\"model\":\"{}\",\
+\"status\":\"completed\",\"x_pasture_route\":\"{route_label}\",\
+\"output\":[{{\"type\":\"message\",\"id\":\"{msg_id}\",\"status\":\"completed\",\
+\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{text}\",\
+\"annotations\":[]}}]}}],\"output_text\":\"{text}\",\
+\"usage\":{{\"input_tokens\":{},\"output_tokens\":{},\"total_tokens\":{}}}}}",
+        unix_now(),
+        escape_string(&resp.model),
         resp.prompt_tokens,
         resp.completion_tokens,
         total,

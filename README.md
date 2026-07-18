@@ -69,6 +69,7 @@ base_url = http://127.0.0.1:8645/v1
   and `response_format` (JSON mode / structured outputs) are forwarded to the backend.
 - `POST /v1/embeddings` — pass-through to the local backend (Ollama or OpenAI-compat);
   returns the standard OpenAI embeddings shape. Local-only (no cloud escalation).
+- `POST /v1/responses` — OpenAI Responses API shim (IMP-38): translates `input`→messages and routes through the same pipeline, returning an `object:"response"` reply. Text-only, non-streaming (tools/streaming rejected with a pointer to `/v1/chat/completions`).
 - `GET /v1/models` — list the configured local (and cloud) model ids, OpenAI-compatible.
 - `GET /v1/models/{id}` — retrieve one configured model (or 404), OpenAI-compatible.
 - `GET /v1/stats` — live JSON snapshot of the cost-log counters (routes, rates, tokens, spend).

@@ -101,6 +101,30 @@ Success (non-stream): `200`, body is an OpenAI `chat.completion` object containi
 (`prompt_tokens`, `completion_tokens`, `total_tokens`), and the Pasture extension
 **`x_pasture_route`** ∈ {`local`,`cloud`,`cache`}.
 
+### 3.1a `POST /v1/responses` (OpenAI Responses API shim, IMP-38)
+A compatibility shim for the OpenAI Responses API (`client.responses.create`),
+which several clients — e.g. the Codex CLI — now require in place of Chat
+Completions. Translates the request into the internal chat shape and routes it
+through the **same** pipeline (routing, privacy, cache, cost log), then formats
+the reply as a Responses object.
+
+Request: `{"model", "input", …}`. `input` is a **string** (→ one user message) or
+an **array** of `{role, content}` items, where `content` is a string or an array
+of text parts (`type:"input_text"`/`"output_text"`/`"text"`). A top-level
+`instructions` string becomes a leading system message. `max_output_tokens` maps
+to `max_tokens`; `developer` role → `system`.
+
+Success (non-stream): `200`, `{"object":"response","status":"completed","model",`
+`"x_pasture_route","output":[{"type":"message","role":"assistant","content":`
+`[{"type":"output_text","text",…}]}],"output_text":<same text>,"usage":`
+`{"input_tokens","output_tokens","total_tokens"}}`.
+
+**Scope (v1):** text-only, non-streaming. `"stream":true` and a non-empty
+`"tools"` array are rejected with `400` pointing at `/v1/chat/completions` — a
+deliberate choice over silently dropping tools (the migration failure mode where
+a tool call surfaces as raw text). Streaming Responses (`response.output_text.delta`
+SSE events) and tool use are documented follow-ups.
+
 ### 3.2 `GET /v1/models`
 `200`, OpenAI list: `{"object":"list","data":[{"id","object":"model","owned_by":"pasture"}…]}`
 listing the configured local (and, if enabled, cloud) model ids; de-duplicated. An
