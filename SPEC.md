@@ -279,7 +279,12 @@ returns at the first match (I4):
    markers (EN/JA); `≥3` clause-terminating question marks (ADR-209 — a URL query
    `?` followed by alphanumeric does not count; full-width `？` always counts);
    `≥3` **distinct** math symbol types (ADR-208 — e.g. `^`, `+`, `=` together;
-   single-char repetition like `/` in a URL does not trigger); **`has_tools`** (IMP-10).
+   single-char repetition like `/` in a URL does not trigger); **multi-step**
+   (ADR-242 — `≥3` distinct sequencing cues such as *first/then/finally* or
+   まず/次に/最後に, matched whole-word so "then" inside "strengthen" does not
+   count, **or** a numbered list of `≥3` items; catches short multi-step plans
+   the reasoning markers and length threshold miss, which small local models
+   handle worse per 2026 SLM benchmarks); **`has_tools`** (IMP-10).
 5. **Length.** `estimate_tokens(text) ≥ threshold` ⇒ **cloud**, else **local**.
 
 **Token estimation:** script-aware (ADR-022). CJK/Hangul/fullwidth ≈ 1 token/char;

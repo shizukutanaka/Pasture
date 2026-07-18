@@ -400,7 +400,89 @@ pub fn hard_signals(text: &str) -> Vec<&'static str> {
     if looks_mathy(text) {
         signals.push("math");
     }
+    if is_multi_step(text) {
+        signals.push("multi_step");
+    }
     signals
+}
+
+/// English sequencing cue words (matched whole-word) that mark an explicit
+/// enumeration of sequential steps.
+const STEP_CUES_EN: &[&str] = &[
+    "first",
+    "firstly",
+    "second",
+    "secondly",
+    "third",
+    "thirdly",
+    "then",
+    "next",
+    "afterward",
+    "afterwards",
+    "finally",
+    "lastly",
+    "subsequently",
+];
+
+/// Japanese sequencing cues (matched as substrings — distinctive multi-byte
+/// sequences with negligible false-positive risk, and JA has no word breaks).
+const STEP_CUES_JA: &[&str] = &["まず", "次に", "その後", "最後に", "はじめに", "続いて", "それから"];
+
+/// True when the prompt enumerates **≥3 distinct sequential steps** (IMP-40):
+/// an implicit multi-step plan like "first X, then Y, finally Z", or a numbered
+/// list of ≥3 items. These carry no explicit reasoning marker (`step by step`,
+/// `prove`) so the reasoning signal misses them, and they can sit below the
+/// token threshold, yet multi-step tasks are exactly where a small local model
+/// underperforms a frontier model (2026 SLM benchmarks) — so they should
+/// escalate. Counting *distinct cue types* (not raw occurrences) plus a
+/// numbered-list detector keeps false positives on a casual "…, then …" low.
+pub fn is_multi_step(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // Distinct EN cue types via word-boundary tokenization (substring matching
+    // would fire on "then" inside "strengthen").
+    let mut distinct: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for w in lower.split(|c: char| !c.is_alphanumeric()) {
+        if STEP_CUES_EN.contains(&w) {
+            distinct.insert(w);
+        }
+    }
+    for cue in STEP_CUES_JA {
+        if lower.contains(cue) {
+            distinct.insert(cue);
+        }
+    }
+    if distinct.len() >= 3 {
+        return true;
+    }
+    numbered_list_items(text) >= 3
+}
+
+/// Count list items introduced by `N.`/`N)` at a token boundary and followed by
+/// whitespace (so `3.14` is not a list item). Used by `is_multi_step`.
+fn numbered_list_items(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut count = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        if at_boundary && bytes[i].is_ascii_digit() {
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            // A marker is <digits><'.' or ')'> then whitespace or end-of-text.
+            if j < bytes.len()
+                && matches!(bytes[j], b'.' | b')')
+                && (j + 1 == bytes.len() || bytes[j + 1].is_ascii_whitespace())
+            {
+                count += 1;
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    count
 }
 
 /// True when the prompt has no hard content signals and is below `threshold`
@@ -1103,6 +1185,32 @@ mod tests {
         assert!(hard_signals("output as XML").contains(&"format"));
         // A plain factual prompt is still untouched (no false escalation).
         assert!(hard_signals("what time is it in Tokyo").is_empty());
+    }
+
+    #[test]
+    fn test_is_multi_step_detects_sequenced_plans() {
+        // ≥3 distinct sequencing cues → multi-step (no reasoning keyword present).
+        assert!(is_multi_step(
+            "first set up the database, then migrate the schema, finally deploy"
+        ));
+        assert!(is_multi_step("まず設計し、次に実装して、最後にテストする"));
+        // A numbered list of ≥3 items.
+        assert!(is_multi_step("do these:\n1. clone the repo\n2. build it\n3. run tests"));
+        // And it feeds the hard-signal set so such prompts escalate.
+        assert!(hard_signals("first do X, then do Y, then finally do Z").contains(&"multi_step"));
+    }
+
+    #[test]
+    fn test_is_multi_step_avoids_false_positives() {
+        // One or two casual cues is not a multi-step task.
+        assert!(!is_multi_step("first, thanks for the help"));
+        assert!(!is_multi_step("I was there, then I left"));
+        // Substring safety: "then" inside "strengthen" must not count.
+        assert!(!is_multi_step("how do I strengthen this argument"));
+        // A decimal is not a numbered-list item.
+        assert!(!is_multi_step("the value is 3.14 and pi is irrational"));
+        // Plain factual prompts stay clear of the whole hard-signal set.
+        assert!(!hard_signals("what is the capital of France").contains(&"multi_step"));
     }
 
     #[test]
