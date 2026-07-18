@@ -2767,7 +2767,7 @@ impl Proxy {
             .unwrap_or(4)
             .clamp(2, 32);
         eprintln!(
-            "pasture: listening on http://{addr} ({workers} workers, POST /v1/chat/completions, GET /v1/models, GET /v1/stats, dashboard at http://{addr}/dashboard)"
+            "pasture: listening on http://{addr} ({workers} workers, POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /v1/stats, dashboard at http://{addr}/dashboard)"
         );
 
         let proxy = Arc::new(self);

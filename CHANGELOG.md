@@ -5,6 +5,23 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — Responses API, IBAN masking, multi-step routing (IMP-38/43/40, ADR-240–242)
+
+- **`POST /v1/responses`** — an OpenAI Responses API compatibility shim (IMP-38,
+  ADR-241): translates `input`→messages, `instructions`→system message,
+  `max_output_tokens`→`max_tokens`, and routes through the same pipeline,
+  returning an `object:"response"`. Text-only, non-streaming; `stream:true` and
+  a non-empty `tools` array are rejected with a `400` pointing at
+  `/v1/chat/completions` (rather than silently dropping tools).
+- **IBAN value detection & masking** (IMP-43, ADR-240): a bare IBAN (no keyword)
+  is caught by an ISO 7064 MOD-97-10 span pre-pass → classified sensitive (kept
+  local) and masked `<IBAN_n>` before any cloud call, run before card masking so
+  a short all-digit IBAN isn't split into a `<CARD>`.
+- **`multi_step` routing signal** (IMP-40, ADR-242): short prompts that
+  enumerate ≥3 sequential steps ("first…then…finally", or a numbered list) now
+  escalate to cloud — the multi-step tasks small local models handle worse
+  (2026 SLM data) that the reasoning markers and length threshold both miss.
+
 ## [0.27.0] - 2026-07-17
 
 ### Added — external research refresh: dashboard, savings, OTel aliases, cache safety, calibrate sweep (IMP-36/37/39/41/42, ADR-235–239)
