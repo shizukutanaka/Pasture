@@ -331,7 +331,52 @@ zero-dep/single-user/privacy wedge):**
 
 | IMP | Candidate | So-what / grounding |
 |-----|-----------|---------------------|
-| **IMP-44** | Declarative fallback chain + model-suffix routing (`model:local`, `auto:cheap`) | Every 2025-era gateway converged on declarative fallback chains and OpenRouter-style model-suffix intent. Parse suffixes off the incoming `model`; make the backend fallback list config-driven with per-hop timeout — composes with existing circuit breakers. |
+| **IMP-44** | Declarative fallback chain + model-suffix routing (`model:local`, `auto:cheap`) | Every 2025-era gateway converged on declarative fallback chains and OpenRouter-style model-suffix intent. Parse suffixes off the incoming `model`; make the backend fallback list config-driven with per-hop timeout — composes with existing circuit breakers. **Assessed & deferred (2026-07):** model-suffix needs a `route_hint` field on `CompletionRequest` (25 explicit constructors → high churn) for niche single-user value; the fallback chain overlaps the shipped cloud→local + secondary-provider fallback (ADR-136). Revisit only if a concrete user need appears. |
+
+## 4e. Strengths / weaknesses audit (2026-07, post-IMP-44 backlog)
+
+> Source: first-hand assessment after shipping IMP-36→43 and IMP-38/40 this
+> cycle (ADR-235–242). Unlike §4a–4d (feature backlogs), this is a candid
+> state-of-the-codebase read to guide what a *future* contributor should tackle.
+
+**Strengths (the moat — do not erode):**
+- **Zero-dependency single binary, std-only default.** No peer gateway ships
+  this. It is the whole wedge; every change is judged against invariant I1.
+- **Verification culture.** 867 tests + `eval` harness + a SPEC drift-guard test
+  (`test_spec_documents_every_stats_response_field`) + i18n catalog-parity test.
+  Features are routinely verified end-to-end against a fake NDJSON Ollama, not
+  just unit-tested.
+- **Verified improvement ledger.** `IMPROVEMENTS.jsonl` (222 entries) with a
+  fixed schema makes the improvement history a queryable asset (SELF_IMPROVEMENT.md).
+- **Layered privacy.** keyword + checksum-validated *value* recognizers (Luhn,
+  My Number, IBAN/MOD-97) + reversible pseudonymization + output scan, all
+  std-only, EN+JA. Forced-local on any sensitive hit.
+
+**Weaknesses (honest gaps a contributor could close):**
+- **(W1) Agent conventions were tribal knowledge.** No `CLAUDE.md` existed, so
+  each session re-derived the toolchain workaround and the IMP→ADR→ledger ritual.
+  *Closed by the CLAUDE.md added alongside this section.*
+- **(W2) Toolchain pin is offline-hostile.** `rust-toolchain.toml` pins 1.75.0,
+  which cannot be fetched in a sandbox; every build here uses `rustup run stable`.
+- **(W3) `/v1/responses` is text-only.** Streaming (`response.output_text.delta`
+  SSE) and tool forwarding are rejected with a 400 (ADR-241).
+- **(W4) No history store.** The dashboard and `/v1/stats` are point-in-time;
+  there is no time-series, so no trend/sparkline is possible without one.
+- **(W5) `proxy.rs` is ~4k lines.** The single-file HTTP/routing/dispatch module
+  is large enough that finding call sites is slow; a module split would help.
+- **(W6) No live-model quality eval.** Tests use MockBackend / fake Ollama; there
+  is no harness measuring real local-vs-cloud answer quality on a task set.
+
+**Improvement candidates (IMP-45→, priority order, each keeps the wedge):**
+
+| IMP | Candidate | So-what / grounding |
+|-----|-----------|---------------------|
+| **IMP-45** | Streaming `POST /v1/responses` (SSE Responses events) | Closes W3; completes the ADR-241 shim. Emit `response.created` / `response.output_text.delta` / `response.completed`. Invasive (dual SSE protocol in `stream_chat_to_socket`) → Opus-scale. |
+| **IMP-46** | Semantic-cache lexical second-gate | Research (2601.23088 collision study): require a token-set/char-3gram overlap floor before serving a cosine hit, cutting embedding false-positives. std-only, contained in `cache.rs`. |
+| **IMP-47** | Verbalized-confidence cascade signal + AUROC self-test | Research (2604.19781): a second escalation signal beyond mean-logprob, with a bundled probe set that auto-disables a signal whose AUROC ≈ 0.5. std-only counting. |
+| **IMP-48** | Lightweight daily-counter history for the dashboard | Closes W4: append one JSONL row per day (routes/tokens/spend/savings) so the dashboard can draw a 30-day trend. Bounded file, std-only. |
+| **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
+| **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | Research (Anthropic 5-min-TTL change): inject `cache_control`, price `cache_creation`/`cache_read` tokens correctly in the budget guard. Behind the `cloud` flag. |
 
 ## 5. Anti-goals (deliberately *not* adopting)
 
