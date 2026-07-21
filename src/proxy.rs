@@ -2602,7 +2602,10 @@ impl Proxy {
     /// raw text). `developer` role maps to `system`.
     fn parse_responses_request(body: &str) -> Result<CompletionRequest, ProxyError> {
         let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
-        if v.get("stream").and_then(JsonValue::as_bool).unwrap_or(false) {
+        if v.get("stream")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+        {
             return Err(ProxyError::BadRequest(
                 "streaming is not supported on /v1/responses; omit \"stream\" or use POST /v1/chat/completions"
                     .to_string(),
@@ -2712,7 +2715,9 @@ impl Proxy {
                         "request blocked by injection guard: {label}"
                     )));
                 }
-                eprintln!("pasture: injection_flag:{label} (flag mode, responses request proceeds)");
+                eprintln!(
+                    "pasture: injection_flag:{label} (flag mode, responses request proceeds)"
+                );
                 self.injection_stats.tally(&label, "flagged");
             }
         }

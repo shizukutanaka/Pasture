@@ -348,8 +348,14 @@ mod tests {
         // all-local / all-cloud extreme.
         let d = DEFAULT_SWEEP_TARGETS;
         assert!(!d.is_empty());
-        assert!(d.windows(2).all(|w| w[0] < w[1]), "must be strictly ascending");
-        assert!(d.iter().all(|&t| t > 0.0 && t < 1.0), "must be within (0,1)");
+        assert!(
+            d.windows(2).all(|w| w[0] < w[1]),
+            "must be strictly ascending"
+        );
+        assert!(
+            d.iter().all(|&t| t > 0.0 && t < 1.0),
+            "must be within (0,1)"
+        );
     }
 
     #[test]

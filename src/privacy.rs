@@ -905,7 +905,7 @@ mod tests {
         assert!(iban_check_valid(b"DE89370400440532013000"));
         assert!(iban_check_valid(b"GB82WEST12345698765432"));
         assert!(iban_check_valid(b"NO9386011117947")); // 15 chars, all-digit BBAN
-        // Flip one digit → checksum fails.
+                                                       // Flip one digit → checksum fails.
         assert!(!iban_check_valid(b"DE89370400440532013001"));
         // Too short / too long → rejected outright.
         assert!(!iban_check_valid(b"DE8937"));
@@ -923,7 +923,9 @@ mod tests {
     #[test]
     fn test_iban_rejects_non_iban_runs() {
         // A random alphanumeric run of IBAN-ish length must not validate.
-        assert!(!contains_iban("token AB12CDEF34567890QRSTUVWX is not a bank code"));
+        assert!(!contains_iban(
+            "token AB12CDEF34567890QRSTUVWX is not a bank code"
+        ));
         // A plain long digit run (no 2-letter country prefix) is not an IBAN.
         assert!(!contains_iban("id 370400440532013000 here"));
     }
@@ -935,7 +937,10 @@ mod tests {
         let spans = iban_spans("to DE89370400440532013000 now");
         assert_eq!(spans.len(), 1);
         let (s, e) = spans[0];
-        assert_eq!(&"to DE89370400440532013000 now"[s..e], "DE89370400440532013000");
+        assert_eq!(
+            &"to DE89370400440532013000 now"[s..e],
+            "DE89370400440532013000"
+        );
     }
 
     // --- My Number (マイナンバー, ADR-212) ---

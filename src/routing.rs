@@ -426,7 +426,15 @@ const STEP_CUES_EN: &[&str] = &[
 
 /// Japanese sequencing cues (matched as substrings — distinctive multi-byte
 /// sequences with negligible false-positive risk, and JA has no word breaks).
-const STEP_CUES_JA: &[&str] = &["まず", "次に", "その後", "最後に", "はじめに", "続いて", "それから"];
+const STEP_CUES_JA: &[&str] = &[
+    "まず",
+    "次に",
+    "その後",
+    "最後に",
+    "はじめに",
+    "続いて",
+    "それから",
+];
 
 /// True when the prompt enumerates **≥3 distinct sequential steps** (IMP-40):
 /// an implicit multi-step plan like "first X, then Y, finally Z", or a numbered
@@ -1195,7 +1203,9 @@ mod tests {
         ));
         assert!(is_multi_step("まず設計し、次に実装して、最後にテストする"));
         // A numbered list of ≥3 items.
-        assert!(is_multi_step("do these:\n1. clone the repo\n2. build it\n3. run tests"));
+        assert!(is_multi_step(
+            "do these:\n1. clone the repo\n2. build it\n3. run tests"
+        ));
         // And it feeds the hard-signal set so such prompts escalate.
         assert!(hard_signals("first do X, then do Y, then finally do Z").contains(&"multi_step"));
     }

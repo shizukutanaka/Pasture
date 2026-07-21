@@ -717,7 +717,8 @@ mod tests {
     #[test]
     fn test_iban_in_tool_call_arguments_masked() {
         // An IBAN inside tool-call argument JSON is masked too (via replace_in_text).
-        let tc = r#"[{"function":{"name":"pay","arguments":"{\"iban\":\"DE89370400440532013000\"}"}}]"#;
+        let tc =
+            r#"[{"function":{"name":"pay","arguments":"{\"iban\":\"DE89370400440532013000\"}"}}]"#;
         let msgs = vec![Message {
             role: "assistant".to_string(),
             content: String::new(),
