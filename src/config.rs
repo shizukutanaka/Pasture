@@ -62,6 +62,12 @@ pub struct Config {
     /// default 0.92. A hit is returned when similarity ≥ threshold. Ignored when
     /// `semantic_cache_size` is 0.
     pub semantic_cache_threshold: f64,
+    /// Lexical second-gate floor for semantic cache hits (IMP-46). A cosine hit
+    /// must also share at least this Jaccard token-set overlap with the cached
+    /// prompt, rejecting embedding false-positives that would serve a wrong
+    /// answer. Values in [0, 1]; `0.0` (default) disables the gate. Ignored when
+    /// `semantic_cache_size` is 0.
+    pub semantic_cache_min_lexical: f64,
     /// Path to a known-hard prompts file for the embedding difficulty signal
     /// (IMP-14). One prompt per line; `#` comments. Empty = disabled (the default).
     /// Requests embedding-similar to a listed prompt escalate Local → Cloud.
@@ -185,6 +191,7 @@ impl Default for Config {
             local_timeout_secs: 120,
             semantic_cache_size: 0,
             semantic_cache_threshold: 0.92,
+            semantic_cache_min_lexical: 0.0,
             hard_prompts: String::new(),
             hard_threshold: 0.85,
             skills: Vec::new(),
@@ -369,6 +376,11 @@ impl Config {
                 self.semantic_cache_threshold = f;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_SEMANTIC_MIN_LEXICAL") {
+            if let Ok(f) = v.parse::<f64>() {
+                self.semantic_cache_min_lexical = f;
+            }
+        }
         if let Ok(v) = std::env::var("PASTURE_HARD_PROMPTS") {
             self.hard_prompts = v;
         }
@@ -542,6 +554,11 @@ impl Config {
             "semantic_cache_threshold" => {
                 if let Ok(f) = val.parse::<f64>() {
                     self.semantic_cache_threshold = f;
+                }
+            }
+            "semantic_cache_min_lexical" => {
+                if let Ok(f) = val.parse::<f64>() {
+                    self.semantic_cache_min_lexical = f;
                 }
             }
             "hard_prompts" => self.hard_prompts = val.to_string(),

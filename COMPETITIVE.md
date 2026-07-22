@@ -372,7 +372,7 @@ zero-dep/single-user/privacy wedge):**
 | IMP | Candidate | So-what / grounding |
 |-----|-----------|---------------------|
 | **IMP-45** | Streaming `POST /v1/responses` (SSE Responses events) | Closes W3; completes the ADR-241 shim. Emit `response.created` / `response.output_text.delta` / `response.completed`. Invasive (dual SSE protocol in `stream_chat_to_socket`) → Opus-scale. |
-| **IMP-46** | Semantic-cache lexical second-gate | Research (2601.23088 collision study): require a token-set/char-3gram overlap floor before serving a cosine hit, cutting embedding false-positives. std-only, contained in `cache.rs`. |
+| **IMP-46** | Semantic-cache lexical second-gate | ✅ **SHIPPED (ADR-243)** — opt-in `PASTURE_SEMANTIC_MIN_LEXICAL` (default 0 = off): a cosine hit must also clear a Jaccard token-set overlap floor, rejecting embedding false-positives that would serve a wrong cached answer while preserving genuine paraphrase hits. std-only, in `cache.rs`; each entry stores a sorted token-hash fingerprint. |
 | **IMP-47** | Verbalized-confidence cascade signal + AUROC self-test | Research (2604.19781): a second escalation signal beyond mean-logprob, with a bundled probe set that auto-disables a signal whose AUROC ≈ 0.5. std-only counting. |
 | **IMP-48** | Lightweight daily-counter history for the dashboard | Closes W4: append one JSONL row per day (routes/tokens/spend/savings) so the dashboard can draw a 30-day trend. Bounded file, std-only. |
 | **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |

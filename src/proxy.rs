@@ -880,6 +880,21 @@ impl Proxy {
         self
     }
 
+    /// Set the semantic-cache lexical second-gate floor (IMP-46). Must be called
+    /// **after** `with_semantic_cache` (as `cli.rs` does); a no-op when the
+    /// semantic cache is disabled. `floor` is clamped to `[0,1]`; `0.0` (default)
+    /// leaves the gate off, so existing behaviour is unchanged unless configured.
+    pub fn with_semantic_min_lexical(self, floor: f64) -> Self {
+        if floor > 0.0 {
+            if let Some(ref sem_mutex) = self.semantic_cache {
+                if let Ok(mut guard) = sem_mutex.lock() {
+                    guard.set_min_lexical(floor);
+                }
+            }
+        }
+        self
+    }
+
     /// Enable the embedding difficulty signal (IMP-14): requests whose embedding
     /// is within `threshold` cosine similarity of any of `prompts` escalate
     /// Local → Cloud. An empty list leaves the signal disabled.
@@ -1382,7 +1397,10 @@ impl Proxy {
             {
                 if let Ok(mut guard) = sem_mutex.lock() {
                     let samp = crate::cache::sampling_key(&req.sampling);
-                    if let Some(hit) = guard.find_similar(emb, &req.model, samp) {
+                    // IMP-46: pass the prompt text for the lexical second-gate
+                    // (ignored when the gate is disabled, the default).
+                    let qtext = semantic_embed_text(req);
+                    if let Some(hit) = guard.find_similar(emb, &req.model, samp, &qtext) {
                         self.emit_cache_hit_span(otel_span, &hit, "semantic_cache");
                         return EmbeddingStep::SemanticHit(hit);
                     }
@@ -1509,6 +1527,7 @@ impl Proxy {
         cache_mapping: Option<&crate::pseudonymize::Mapping>,
         req_model: &str,
         req_sampling: u64,
+        query_text: &str,
         reserved_tokens: u64,
     ) {
         self.log_cost(route_label, r, None, reserved_tokens);
@@ -1570,7 +1589,13 @@ impl Proxy {
             to_cache.content = restored;
             to_cache.tool_calls = restored_tool_calls;
             if let Ok(mut g) = sem_mutex.lock() {
-                g.put(emb, req_model.to_string(), req_sampling, to_cache);
+                g.put(
+                    emb,
+                    req_model.to_string(),
+                    req_sampling,
+                    to_cache,
+                    query_text,
+                );
             }
         }
     }
@@ -2121,7 +2146,14 @@ impl Proxy {
             if let (Some(emb), Some(sem_mutex)) = (query_embedding, self.semantic_cache.as_ref()) {
                 if let Ok(mut guard) = sem_mutex.lock() {
                     let samp = crate::cache::sampling_key(&req.sampling);
-                    guard.put(emb, req.model.clone(), samp, resp.clone());
+                    // IMP-46: store the prompt text alongside for the lexical gate.
+                    guard.put(
+                        emb,
+                        req.model.clone(),
+                        samp,
+                        resp.clone(),
+                        &semantic_embed_text(req),
+                    );
                 }
             }
         }
@@ -3420,6 +3452,11 @@ impl Proxy {
         // this normally stays None; it guards the case where the pseudonymizer masks
         // something the sensitivity classifier did not flag.
         let mut cache_mapping: Option<crate::pseudonymize::Mapping> = None;
+        // IMP-46: capture the ORIGINAL prompt text for the semantic-cache lexical
+        // fingerprint before the pseudonymize rebind below — it must match the
+        // text embedding_step embedded/looked up, not the masked copy, or a later
+        // identical query would fingerprint differently and be wrongly gated out.
+        let sem_query_text = semantic_embed_text(req);
         let req = if self.pseudonymize && route == Route::Cloud {
             let (msgs, mapping) = crate::pseudonymize::pseudonymize_messages(&req.messages);
             if !mapping.is_empty() {
@@ -3525,6 +3562,7 @@ impl Proxy {
                     cache_mapping.as_ref(),
                     &req.model,
                     crate::cache::sampling_key(&req.sampling),
+                    &sem_query_text,
                     budget_reserved,
                 );
                 if io_err.is_none() {

@@ -3649,6 +3649,7 @@ fn test_finalize_streamed_accounts_without_client_io() {
         None,
         "m",
         0,
+        "",
         0,
     );
     // Cost record written.
@@ -3698,6 +3699,7 @@ fn test_finalize_streamed_accrues_cloud_budget() {
         None,
         "cloud-model",
         0,
+        "",
         0,
     );
     let after = p.today_cloud_tokens.load(Ordering::Relaxed);

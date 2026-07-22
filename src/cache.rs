@@ -56,6 +56,10 @@ struct SemanticEntry {
     sampling: u64,
     inserted: Instant,
     resp: CompletionResponse,
+    /// Sorted, de-duplicated hashes of the prompt's lexical tokens, for the
+    /// IMP-46 lexical second-gate. Always stored (cheap); only consulted when
+    /// `min_lexical > 0`.
+    lexical: Vec<u64>,
 }
 
 pub struct SemanticCache {
@@ -63,6 +67,12 @@ pub struct SemanticCache {
     cap: usize,
     /// Minimum cosine similarity for a hit (e.g. 0.92).
     threshold: f64,
+    /// Minimum lexical (Jaccard token-set) overlap a cosine hit must also clear
+    /// before it is served (IMP-46). `0.0` disables the gate (default). A small
+    /// floor (e.g. 0.15) rejects embedding false-positives — prompts that are
+    /// cosine-close but share almost no words, which would otherwise serve a
+    /// wrong cached answer — while preserving genuine paraphrase hits.
+    min_lexical: f64,
     /// Maximum age of a cached entry. None = no TTL (FIFO eviction only).
     max_age: Option<Duration>,
     hits: AtomicU64,
@@ -75,10 +85,27 @@ impl SemanticCache {
             entries: VecDeque::new(),
             cap,
             threshold,
+            min_lexical: 0.0,
             max_age: None,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    /// Set the lexical second-gate floor (IMP-46). Values outside `[0,1]` are
+    /// clamped; `0.0` disables the gate. Mirrors `set_max_age` so it can be
+    /// applied builder-order-independently.
+    pub fn set_min_lexical(&mut self, floor: f64) {
+        self.min_lexical = if floor.is_finite() {
+            floor.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// Configured lexical-gate floor (0 = disabled).
+    pub fn min_lexical(&self) -> f64 {
+        self.min_lexical
     }
 
     /// Set a maximum age for cached entries (ADR-160). Entries older than `secs`
@@ -134,10 +161,18 @@ impl SemanticCache {
         query: &[f64],
         model: &str,
         sampling: u64,
+        query_text: &str,
     ) -> Option<CompletionResponse> {
         if let Some(max_age) = self.max_age {
             self.entries.retain(|e| e.inserted.elapsed() <= max_age);
         }
+        // IMP-46: when the lexical gate is on, fingerprint the query once and
+        // require each cosine candidate to also clear the token-overlap floor.
+        let query_fp = if self.min_lexical > 0.0 {
+            Some(lexical_fingerprint(query_text))
+        } else {
+            None
+        };
         let mut best_score = self.threshold - f64::EPSILON;
         let mut best: Option<&CompletionResponse> = None;
         for e in &self.entries {
@@ -145,10 +180,19 @@ impl SemanticCache {
                 continue;
             }
             let score = cosine_similarity(query, &e.embedding);
-            if score > best_score {
-                best_score = score;
-                best = Some(&e.resp);
+            if score <= best_score {
+                continue;
             }
+            // Lexical second-gate (IMP-46): a cosine match with near-zero word
+            // overlap is an embedding false-positive; serving it would return a
+            // wrong answer, so skip it and let a genuinely-similar entry win.
+            if let Some(ref qfp) = query_fp {
+                if jaccard_sorted(qfp, &e.lexical) < self.min_lexical {
+                    continue;
+                }
+            }
+            best_score = score;
+            best = Some(&e.resp);
         }
         match best {
             Some(resp) => {
@@ -171,6 +215,7 @@ impl SemanticCache {
         model: String,
         sampling: u64,
         resp: CompletionResponse,
+        query_text: &str,
     ) {
         if self.cap == 0 {
             return;
@@ -181,10 +226,58 @@ impl SemanticCache {
             sampling,
             inserted: Instant::now(),
             resp,
+            lexical: lexical_fingerprint(query_text),
         });
         while self.entries.len() > self.cap {
             self.entries.pop_front();
         }
+    }
+}
+
+/// Sorted, de-duplicated hashes of a prompt's lexical tokens (IMP-46). Tokens
+/// are maximal alphanumeric runs, lower-cased; hashing keeps entries compact and
+/// avoids storing prompt text (I3 — no PII retained in the cache beyond the
+/// response already stored). The sorted form lets `jaccard_sorted` merge in
+/// O(n+m).
+fn lexical_fingerprint(text: &str) -> Vec<u64> {
+    let mut v: Vec<u64> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            let mut h = DefaultHasher::new();
+            t.to_lowercase().hash(&mut h);
+            h.finish()
+        })
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Jaccard similarity |A∩B| / |A∪B| of two sorted, de-duplicated slices
+/// (IMP-46). Two empty sets are defined as fully similar (1.0) so an empty
+/// prompt never trips the gate; one empty and one non-empty is 0.0.
+fn jaccard_sorted(a: &[u64], b: &[u64]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let (mut i, mut j, mut inter) = (0usize, 0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i] < b[j] {
+            i += 1;
+        } else if a[i] > b[j] {
+            j += 1;
+        } else {
+            inter += 1;
+            i += 1;
+            j += 1;
+        }
+    }
+    let union = a.len() + b.len() - inter;
+    if union == 0 {
+        1.0
+    } else {
+        inter as f64 / union as f64
     }
 }
 
@@ -650,9 +743,9 @@ mod tests {
     fn test_semantic_cache_hit_above_threshold() {
         let mut c = SemanticCache::new(4, 0.9);
         let v = vec![1.0_f64, 0.0, 0.0];
-        c.put(v.clone(), "gpt-4o".to_string(), 0, resp("answer"));
+        c.put(v.clone(), "gpt-4o".to_string(), 0, resp("answer"), "");
         // Identical query, same model + sampling → cosine = 1.0 ≥ 0.9
-        let hit = c.find_similar(&v, "gpt-4o", 0);
+        let hit = c.find_similar(&v, "gpt-4o", 0, "");
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().content, "answer");
         assert_eq!(c.hits(), 1);
@@ -662,9 +755,9 @@ mod tests {
     #[test]
     fn test_semantic_cache_miss_below_threshold() {
         let mut c = SemanticCache::new(4, 0.95);
-        c.put(vec![1.0, 0.0], "m".to_string(), 0, resp("a"));
+        c.put(vec![1.0, 0.0], "m".to_string(), 0, resp("a"), "");
         // Orthogonal vector → cosine = 0 < 0.95
-        let hit = c.find_similar(&[0.0, 1.0], "m", 0);
+        let hit = c.find_similar(&[0.0, 1.0], "m", 0, "");
         assert!(hit.is_none());
         assert_eq!(c.misses(), 1);
     }
@@ -676,9 +769,9 @@ mod tests {
         let v_close = vec![0.99f64, 0.14142f64]; // cos ~ 0.99
         let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
         let v_far = vec![inv_sqrt2, inv_sqrt2]; // cos ~ 0.707
-        c.put(v_far.clone(), "m".to_string(), 0, resp("far"));
-        c.put(v_close.clone(), "m".to_string(), 0, resp("close"));
-        let hit = c.find_similar(&[1.0, 0.0], "m", 0);
+        c.put(v_far.clone(), "m".to_string(), 0, resp("far"), "");
+        c.put(v_close.clone(), "m".to_string(), 0, resp("close"), "");
+        let hit = c.find_similar(&[1.0, 0.0], "m", 0, "");
         // Should return the closest match ("close")
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().content, "close");
@@ -688,12 +781,12 @@ mod tests {
     fn test_semantic_cache_fifo_eviction() {
         let mut c = SemanticCache::new(2, 0.9);
         let v = vec![1.0f64, 0.0];
-        c.put(vec![1.0, 0.0], "m".to_string(), 0, resp("first"));
-        c.put(vec![0.0, 1.0], "m".to_string(), 0, resp("second"));
-        c.put(vec![0.5, 0.5], "m".to_string(), 0, resp("third")); // evicts "first"
+        c.put(vec![1.0, 0.0], "m".to_string(), 0, resp("first"), "");
+        c.put(vec![0.0, 1.0], "m".to_string(), 0, resp("second"), "");
+        c.put(vec![0.5, 0.5], "m".to_string(), 0, resp("third"), ""); // evicts "first"
         assert_eq!(c.len(), 2);
         // "first" entry ([1,0]) was evicted; an identical query returns one of the remaining
-        let hit = c.find_similar(&v, "m", 0);
+        let hit = c.find_similar(&v, "m", 0, "");
         // After eviction, [1,0] is gone; [0,1] and [0.5,0.5] remain.
         // cos([1,0],[0,1])=0, cos([1,0],[0.5,0.5])≈0.707 — both below threshold 0.9
         assert!(hit.is_none(), "evicted entry must not be found");
@@ -702,9 +795,9 @@ mod tests {
     #[test]
     fn test_semantic_cache_cap_zero_stores_nothing() {
         let mut c = SemanticCache::new(0, 0.9);
-        c.put(vec![1.0, 0.0], "m".to_string(), 0, resp("x"));
+        c.put(vec![1.0, 0.0], "m".to_string(), 0, resp("x"), "");
         assert!(c.is_empty());
-        assert!(c.find_similar(&[1.0, 0.0], "m", 0).is_none());
+        assert!(c.find_similar(&[1.0, 0.0], "m", 0, "").is_none());
     }
 
     #[test]
@@ -713,9 +806,9 @@ mod tests {
         // cross-serve — different models produce different outputs.
         let mut c = SemanticCache::new(4, 0.9);
         let v = vec![1.0_f64, 0.0];
-        c.put(v.clone(), "llama3".to_string(), 0, resp("local answer"));
+        c.put(v.clone(), "llama3".to_string(), 0, resp("local answer"), "");
         // Same embedding, different model → must be a miss.
-        let hit = c.find_similar(&v, "gpt-4o", 0);
+        let hit = c.find_similar(&v, "gpt-4o", 0, "");
         assert!(
             hit.is_none(),
             "cross-model semantic hit must not occur: {:?}",
@@ -723,7 +816,7 @@ mod tests {
         );
         assert_eq!(c.misses(), 1);
         // Same model → must be a hit.
-        let hit2 = c.find_similar(&v, "llama3", 0);
+        let hit2 = c.find_similar(&v, "llama3", 0, "");
         assert!(hit2.is_some());
         assert_eq!(hit2.unwrap().content, "local answer");
     }
@@ -741,9 +834,10 @@ mod tests {
             "m".to_string(),
             111,
             resp("deterministic answer"),
+            "",
         );
         // Same embedding + model but a different sampling signature → miss.
-        let hit = c.find_similar(&v, "m", 222);
+        let hit = c.find_similar(&v, "m", 222, "");
         assert!(
             hit.is_none(),
             "cross-sampling semantic hit must not occur: {:?}",
@@ -751,7 +845,7 @@ mod tests {
         );
         assert_eq!(c.misses(), 1);
         // Same sampling signature → hit.
-        let hit2 = c.find_similar(&v, "m", 111);
+        let hit2 = c.find_similar(&v, "m", 111, "");
         assert!(hit2.is_some());
         assert_eq!(hit2.unwrap().content, "deterministic answer");
     }
@@ -767,9 +861,9 @@ mod tests {
         // ...but back-date by forcing a sub-nanosecond effective TTL.
         c.max_age = Some(Duration::from_nanos(1));
         let v = vec![1.0_f64, 0.0];
-        c.put(v.clone(), "m".to_string(), 0, resp("stale"));
+        c.put(v.clone(), "m".to_string(), 0, resp("stale"), "");
         std::thread::sleep(Duration::from_millis(1));
-        let hit = c.find_similar(&v, "m", 0);
+        let hit = c.find_similar(&v, "m", 0, "");
         assert!(hit.is_none(), "expired semantic entry must not be served");
         assert_eq!(c.misses(), 1);
         assert_eq!(c.len(), 0, "expired entry must be removed");
@@ -781,11 +875,81 @@ mod tests {
         let mut c = SemanticCache::new(4, 0.9);
         assert_eq!(c.max_age_secs(), 0);
         let v = vec![1.0_f64, 0.0];
-        c.put(v.clone(), "m".to_string(), 0, resp("fresh"));
+        c.put(v.clone(), "m".to_string(), 0, resp("fresh"), "");
         std::thread::sleep(Duration::from_millis(1));
-        let hit = c.find_similar(&v, "m", 0);
+        let hit = c.find_similar(&v, "m", 0, "");
         assert!(hit.is_some(), "without TTL the entry must remain");
         assert_eq!(hit.unwrap().content, "fresh");
+    }
+
+    // --- IMP-46 lexical second-gate ---
+
+    #[test]
+    fn test_lexical_gate_rejects_word_disjoint_cosine_hit() {
+        // Gate on. Same embedding (cosine 1.0) but the query shares no words with
+        // the stored prompt → Jaccard 0 < floor → the embedding false-positive is
+        // rejected, so no wrong answer is served.
+        let mut c = SemanticCache::new(4, 0.9);
+        c.set_min_lexical(0.15);
+        let v = vec![1.0_f64, 0.0];
+        c.put(
+            v.clone(),
+            "m".to_string(),
+            0,
+            resp("paris"),
+            "capital of france",
+        );
+        let hit = c.find_similar(&v, "m", 0, "how tall is mount everest");
+        assert!(hit.is_none(), "word-disjoint cosine hit must be gated out");
+        assert_eq!(c.misses(), 1);
+    }
+
+    #[test]
+    fn test_lexical_gate_allows_paraphrase_with_shared_words() {
+        // Gate on. The query shares content words with the stored prompt → Jaccard
+        // clears the floor → the genuine paraphrase hit is still served.
+        let mut c = SemanticCache::new(4, 0.9);
+        c.set_min_lexical(0.15);
+        let v = vec![1.0_f64, 0.0];
+        c.put(
+            v.clone(),
+            "m".to_string(),
+            0,
+            resp("paris"),
+            "what is the capital of france",
+        );
+        let hit = c.find_similar(&v, "m", 0, "tell me the capital of france please");
+        assert!(hit.is_some(), "paraphrase sharing words must still hit");
+        assert_eq!(hit.unwrap().content, "paris");
+    }
+
+    #[test]
+    fn test_lexical_gate_off_by_default_ignores_text() {
+        // Default (floor 0): the gate is disabled, so a word-disjoint query still
+        // hits on cosine alone — preserving pre-IMP-46 behaviour.
+        let mut c = SemanticCache::new(4, 0.9);
+        let v = vec![1.0_f64, 0.0];
+        c.put(
+            v.clone(),
+            "m".to_string(),
+            0,
+            resp("x"),
+            "totally different words",
+        );
+        let hit = c.find_similar(&v, "m", 0, "nothing in common here");
+        assert!(hit.is_some(), "gate off → cosine-only hit as before");
+        assert_eq!(c.min_lexical(), 0.0);
+    }
+
+    #[test]
+    fn test_set_min_lexical_clamps() {
+        let mut c = SemanticCache::new(4, 0.9);
+        c.set_min_lexical(5.0);
+        assert_eq!(c.min_lexical(), 1.0);
+        c.set_min_lexical(-1.0);
+        assert_eq!(c.min_lexical(), 0.0);
+        c.set_min_lexical(f64::NAN);
+        assert_eq!(c.min_lexical(), 0.0);
     }
 
     #[test]

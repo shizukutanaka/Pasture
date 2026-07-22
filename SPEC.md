@@ -352,6 +352,13 @@ false negative = data leak (unacceptable).
   caches sensitive prompts (I2). Applies to both buffered and `stream:true` requests
   (IMP-31b): a streamed hit replays the cached content as SSE; a streamed miss
   populates the cache. The semantic cache remains buffered-only.
+  **Semantic-cache lexical second-gate (IMP-46, opt-in):** when
+  `PASTURE_SEMANTIC_MIN_LEXICAL > 0`, a cosine hit must ALSO share at least that
+  Jaccard token-set overlap with the cached prompt before it is served. This
+  rejects embedding false-positives — prompts that are cosine-close but share
+  almost no words, which would otherwise return a wrong cached answer — while a
+  small floor (e.g. 0.15) preserves genuine paraphrase hits. Default `0.0` =
+  disabled, so existing behaviour is unchanged unless configured.
   **Time-sensitive bypass (IMP-41):** a prompt whose correct answer changes over
   time (detected by deterministic EN+JA markers -- "today", "latest", "current
   price", 今日, 最新, … -- via `routing::is_time_sensitive`) is never served
@@ -461,6 +468,7 @@ wins). Variables:
 | `PASTURE_INJECTION_GUARD` | `off` | prompt-injection guard: `off` \| `flag` \| `block` (§7.2, IMP-20) |
 | `PASTURE_SEMANTIC_CACHE` | `0` | semantic (embedding) cache capacity; 0 = disabled (§6, IMP-12) |
 | `PASTURE_SEMANTIC_THRESHOLD` | `0.92` | cosine-similarity threshold for a semantic-cache hit (§6) |
+| `PASTURE_SEMANTIC_MIN_LEXICAL` | `0.0` | lexical second-gate floor (Jaccard token overlap) a cosine hit must also clear; `0` disables (§6, IMP-46) |
 | `PASTURE_CACHE_TTL` | `0` | cached-entry TTL in seconds; 0 = no TTL (FIFO only) |
 | `PASTURE_CACHE_CONTROL` | off | inject Anthropic `cache_control` prompt-caching hint (no-op for OpenAI) |
 | `PASTURE_HARD_PROMPTS` | _(off)_ | path to known-hard-prompts file; near-matches escalate to cloud (IMP-14) |

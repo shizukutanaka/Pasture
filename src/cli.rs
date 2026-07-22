@@ -1874,6 +1874,7 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         // is configured first or second), so this ordering is no longer load-
         // bearing — kept as-is to minimize diff.
         .with_semantic_cache(config.semantic_cache_size, config.semantic_cache_threshold)
+        .with_semantic_min_lexical(config.semantic_cache_min_lexical)
         .with_cache_ttl(config.cache_ttl_secs)
         .with_hard_prompts(hard_prompts, config.hard_threshold)
         .with_models(models)
