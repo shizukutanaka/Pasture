@@ -378,6 +378,20 @@ zero-dep/single-user/privacy wedge):**
 | **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
 | **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | Research (Anthropic 5-min-TTL change): inject `cache_control`, price `cache_creation`/`cache_read` tokens correctly in the budget guard. Behind the `cloud` flag. |
 
+### 4e-3. Security pass: prompt-injection surface (2026-08)
+
+> Prompted by 2026 reporting placing prompt injection as OWASP's #1 AI threat,
+> the first documented large-scale *indirect* injections in the wild, and the
+> recurring finding that gateways inspecting only prompts/completions are blind
+> to the tool-call layer where the exploit actually lives. Two real defects
+> found in Pasture's own guard, both fixed.
+
+| Finding | Verdict |
+|---|---|
+| **S1. Guard skipped tool-call arguments** | ✅ **FIXED (ADR-247)** — ADR-187 had already extended the *privacy* scan to `tool_calls_json` ("PII can live solely there"); the injection guard never got the same treatment and scanned content-only `routing_text()`. Since ADR-183 round-trips prior `tool_calls` every turn, a payload could ride in the arguments untouched — exactly the indirect-injection path. `guard_text()` now covers the same surface as `privacy_text()`. |
+| **S2. Literal patterns defeated by one inserted word** | ✅ **FIXED (ADR-248)** — probing found **1 of 6** canonical phrasings detected: `"ignore previous instructions"` matched, but `"ignore all previous instructions"` — the most recognisable form of the attack — did not. Replaced with structural verb→scope→target matching: recall 1/6 → **9/9**, false positives **0/7**. |
+| **S3. Lexical guards remain a first layer only** | ⏸️ **Unchanged, documented.** Homoglyphs, base64/encoding tricks, and multi-turn staged attacks are still out of reach for a std-only lexical guard. `guard.rs` says so in its header; do not oversell it. |
+
 ### 4e-2. First-principles pass on *excess* capability (2026-07)
 
 > §4e above asks "what is missing?". This asks the inverse, from first
