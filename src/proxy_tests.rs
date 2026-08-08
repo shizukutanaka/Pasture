@@ -2516,8 +2516,48 @@ fn test_moderations_returns_200_all_false() {
     assert_eq!(status, 200, "body: {resp}");
     assert!(resp.contains("\"flagged\":false"), "body: {resp}");
     assert!(
-        resp.contains("\"model\":\"text-moderation-stable\""),
+        resp.contains("\"model\":\"pasture-no-moderation\""),
         "body: {resp}"
+    );
+}
+
+#[test]
+fn test_moderations_does_not_claim_unverified_safety() {
+    // ADR-244: the stub examines nothing, so it must not present itself as a
+    // real moderation verdict. It must self-identify as un-moderated and must
+    // NOT impersonate OpenAI's moderation model — otherwise a client gating
+    // display on this response gets a safety claim Pasture cannot back.
+    let p = proxy_with(true, false, 100, "unused");
+    let (_, resp) = roundtrip(
+        p,
+        http_post("/v1/moderations", r#"{"input":"anything at all"}"#),
+    );
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or(&resp);
+    let v = crate::json::parse(body).expect("valid JSON");
+    assert_eq!(
+        v.get("x_pasture_moderated").and_then(|x| x.as_bool()),
+        Some(false),
+        "must declare that no moderation ran: {body}"
+    );
+    assert!(
+        !body.contains("text-moderation"),
+        "must not impersonate an OpenAI moderation model: {body}"
+    );
+    // Non-breaking: the OpenAI-shaped result object is still present so existing
+    // SDK clients keep parsing successfully.
+    let first = v
+        .get("results")
+        .and_then(|r| r.as_array())
+        .and_then(|a| a.first())
+        .expect("results[0] present");
+    assert!(first.get("flagged").is_some(), "flagged retained: {body}");
+    assert!(
+        first.get("categories").is_some(),
+        "categories retained: {body}"
+    );
+    assert!(
+        first.get("category_scores").is_some(),
+        "category_scores retained: {body}"
     );
 }
 

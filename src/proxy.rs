@@ -4163,14 +4163,28 @@ gen_ai_requests_total{{gen_ai_provider_name=\"cache\"}} {cache}\n",
     )
 }
 
-/// Build a stub `/v1/moderations` response. All categories are marked safe
-/// (false / score 0). Pasture does not run content moderation; the stub prevents
-/// client SDKs that unconditionally call the moderation endpoint from erroring.
+/// Build a stub `/v1/moderations` response. Pasture does not run content
+/// moderation; the stub exists only so client SDKs that unconditionally call the
+/// endpoint do not 404.
+///
+/// **Honesty contract (ADR-244).** The stub must never make a safety claim it
+/// cannot back. It previously returned `flagged:false` with all-zero scores while
+/// advertising `"model":"text-moderation-stable"` — OpenAI's real moderation
+/// model — so a client using the verdict to gate display received a machine-
+/// readable "this content is safe" for text Pasture never examined. That
+/// contradicts how the rest of this proxy behaves: it rejects multimodal parts
+/// rather than answering blind, and rejects `tools` on `/v1/responses` rather
+/// than silently dropping them (ADR-241). So the response now self-identifies:
+/// `model` is `pasture-no-moderation` and a top-level `x_pasture_moderated:false`
+/// states outright that no moderation ran. The OpenAI-shaped `results[0]`
+/// (`flagged` / `categories` / `category_scores`) is unchanged, so existing SDK
+/// clients still parse it — the fix adds truth without breaking compatibility.
 pub fn build_moderations_response() -> String {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let id = CTR.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{{\"id\":\"modr-pasture{id:08}\",\"model\":\"text-moderation-stable\",\
+        "{{\"id\":\"modr-pasture{id:08}\",\"model\":\"pasture-no-moderation\",\
+\"x_pasture_moderated\":false,\
 \"results\":[{{\"flagged\":false,\
 \"categories\":{{\"hate\":false,\"hate/threatening\":false,\"harassment\":false,\
 \"harassment/threatening\":false,\"self-harm\":false,\"self-harm/intent\":false,\

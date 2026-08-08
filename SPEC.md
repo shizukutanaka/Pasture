@@ -150,6 +150,23 @@ backend is reachable the proxy returns `502` with the OpenAI error envelope (§3
 Privacy rules do not apply to embeddings (the vector is returned to the caller, not
 logged). Implemented by `handle_embeddings` (IMP-8 completion).
 
+### 3.2b-2 `POST /v1/moderations` (compatibility stub — performs NO moderation)
+A stub that exists **only** so OpenAI SDK versions which call `/v1/moderations`
+unconditionally do not break on a `404` (ADR-061). Pasture **does not run content
+moderation of any kind**: the `input` is accepted, ignored, and never examined.
+
+Success: `200`, an OpenAI-shaped moderation object whose `results[0]` carries the
+usual `flagged` / `categories` / `category_scores` fields (all safe/zero) so SDK
+clients parse it, **plus two honesty markers (ADR-244)**: `model` is
+`"pasture-no-moderation"` (it MUST NOT impersonate a real moderation model such
+as `text-moderation-stable`) and a top-level **`"x_pasture_moderated": false`**
+declares machine-readably that no moderation was performed.
+
+> ⚠️ **This response is not a safety verdict.** `flagged:false` here means "not
+> checked", never "checked and found safe". Clients MUST NOT gate display,
+> storage, or forwarding on it. Check `x_pasture_moderated` and call a real
+> moderation service if you need one.
+
 ### 3.2c `GET /v1/stats`
 `200`, JSON snapshot of the cost-log counters plus live in-memory state (IMP-metrics).
 Read-only and PII-free (I3); a missing cost log reads as all-zeros. No auth
