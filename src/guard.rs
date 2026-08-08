@@ -150,7 +150,7 @@ fn fold_homoglyph(c: char) -> char {
 /// single highest-value normalization: an attacker inserts one zero-width space
 /// mid-word and a literal filter sees nothing, while the model reads the word
 /// exactly as intended.
-fn is_invisible(c: char) -> bool {
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(c,
         '\u{00AD}'                      // soft hyphen
         | '\u{200B}'..='\u{200F}'       // ZWSP, ZWNJ, ZWJ, LRM, RLM

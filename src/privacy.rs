@@ -145,6 +145,13 @@ const ENV_SECRET_SUBSTRINGS: &[&str] = &[
 /// change from normalization does not matter here.
 pub fn normalize_for_detection(text: &str) -> String {
     text.chars()
+        // ADR-250: drop invisible/formatting characters BEFORE folding. A soft
+        // hyphen or zero-width space inside a value silently defeats every
+        // detector below — and unlike the injection guard, this is not mainly an
+        // adversarial concern: PDFs use soft hyphens at line breaks and web text
+        // carries zero-width spaces, so an ordinary copy-paste can smuggle a
+        // credit-card number past the classifier and out to the cloud (I2).
+        .filter(|c| !crate::guard::is_invisible(*c))
         .map(|c| match c {
             // '０' (U+FF10) → '0' … '９' (U+FF19) → '9'
             '\u{FF10}'..='\u{FF19}' => char::from(b'0' + (c as u32 - 0xFF10) as u8),
@@ -163,11 +170,16 @@ pub fn normalize_for_detection(text: &str) -> String {
 /// Classify a prompt's sensitivity. Returns category labels only.
 pub fn classify(text: &str) -> SensitivityReport {
     let mut categories: Vec<&'static str> = Vec::new();
-    let lower = text.to_lowercase();
     // ADR-213/214: normalize full-width digits and separators (dot/dash/space)
-    // to ASCII for the digit-based detectors so numeric PII typed in full-width
-    // form (common in Japanese input) is still detected and kept local.
+    // to ASCII so numeric PII typed in full-width form (common in Japanese
+    // input) is still detected and kept local.
+    // ADR-250: normalization now also strips invisible characters, and EVERY
+    // detector runs on the normalized text — previously only the numeric ones
+    // did, so `alice@exam<ZWSP>ple.com` or `pass<ZWSP>word` slipped through the
+    // email/keyword checks and escaped to the cloud (I2).
     let normalized = normalize_for_detection(text);
+    let text = normalized.as_str();
+    let lower = normalized.to_lowercase();
 
     if KEYWORDS.iter().any(|k| lower.contains(k)) {
         categories.push("keyword");
@@ -898,6 +910,47 @@ mod tests {
     }
 
     // --- IBAN value detection (ADR-240) ---
+
+    #[test]
+    fn test_invisible_characters_do_not_defeat_detection() {
+        // ADR-250: a soft hyphen or zero-width space inside a value used to
+        // defeat every detector, sending the PII to the cloud (I2 violation).
+        // This is not only adversarial: PDFs insert soft hyphens at line breaks
+        // and web text carries zero-width spaces, so an ordinary copy-paste hit
+        // this. Each case below returned [] (or a WRONG category) before the fix.
+        let cases: [(&str, &str); 7] = [
+            ("4111 1111 11\u{00AD}11 1111", "credit_card"),
+            ("4111 1111 1111\u{200B} 1111", "credit_card"),
+            ("alice@exam\u{200B}ple.com", "email"),
+            ("alice@exam\u{00AD}ple.com", "email"),
+            ("DE8937040044\u{200B}0532013000", "iban"),
+            ("my pass\u{200B}word is hunter2", "keyword"),
+            ("sk-\u{200B}abcdefghijklmnopqrstuvwxyz1234", "api_key"),
+        ];
+        for (input, expected) in cases {
+            let got = classify(input);
+            assert!(
+                got.categories.contains(&expected),
+                "expected {expected:?} for obfuscated input, got {:?}",
+                got.categories
+            );
+        }
+    }
+
+    #[test]
+    fn test_invisible_stripping_does_not_create_false_positives() {
+        // Normalization must not make ordinary text look sensitive.
+        for benign in [
+            "what is the weather in Tokyo",
+            "こんにちは、天気を教えて",
+            "please summarize this article for me",
+        ] {
+            assert!(
+                !classify(benign).is_sensitive(),
+                "benign text must stay non-sensitive: {benign:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_iban_check_valid_mod97() {
