@@ -33,6 +33,7 @@ COMMANDS:
     calibrate --sweep         Show recommended thresholds at several target rates at once (add --logprob for cascade)
     calibrate --logprob       Recommend PASTURE_CASCADE_LOGPROB from logged cascade confidence
     calibrate --error --labels <f.jsonl> [--target E]
+    calibrate --auroc --labels <f.jsonl>     Self-test: does the confidence signal actually predict correctness?
                              Recommend PASTURE_CASCADE_LOGPROB for a target error rate E
                              (default 0.1) from labelled answers: {\"logprob\": -0.4, \"correct\": true}
     donate                   Show how to support development ($1/month)
@@ -1267,6 +1268,10 @@ fn run_calibrate(config: &Config, rest: &[String]) -> i32 {
     if rest.iter().any(|a| a == "--error") {
         return run_calibrate_error(lang, rest);
     }
+    // IMP-47: validate the signal before trusting any threshold fit to it.
+    if rest.iter().any(|a| a == "--auroc") {
+        return run_calibrate_auroc(lang, rest);
+    }
     let logprob_mode = rest.iter().any(|a| a == "--logprob");
     // IMP-42: --sweep shows several candidate thresholds at once instead of one
     // point chosen by --target. Composes with --logprob to sweep the cascade axis.
@@ -1461,6 +1466,79 @@ fn run_calibrate_sweep(config: &Config, lang: crate::i18n::Lang, logprob_mode: b
             )
         );
     }
+    0
+}
+
+/// `calibrate --auroc --labels <file>` (IMP-47): measure whether the cascade's
+/// confidence signal actually separates correct answers from incorrect ones on
+/// *this* machine's model, and say plainly when it does not.
+///
+/// This is the self-test that has to pass before any other calibrate mode means
+/// anything. `--logprob` and `--error` both fit a threshold to the logprob
+/// signal; if that signal has no discriminative power, they still return a
+/// confident-looking number, and gating on it spends cloud budget at random.
+/// Published per-model AUROCs for confidence signals span roughly 0.58 (barely
+/// above chance) to 0.84 (genuinely useful) on the same task, so this is
+/// model-specific and must be measured, not assumed.
+fn run_calibrate_auroc(lang: crate::i18n::Lang, rest: &[String]) -> i32 {
+    use crate::calibrate::SignalVerdict;
+    use crate::i18n::{t, tf};
+    let Some(labels_path) = option_value(rest, "--labels") else {
+        eprintln!("{}", t(lang, "calibrate.error.labels-required"));
+        return 1;
+    };
+    let labeled = match crate::calibrate::load_labeled_logprobs(labels_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let Some(q) = crate::calibrate::signal_auroc(&labeled) else {
+        // Undefined without both classes — say why rather than printing a number.
+        println!(
+            "{}",
+            tf(lang, "calibrate.auroc.one-class", &[("path", labels_path)])
+        );
+        return 0;
+    };
+    let n = labeled.len().to_string();
+    println!(
+        "{}",
+        tf(
+            lang,
+            "calibrate.auroc.header",
+            &[
+                ("n", &n),
+                ("correct", &q.n_correct.to_string()),
+                ("incorrect", &q.n_incorrect.to_string()),
+            ]
+        )
+    );
+    println!(
+        "{}",
+        tf(
+            lang,
+            "calibrate.auroc.score",
+            &[("auroc", &format!("{:.3}", q.auroc))]
+        )
+    );
+    if labeled.len() < MIN_CALIBRATE_SAMPLE {
+        println!(
+            "{}",
+            tf(
+                lang,
+                "calibrate.small_sample",
+                &[("n", &n), ("min", &MIN_CALIBRATE_SAMPLE.to_string())]
+            )
+        );
+    }
+    let key = match q.verdict() {
+        SignalVerdict::NoBetterThanRandom => "calibrate.auroc.verdict.random",
+        SignalVerdict::Weak => "calibrate.auroc.verdict.weak",
+        SignalVerdict::Usable => "calibrate.auroc.verdict.usable",
+    };
+    println!("{}", t(lang, key));
     0
 }
 

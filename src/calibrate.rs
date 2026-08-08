@@ -148,6 +148,107 @@ pub struct LabeledLogprob {
     pub correct: bool,
 }
 
+/// How well a confidence signal separates correct from incorrect answers
+/// (IMP-47). `auroc` is the probability that a randomly chosen *correct* answer
+/// scored higher than a randomly chosen *incorrect* one (0.5 = coin flip).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SignalQuality {
+    pub auroc: f64,
+    pub n_correct: usize,
+    pub n_incorrect: usize,
+}
+
+/// The operator-facing verdict for a `SignalQuality` (IMP-47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalVerdict {
+    /// AUROC ≈ 0.5: the signal carries no usable information. Gating on it is
+    /// worse than useless — it spends cloud calls at random.
+    NoBetterThanRandom,
+    /// Some signal, but weak enough that thresholds will be unstable.
+    Weak,
+    /// Usable for cascade escalation.
+    Usable,
+}
+
+impl SignalQuality {
+    /// Classify the measured AUROC. The bands are deliberately conservative:
+    /// published per-model AUROCs for confidence signals span ~0.58 (barely
+    /// above chance) to ~0.84 (genuinely useful) on the *same* task, so a
+    /// signal that works for one local model can be near-worthless for another.
+    /// Anything below 0.55 is treated as noise rather than "slightly positive".
+    pub fn verdict(&self) -> SignalVerdict {
+        if self.auroc < 0.55 {
+            SignalVerdict::NoBetterThanRandom
+        } else if self.auroc < 0.70 {
+            SignalVerdict::Weak
+        } else {
+            SignalVerdict::Usable
+        }
+    }
+}
+
+/// Measure how well the logprob signal ranks correct answers above incorrect
+/// ones (IMP-47), as AUROC computed by the rank-sum (Mann–Whitney U) identity:
+/// `AUROC = (Σ ranks of correct − n₊(n₊+1)/2) / (n₊·n₋)`. Ties receive their
+/// average rank, so a signal that emits the same value for everything scores
+/// exactly 0.5 rather than an accidental 1.0 — which matters here, because
+/// verbalized/self-reported confidence is known to collapse onto a few
+/// saturated values (0.9, 1.0) and would otherwise look perfect.
+///
+/// Returns `None` when the labels are all-correct or all-incorrect: AUROC is
+/// undefined without both classes, and silently reporting 0.5 (or 1.0) would be
+/// a fabricated measurement.
+///
+/// **Why this exists (IMP-47).** Pasture's cascade escalates when the local
+/// mean-logprob falls below a threshold, but nothing ever checked whether that
+/// logprob actually predicts correctness *on this machine's model*. Calibrating
+/// a threshold for a signal with no discriminative power produces a confident-
+/// looking number that spends cloud budget at random. This is the self-test
+/// that has to pass before `--logprob`/`--error` calibration means anything.
+pub fn signal_auroc(labeled: &[LabeledLogprob]) -> Option<SignalQuality> {
+    let n_correct = labeled.iter().filter(|l| l.correct).count();
+    let n_incorrect = labeled.len() - n_correct;
+    if n_correct == 0 || n_incorrect == 0 {
+        return None;
+    }
+    // Rank ascending with average ranks for ties.
+    let mut idx: Vec<usize> = (0..labeled.len()).collect();
+    idx.sort_by(|&a, &b| {
+        labeled[a]
+            .logprob
+            .partial_cmp(&labeled[b].logprob)
+            .expect("logprobs are finite (validated on load)")
+    });
+    let mut ranks = vec![0.0f64; labeled.len()];
+    let mut i = 0;
+    while i < idx.len() {
+        let mut j = i;
+        while j + 1 < idx.len() && labeled[idx[j + 1]].logprob == labeled[idx[i]].logprob {
+            j += 1;
+        }
+        // Ranks are 1-based; the tied block [i..=j] shares their mean rank.
+        let avg = ((i + 1) + (j + 1)) as f64 / 2.0;
+        for &k in &idx[i..=j] {
+            ranks[k] = avg;
+        }
+        i = j + 1;
+    }
+    let sum_correct: f64 = labeled
+        .iter()
+        .zip(&ranks)
+        .filter(|(l, _)| l.correct)
+        .map(|(_, r)| *r)
+        .sum();
+    let n_pos = n_correct as f64;
+    let n_neg = n_incorrect as f64;
+    let auroc = (sum_correct - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg);
+    Some(SignalQuality {
+        auroc,
+        n_correct,
+        n_incorrect,
+    })
+}
+
 /// A monotone, non-increasing map from mean-logprob to estimated error
 /// probability (IMP-13, UCCI arXiv:2605.18796), fit with the Pool Adjacent
 /// Violators Algorithm. Higher confidence (logprob closer to 0) never yields a
@@ -432,6 +533,71 @@ mod tests {
 
     fn lab(logprob: f64, correct: bool) -> LabeledLogprob {
         LabeledLogprob { logprob, correct }
+    }
+
+    #[test]
+    fn test_auroc_perfect_and_inverted_separation() {
+        // Perfectly separable: every correct answer outscores every incorrect one.
+        let perfect = vec![
+            lab(-2.0, false),
+            lab(-1.5, false),
+            lab(-0.5, true),
+            lab(-0.2, true),
+        ];
+        let q = signal_auroc(&perfect).expect("both classes present");
+        assert!((q.auroc - 1.0).abs() < 1e-9, "auroc {}", q.auroc);
+        assert_eq!(q.verdict(), SignalVerdict::Usable);
+        assert_eq!((q.n_correct, q.n_incorrect), (2, 2));
+        // Inverted (signal points the wrong way) must score 0, not 1 — a signal
+        // that anti-predicts is not secretly good.
+        let inverted: Vec<LabeledLogprob> =
+            perfect.iter().map(|l| lab(l.logprob, !l.correct)).collect();
+        let qi = signal_auroc(&inverted).unwrap();
+        assert!((qi.auroc - 0.0).abs() < 1e-9, "auroc {}", qi.auroc);
+        assert_eq!(qi.verdict(), SignalVerdict::NoBetterThanRandom);
+    }
+
+    #[test]
+    fn test_auroc_saturated_signal_scores_half_not_one() {
+        // IMP-47's whole point: a signal that emits the SAME value for every
+        // answer (the documented failure mode of verbalized confidence, which
+        // collapses onto 0.9/1.0) carries zero information. Average-rank tie
+        // handling must score it exactly 0.5 and flag it as unusable — naive
+        // rank code would report a perfect 1.0 here.
+        let saturated = vec![
+            lab(-0.1, true),
+            lab(-0.1, false),
+            lab(-0.1, true),
+            lab(-0.1, false),
+        ];
+        let q = signal_auroc(&saturated).unwrap();
+        assert!((q.auroc - 0.5).abs() < 1e-9, "auroc {}", q.auroc);
+        assert_eq!(q.verdict(), SignalVerdict::NoBetterThanRandom);
+    }
+
+    #[test]
+    fn test_auroc_undefined_without_both_classes() {
+        // All-correct or all-incorrect: AUROC is undefined. Reporting a number
+        // anyway would be a fabricated measurement, so return None.
+        assert!(signal_auroc(&[lab(-0.5, true), lab(-0.9, true)]).is_none());
+        assert!(signal_auroc(&[lab(-0.5, false), lab(-0.9, false)]).is_none());
+        assert!(signal_auroc(&[]).is_none());
+    }
+
+    #[test]
+    fn test_auroc_verdict_bands() {
+        let q = |a: f64| SignalQuality {
+            auroc: a,
+            n_correct: 10,
+            n_incorrect: 10,
+        };
+        assert_eq!(q(0.50).verdict(), SignalVerdict::NoBetterThanRandom);
+        assert_eq!(q(0.54).verdict(), SignalVerdict::NoBetterThanRandom);
+        assert_eq!(q(0.60).verdict(), SignalVerdict::Weak);
+        // Published per-model spread: ~0.58 is near-chance, ~0.84 is genuinely
+        // useful — the same signal, different local model.
+        assert_eq!(q(0.58).verdict(), SignalVerdict::Weak);
+        assert_eq!(q(0.84).verdict(), SignalVerdict::Usable);
     }
 
     #[test]

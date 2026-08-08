@@ -45,6 +45,7 @@ pasture up                 # one command: ensure model, then start the proxy
 pasture connect cursor     # exact setup to point an app at the proxy
 pasture connect lmstudio   # use LM Studio (or any OpenAI server) as the engine
 pasture calibrate          # recommend PASTURE_THRESHOLD from your own usage
+pasture calibrate --auroc --labels labels.jsonl  # self-test: does the confidence signal predict correctness?
 pasture models             # recommended local models for your machine
 pasture doctor             # check your setup and how to fix problems
 pasture eval               # measure routing accuracy + threshold sweep
