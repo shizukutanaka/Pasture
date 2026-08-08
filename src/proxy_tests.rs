@@ -2562,6 +2562,68 @@ fn test_moderations_does_not_claim_unverified_safety() {
 }
 
 #[test]
+fn test_history_returns_days_from_cost_log() {
+    // IMP-48: /v1/stats answers "what is true now"; /v1/history adds the time
+    // axis by rolling the same PII-free cost log up per UTC day.
+    let log = tmp_log();
+    const DAY: u64 = 86_400;
+    let lines = format!(
+        "{{\"ts\":{},\"route\":\"local\",\"model\":\"m\",\"prompt_tokens\":100,\"completion_tokens\":50,\"cost_usd\":0}}\n\
+{{\"ts\":{},\"route\":\"cloud\",\"model\":\"m\",\"prompt_tokens\":20,\"completion_tokens\":10,\"cost_usd\":0.02}}\n\
+{{\"ts\":{},\"route\":\"local\",\"model\":\"m\",\"prompt_tokens\":7,\"completion_tokens\":3,\"cost_usd\":0}}\n",
+        DAY * 10,
+        DAY * 10 + 3600,
+        DAY * 11
+    );
+    std::fs::write(&log, lines).unwrap();
+    let p = proxy_with(true, false, 100, &log);
+    let (status, body) = roundtrip(p, "GET /v1/history HTTP/1.1\r\n\r\n".to_string());
+    assert_eq!(status, 200, "body: {body}");
+    let v = crate::json::parse(&body).expect("valid JSON");
+    assert_eq!(
+        v.get("object").and_then(|x| x.as_str()),
+        Some("pasture.history")
+    );
+    let days = v
+        .get("days")
+        .and_then(|d| d.as_array())
+        .expect("days array");
+    assert_eq!(days.len(), 2, "two distinct UTC days: {body}");
+    assert_eq!(
+        days[0].get("day").and_then(|x| x.as_f64()),
+        Some((DAY * 10) as f64),
+        "ascending by day: {body}"
+    );
+    assert_eq!(days[0].get("local").and_then(|x| x.as_f64()), Some(1.0));
+    assert_eq!(days[0].get("cloud").and_then(|x| x.as_f64()), Some(1.0));
+    assert_eq!(
+        days[0].get("cloud_cost_usd").and_then(|x| x.as_f64()),
+        Some(0.02)
+    );
+    assert!(
+        days[0].get("estimated_savings_usd").is_some(),
+        "savings field present: {body}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_history_missing_log_is_empty_not_error() {
+    // A fresh install has no cost log; that must read as an empty series, not 500.
+    let p = proxy_with(true, false, 100, "/no/such/cost-log.jsonl");
+    let (status, body) = roundtrip(p, "GET /v1/history HTTP/1.1\r\n\r\n".to_string());
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains("\"days\":[]"), "body: {body}");
+}
+
+#[test]
+fn test_history_wrong_method_returns_405() {
+    let p = proxy_with(true, false, 100, "unused");
+    let raw = roundtrip_raw(p, http_post("/v1/history", "{}"));
+    assert!(raw.starts_with("HTTP/1.1 405"), "{raw:.40}");
+}
+
+#[test]
 fn test_moderations_wrong_method_returns_405() {
     let p = proxy_with(true, false, 100, "unused");
     let (status, _) = roundtrip(p, "GET /v1/moderations HTTP/1.1\r\n\r\n".to_string());

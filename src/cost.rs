@@ -133,6 +133,71 @@ pub fn today_cloud_tokens(path: &str) -> u64 {
         .sum()
 }
 
+/// One UTC day's rolled-up counters (IMP-48). Same route buckets and token
+/// fields as `CostSummary`, but grouped by day so a dashboard can draw a trend.
+/// `local_*_tokens` are kept separately to price the day's savings (IMP-37); the
+/// price lives in the proxy, so this struct stays price-agnostic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailySummary {
+    /// UTC midnight (Unix seconds) of the day this row covers.
+    pub day_start_secs: u64,
+    pub local: u64,
+    pub cloud: u64,
+    pub cache: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cloud_cost_usd: f64,
+    pub local_prompt_tokens: u64,
+    pub local_completion_tokens: u64,
+}
+
+/// Group cost-log records into per-UTC-day summaries (IMP-48), returning at most
+/// the `max_days` most recent days that have data, ascending by day (`0` = no
+/// truncation). Reuses the cost log as the single source of truth — no separate
+/// history file to keep in sync, and it inherits the log's PII-free guarantee
+/// (I3). Route buckets mirror `fold_record`: exact + semantic cache both count
+/// as `cache`. Non-finite costs from a corrupt line are skipped so one bad
+/// record cannot poison a day's total.
+pub fn daily_summaries(records: &[LoggedRecord], max_days: usize) -> Vec<DailySummary> {
+    use std::collections::BTreeMap;
+    let mut by_day: BTreeMap<u64, DailySummary> = BTreeMap::new();
+    for r in records {
+        let day = r.ts_secs / 86400 * 86400;
+        let d = by_day.entry(day).or_insert_with(|| DailySummary {
+            day_start_secs: day,
+            local: 0,
+            cloud: 0,
+            cache: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cloud_cost_usd: 0.0,
+            local_prompt_tokens: 0,
+            local_completion_tokens: 0,
+        });
+        match r.route.as_str() {
+            "local" => {
+                d.local += 1;
+                d.local_prompt_tokens += r.prompt_tokens;
+                d.local_completion_tokens += r.completion_tokens;
+            }
+            "cloud" => d.cloud += 1,
+            "cache" | "semantic_cache" => d.cache += 1,
+            _ => {}
+        }
+        d.prompt_tokens += r.prompt_tokens;
+        d.completion_tokens += r.completion_tokens;
+        if r.cost_usd.is_finite() {
+            d.cloud_cost_usd += r.cost_usd;
+        }
+    }
+    // BTreeMap already yields ascending order; keep the most recent `max_days`.
+    let mut days: Vec<DailySummary> = by_day.into_values().collect();
+    if max_days > 0 && days.len() > max_days {
+        days.drain(0..days.len() - max_days);
+    }
+    days
+}
+
 fn num(v: &crate::json::JsonValue, key: &str) -> Option<f64> {
     match v.get(key) {
         Some(crate::json::JsonValue::Number(f)) => Some(*f),
@@ -581,6 +646,89 @@ mod tests {
         let v = crate::json::parse(&json).expect("empty stats --json must be valid JSON");
         assert_eq!(v.get("total").and_then(|x| x.as_f64()), Some(0.0));
         assert_eq!(v.get("cloud_rate").and_then(|x| x.as_f64()), Some(0.0));
+    }
+
+    #[test]
+    fn test_daily_summaries_groups_by_utc_day() {
+        // IMP-48: records bucket by UTC day, using the same route buckets
+        // fold_record uses (semantic_cache counts as cache).
+        const DAY: u64 = 86_400;
+        let rec = |ts: u64, route: &str, p: u64, c: u64, cost: f64| LoggedRecord {
+            ts_secs: ts,
+            route: route.into(),
+            prompt_tokens: p,
+            completion_tokens: c,
+            cost_usd: cost,
+            logprob: None,
+        };
+        let recs = vec![
+            rec(DAY * 10, "local", 100, 50, 0.0),
+            rec(DAY * 10 + 3600, "cloud", 20, 10, 0.02),
+            rec(DAY * 10 + 7200, "semantic_cache", 5, 5, 0.0),
+            rec(DAY * 11, "local", 7, 3, 0.0),
+        ];
+        let days = daily_summaries(&recs, 30);
+        assert_eq!(days.len(), 2, "two distinct UTC days");
+        assert_eq!(days[0].day_start_secs, DAY * 10, "ascending by day");
+        assert_eq!(days[1].day_start_secs, DAY * 11);
+        assert_eq!(days[0].local, 1);
+        assert_eq!(days[0].cloud, 1);
+        assert_eq!(days[0].cache, 1, "semantic_cache counts as cache");
+        assert_eq!(days[0].prompt_tokens, 125);
+        assert_eq!(days[0].completion_tokens, 65);
+        assert!((days[0].cloud_cost_usd - 0.02).abs() < 1e-9);
+        // Local-only token fields power the savings estimate (IMP-37).
+        assert_eq!(days[0].local_prompt_tokens, 100);
+        assert_eq!(days[0].local_completion_tokens, 50);
+    }
+
+    #[test]
+    fn test_daily_summaries_keeps_most_recent_days() {
+        const DAY: u64 = 86_400;
+        let recs: Vec<LoggedRecord> = (0..10)
+            .map(|i| LoggedRecord {
+                ts_secs: DAY * (100 + i),
+                route: "local".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cost_usd: 0.0,
+                logprob: None,
+            })
+            .collect();
+        let days = daily_summaries(&recs, 3);
+        assert_eq!(days.len(), 3, "truncated to max_days");
+        assert_eq!(days[0].day_start_secs, DAY * 107, "most recent kept");
+        assert_eq!(days[2].day_start_secs, DAY * 109);
+        assert_eq!(daily_summaries(&recs, 0).len(), 10, "0 = no truncation");
+        assert!(daily_summaries(&[], 30).is_empty());
+    }
+
+    #[test]
+    fn test_daily_summaries_ignores_non_finite_cost() {
+        // A corrupt log line must not turn a day's spend into NaN/inf.
+        const DAY: u64 = 86_400;
+        let recs = vec![
+            LoggedRecord {
+                ts_secs: DAY * 5,
+                route: "cloud".into(),
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cost_usd: 0.03,
+                logprob: None,
+            },
+            LoggedRecord {
+                ts_secs: DAY * 5,
+                route: "cloud".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cost_usd: f64::INFINITY,
+                logprob: None,
+            },
+        ];
+        let days = daily_summaries(&recs, 30);
+        assert_eq!(days.len(), 1);
+        assert!(days[0].cloud_cost_usd.is_finite());
+        assert!((days[0].cloud_cost_usd - 0.03).abs() < 1e-9);
     }
 
     #[test]

@@ -374,9 +374,23 @@ zero-dep/single-user/privacy wedge):**
 | **IMP-45** | Streaming `POST /v1/responses` (SSE Responses events) | Closes W3; completes the ADR-241 shim. Emit `response.created` / `response.output_text.delta` / `response.completed`. Invasive (dual SSE protocol in `stream_chat_to_socket`) → Opus-scale. |
 | **IMP-46** | Semantic-cache lexical second-gate | ✅ **SHIPPED (ADR-243)** — opt-in `PASTURE_SEMANTIC_MIN_LEXICAL` (default 0 = off): a cosine hit must also clear a Jaccard token-set overlap floor, rejecting embedding false-positives that would serve a wrong cached answer while preserving genuine paraphrase hits. std-only, in `cache.rs`; each entry stores a sorted token-hash fingerprint. |
 | **IMP-47** | Verbalized-confidence cascade signal + AUROC self-test | Research (2604.19781): a second escalation signal beyond mean-logprob, with a bundled probe set that auto-disables a signal whose AUROC ≈ 0.5. std-only counting. |
-| **IMP-48** | Lightweight daily-counter history for the dashboard | Closes W4: append one JSONL row per day (routes/tokens/spend/savings) so the dashboard can draw a 30-day trend. Bounded file, std-only. |
+| **IMP-48** | Lightweight daily-counter history for the dashboard | ✅ **SHIPPED (ADR-245)** — closes W4. Simpler than the original sketch: **no new history file**. `cost::daily_summaries` rolls the existing PII-free cost log up per UTC day, `GET /v1/history` serves the last 30 days (routes/tokens/spend/savings), and the dashboard draws a stacked bar per day in pure flexbox. One source of truth ⇒ nothing to drift. |
 | **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
 | **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | Research (Anthropic 5-min-TTL change): inject `cache_control`, price `cache_creation`/`cache_read` tokens correctly in the budget guard. Behind the `cloud` flag. |
+
+### 4e-2. First-principles pass on *excess* capability (2026-07)
+
+> §4e above asks "what is missing?". This asks the inverse, from first
+> principles: Pasture's irreducible job is **(1)** accept an OpenAI-compatible
+> request, **(2)** route it deterministically and privately, **(3)** execute,
+> **(4)** account. What exists that serves none of those — and is it harmless?
+
+| Finding | Verdict |
+|---|---|
+| **F1. `/v1/moderations` claimed unverified safety** | ✅ **FIXED (ADR-244)** — it returned `flagged:false` + all-zero scores for text it never examined, while advertising OpenAI's real `text-moderation-stable`. A client gating display on that got a guarantee Pasture cannot back, contradicting the codebase's own refuse-don't-fake precedents (multimodal rejection; ADR-241 tools rejection). Now self-identifies via `model:"pasture-no-moderation"` + `x_pasture_moderated:false`, with `results[0]` unchanged so SDKs still parse. |
+| **F2. Monetization / referral surfaces** | ⏸️ **Kept, recorded.** Serve none of (1)–(4), but are an explicit product decision (ADR-006, §6) and cause no incorrect behaviour. Not scope for a correctness pass. |
+| **F3. Backlog doc sprawl (§4, 4b, 4c, 4d, 4e)** | ⏸️ **Kept, recorded.** Five append-only backlog sections is navigation friction, not a defect; consolidating would rewrite provenance a future contributor may need. |
+| **F4. Routing decisions are never validated** | ❗ **Open, out of cheap reach** — the deepest gap (= W6). Pasture decides local-vs-cloud but never observes whether local was actually good enough, so there is no feedback loop. Needs ground-truth labels; IMP-47 is the affordable partial proxy. |
 
 ## 5. Anti-goals (deliberately *not* adopting)
 

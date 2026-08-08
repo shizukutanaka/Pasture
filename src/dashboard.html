@@ -80,6 +80,15 @@
   .s-ok   { color: var(--ok); }   .d-ok   { background: var(--ok); }
   .s-warn { color: var(--warn); } .d-warn { background: var(--warn); }
   .s-down { color: var(--down); } .d-down { background: var(--down); }
+  /* Daily trend: one stacked column per day, sized by that day's request count.
+     Pure flexbox + inline heights — no chart library (invariant I1). */
+  .trend { display: flex; align-items: flex-end; gap: 3px; height: 110px; overflow-x: auto; }
+  .trend .day { flex: 1 1 0; min-width: 6px; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
+  .trend .seg { width: 100%; }
+  .trend .seg.local { background: var(--local); }
+  .trend .seg.cloud { background: var(--cloud); }
+  .trend .seg.cache { background: var(--track); }
+  .trend-empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
   section.detail { margin-top: 28px; }
   section.detail h2 {
     font-size: 13px; text-transform: uppercase; letter-spacing: .6px;
@@ -180,6 +189,19 @@
   </div>
 
   <section class="detail">
+    <h2>Daily trend (last 30 days)</h2>
+    <div class="card">
+      <div class="trend" id="trend"></div>
+      <div class="trend-empty" id="trend-empty">No history yet — run some requests.</div>
+      <div class="legend" style="margin-top:10px">
+        <span class="k"><span class="sw" style="background:var(--local)"></span>local</span>
+        <span class="k"><span class="sw" style="background:var(--cloud)"></span>cloud</span>
+        <span class="k"><span class="sw" style="background:var(--track)"></span>cache</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="detail">
     <h2>Detail</h2>
     <div class="tables">
       <div class="card">
@@ -212,7 +234,7 @@
   </section>
 </main>
 
-<footer>Pasture · local-first LLM routing · polling <code>GET /v1/stats</code> every 5s</footer>
+<footer>Pasture · local-first LLM routing · polling <code>GET /v1/stats</code> + <code>GET /v1/history</code> every 5s</footer>
 
 <script>
 (function () {
@@ -327,6 +349,45 @@
     fillRows("inj-body", "inj-empty", injRows);
   }
 
+  // Daily trend (IMP-48): one stacked column per day, height proportional to that
+  // day's request count. DOM nodes + inline heights only — no chart library.
+  function renderTrend(days) {
+    var box = $("trend");
+    box.textContent = "";
+    if (!days || !days.length) {
+      $("trend-empty").style.display = "block";
+      return;
+    }
+    $("trend-empty").style.display = "none";
+    var max = 1;
+    days.forEach(function (d) {
+      var t = (d.local || 0) + (d.cloud || 0) + (d.cache || 0);
+      if (t > max) max = t;
+    });
+    days.forEach(function (d) {
+      var local = d.local || 0, cloud = d.cloud || 0, cache = d.cache || 0;
+      var total = local + cloud + cache;
+      if (!total) return;
+      var col = document.createElement("div");
+      col.className = "day";
+      var when = new Date((d.day || 0) * 1000).toISOString().slice(0, 10);
+      // Native tooltip carries the numbers; textContent/title only, never innerHTML.
+      col.title = when + " — " + total + " requests (local " + local +
+        ", cloud " + cloud + ", cache " + cache + "), $" +
+        (d.cloud_cost_usd || 0).toFixed(4) + " spent, $" +
+        (d.estimated_savings_usd || 0).toFixed(4) + " saved";
+      var scale = (total / max) * 100;
+      [["cache", cache], ["cloud", cloud], ["local", local]].forEach(function (pair) {
+        if (!pair[1]) return;
+        var seg = document.createElement("div");
+        seg.className = "seg " + pair[0];
+        seg.style.height = (scale * (pair[1] / total)) + "%";
+        col.appendChild(seg);
+      });
+      box.appendChild(col);
+    });
+  }
+
   function poll() {
     var headers = {};
     var t = tok();
@@ -351,6 +412,12 @@
       var ago = lastOk ? Math.round((Date.now() - lastOk) / 1000) : null;
       setStatus("stale", ago == null ? "disconnected" : "disconnected · last update " + ago + "s ago");
     });
+    // Daily trend rides the same poll (IMP-48). Failures are silent: the trend is
+    // supplementary, and the /v1/stats handler above owns the status banner.
+    fetch("/v1/history", { headers: headers, cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (h) { if (h && h.days) renderTrend(h.days); })
+      .catch(function () {});
   }
 
   $("token-save").addEventListener("click", function () {

@@ -74,6 +74,7 @@ base_url = http://127.0.0.1:8645/v1
 - `GET /v1/models` — list the configured local (and cloud) model ids, OpenAI-compatible.
 - `GET /v1/models/{id}` — retrieve one configured model (or 404), OpenAI-compatible.
 - `GET /v1/stats` — live JSON snapshot of the cost-log counters (routes, rates, tokens, spend).
+- `GET /v1/history` — per-day rollups (last 30 days) of routes, tokens, spend, and estimated savings, so you can see the trend rather than just the current moment.
 - `GET /health` — liveness check.
 - `GET /dashboard` (or `GET /`) — embedded web dashboard: a single self-contained page (no build step, no external assets) that polls `/v1/stats` and shows the local/cloud split, spend vs. budget, cache hit rates, and backend health. Open `http://127.0.0.1:8645/dashboard` in a browser.
 

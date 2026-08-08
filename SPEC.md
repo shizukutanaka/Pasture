@@ -199,6 +199,24 @@ Full field list, in response order:
 | `injection_guard_stats` | object | `"label:action"` → count tally, e.g. `"role_switch:blocked"` (IMP-20, ADR-225) |
 | `estimated_savings_usd` | float | cumulative estimated savings from local routing, 4dp (IMP-37): the local-route prompt+completion tokens priced at `PASTURE_CLOUD_PRICE_PER_1M`, i.e. what those requests would have cost on the configured cloud backend. `0` when no cloud price is set. Cache hits are excluded (ambiguous counterfactual) |
 
+### 3.2c-2 `GET /v1/history`
+`200`, per-UTC-day rollups of the cost log (IMP-48). Where §3.2c answers "what is
+true now", this adds the time axis so a dashboard can show whether things are
+improving. Read-only and PII-free (I3) — it reads the same cost log, so no
+separate history file exists to drift; a missing log reads as `"days":[]` (not an
+error). Rate-limit-exempt like `/v1/stats` and `/metrics`; auth applies when set.
+
+Body: `{"object":"pasture.history","days":[…]}`, **ascending by day**, at most the
+**30** most recent days that have data. Each element:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `day` | int | UTC midnight (Unix seconds) of the day |
+| `local` / `cloud` / `cache` | int | requests that day per route (both caches count as `cache`, as in §3.2c) |
+| `prompt_tokens` / `completion_tokens` | int | that day's totals, all routes |
+| `cloud_cost_usd` | float | that day's cloud spend, 4dp |
+| `estimated_savings_usd` | float | that day's local tokens priced at `PASTURE_CLOUD_PRICE_PER_1M`, 4dp — same pricing as IMP-37; `0` when no price is set |
+
 ### 3.2d `POST /v1/route`
 Routing **preview / dry-run** (ADR-198). Request body: a chat-completions body
 (`messages` required, plus optional `model`/`tools`). Runs the privacy + routing

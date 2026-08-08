@@ -307,6 +307,11 @@ pub struct Proxy {
 /// Base backoff (doubled each attempt) for cloud retries (IMP-9).
 const CLOUD_RETRY_BASE_MS: u64 = 200;
 
+/// How many recent UTC days `GET /v1/history` returns (IMP-48). A month of trend
+/// is enough to see a change without letting the response grow unbounded as the
+/// cost log does.
+const HISTORY_MAX_DAYS: usize = 30;
+
 /// Outcome of the embedding-based routing step — the semantic cache (IMP-12) and
 /// the difficulty signal (IMP-14), shared by the buffered and streaming paths so
 /// they cannot drift (ADR-150).
@@ -658,6 +663,7 @@ impl Proxy {
         {
             Some("POST, OPTIONS")
         } else if path.starts_with("/v1/stats")
+            || path.starts_with("/v1/history")
             || path.starts_with("/metrics")
             || path.starts_with("/v1/models")
             || path.starts_with("/v1/engines")
@@ -738,13 +744,16 @@ impl Proxy {
                 ));
             }
         }
-        // Monitoring endpoints (/metrics, /v1/stats) are read-only, zero-inference-cost
+        // Monitoring endpoints (/metrics, /v1/stats, /v1/history) are read-only, zero-inference-cost
         // and must not consume rate-limit tokens (ADR-167). A standard Prometheus scraper
         // at 15-second intervals (4 req/min) would otherwise eat a disproportionate share
         // of a tight inference budget — e.g. 40% of PASTURE_RATE_LIMIT=10. /metrics is
         // also outside the /v1/* namespace the limiter documents itself as covering.
         // Auth is still enforced above for both endpoints.
-        if path.starts_with("/metrics") || path.starts_with("/v1/stats") {
+        if path.starts_with("/metrics")
+            || path.starts_with("/v1/stats")
+            || path.starts_with("/v1/history")
+        {
             return None;
         }
         if let Some(rl) = &self.rate_limiter {
@@ -2480,6 +2489,45 @@ impl Proxy {
         ))
     }
 
+    /// Serve `GET /v1/history` (IMP-48): per-UTC-day rollups of the cost log so a
+    /// dashboard can draw a trend. `/v1/stats` answers "what is true now"; this
+    /// answers "is it getting better?" — the accounting half of the proxy's job
+    /// had no time axis before. Read-only over the PII-free cost log (I3), so it
+    /// inherits that guarantee and needs no separate history file to keep in
+    /// sync. Per-day savings reuse the same `cloud_cost_usd` pricing as ADR-166 /
+    /// IMP-37, so a day's "saved" figure is exactly what those local tokens would
+    /// have cost on the configured cloud backend (0 when no price is set).
+    pub fn handle_history(&self) -> Result<String, ProxyError> {
+        let records = crate::cost::read_log(&self.cost_log_path)
+            .map_err(|e| ProxyError::Backend(e.to_string()))?;
+        let days = crate::cost::daily_summaries(&records, HISTORY_MAX_DAYS);
+        let round4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
+        let safe = |x: f64| if x.is_finite() { x } else { 0.0 };
+        let rows: Vec<String> = days
+            .iter()
+            .map(|d| {
+                let savings = self.cloud_cost_usd(d.local_prompt_tokens, d.local_completion_tokens);
+                format!(
+                    "{{\"day\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
+\"prompt_tokens\":{},\"completion_tokens\":{},\"cloud_cost_usd\":{},\
+\"estimated_savings_usd\":{}}}",
+                    d.day_start_secs,
+                    d.local,
+                    d.cloud,
+                    d.cache,
+                    d.prompt_tokens,
+                    d.completion_tokens,
+                    round4(safe(d.cloud_cost_usd)),
+                    round4(safe(savings)),
+                )
+            })
+            .collect();
+        Ok(format!(
+            "{{\"object\":\"pasture.history\",\"days\":[{}]}}",
+            rows.join(",")
+        ))
+    }
+
     /// Serve `GET /metrics` in Prometheus text exposition format (IMP-metrics-prom).
     /// Exposes the same counters as `/v1/stats` but in the standard text format
     /// consumed by Prometheus scrape targets and Grafana agent. Also emits a
@@ -3098,6 +3146,9 @@ impl Proxy {
                 // Routing preview / dry-run (ADR-198): return the route decision
                 // for this body without calling any backend — no cost, no cloud.
                 wr_result!(self.handle_route_preview(&body));
+            } else if method == "GET" && path.starts_with("/v1/history") {
+                // Per-day cost-log rollups for trend display (IMP-48).
+                wr_result!(self.handle_history());
             } else if method == "GET" && path.starts_with("/v1/stats") {
                 wr_result!(self.handle_stats());
             } else if method == "GET" && path.starts_with("/metrics") {
