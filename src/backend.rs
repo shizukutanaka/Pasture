@@ -240,6 +240,26 @@ impl CompletionRequest {
     /// developer-authored schema, not conversation PII, and classifying them would
     /// false-positive every request that merely declares a tool whose description
     /// mentions a privacy keyword, forcing it local for no privacy gain.
+    /// Text scanned by the prompt-injection guard (IMP-52, ADR-247). Same
+    /// surface as `privacy_text()`, and for the same reason ADR-187 gave for
+    /// PII: an injection payload can live *solely* in `tool_calls_json`.
+    ///
+    /// Multi-turn agent conversations round-trip prior `tool_calls` back to the
+    /// proxy (ADR-183), so the arguments the model produced last turn arrive as
+    /// client-supplied text this turn. That is precisely the indirect-injection
+    /// path — content fetched from an untrusted page lands in a tool *result*,
+    /// the model reflects it into the next tool *call*, and the payload rides in
+    /// the arguments. Scanning `routing_text()` alone (content-only) walks right
+    /// past it, which is the documented blind spot of gateways that inspect only
+    /// prompts and completions while the exploit lives in the tool calls.
+    ///
+    /// Tool *definitions* (`sampling.tools`) stay excluded for the same reason as
+    /// in `privacy_text()`: developer-authored schema, not attacker-controlled
+    /// conversation text.
+    pub fn guard_text(&self) -> String {
+        self.privacy_text()
+    }
+
     pub fn privacy_text(&self) -> String {
         let mut text = self.routing_text();
         for m in &self.messages {

@@ -2616,7 +2616,9 @@ impl Proxy {
         let req = Self::parse_legacy_completion(body)?;
         // Apply injection guard on legacy completions too (IMP-20).
         if self.injection_guard != "off" {
-            let text = req.routing_text();
+            // IMP-52: guard_text() includes tool-call arguments, where an
+            // injection payload can live alone (ADR-247).
+            let text = req.guard_text();
             if let crate::guard::InjectionRisk::Flag(label) =
                 crate::guard::classify_injection(&text)
             {
@@ -2785,7 +2787,9 @@ impl Proxy {
     fn handle_responses(&self, body: &str) -> Result<String, ProxyError> {
         let req = Self::parse_responses_request(body)?;
         if self.injection_guard != "off" {
-            let text = req.routing_text();
+            // IMP-52: guard_text() includes tool-call arguments, where an
+            // injection payload can live alone (ADR-247).
+            let text = req.guard_text();
             if let crate::guard::InjectionRisk::Flag(label) =
                 crate::guard::classify_injection(&text)
             {
@@ -3264,7 +3268,8 @@ impl Proxy {
     fn complete_buffered(&self, req: &CompletionRequest) -> Result<String, ProxyError> {
         // Prompt-injection guard (IMP-20). Off by default (zero overhead).
         let injection_label = if self.injection_guard != "off" {
-            let text = req.routing_text();
+            // IMP-52: includes tool-call arguments (ADR-247).
+            let text = req.guard_text();
             match crate::guard::classify_injection(&text) {
                 crate::guard::InjectionRisk::Flag(label) => {
                     if self.injection_guard == "block" {
@@ -3319,7 +3324,9 @@ impl Proxy {
         // the stream starts; flag mode surfaces the label to the client on a leading
         // SSE chunk (ADR-191), matching the buffered path's x_pasture_injection_flag.
         let injection_label: Option<String> = if self.injection_guard != "off" {
-            let text = req.routing_text();
+            // IMP-52: guard_text() includes tool-call arguments, where an
+            // injection payload can live alone (ADR-247).
+            let text = req.guard_text();
             if let crate::guard::InjectionRisk::Flag(label) =
                 crate::guard::classify_injection(&text)
             {
