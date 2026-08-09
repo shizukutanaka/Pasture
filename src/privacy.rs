@@ -127,6 +127,25 @@ const ENV_SECRET_SUBSTRINGS: &[&str] = &[
     "_key",       // SIGNING_KEY, STRIPE_KEY
 ];
 
+/// Fold one character for PII detection (ADR-213/214): full-width digits,
+/// full stop, dash family, and ideographic space to their ASCII equivalents.
+/// Shared by `normalize_for_detection` and the pseudonymizer's offset-mapped
+/// span pass (ADR-251) so both agree on what a value looks like.
+pub(crate) fn fold_char_for_detection(c: char) -> char {
+    match c {
+        // '０' (U+FF10) → '0' … '９' (U+FF19) → '9'
+        '\u{FF10}'..='\u{FF19}' => char::from(b'0' + (c as u32 - 0xFF10) as u8),
+        // Full-width full stop → ASCII dot.
+        '\u{FF0E}' => '.',
+        // Full-width hyphen-minus and the Unicode dash family → ASCII hyphen.
+        '\u{FF0D}' | '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}'
+        | '\u{2015}' => '-',
+        // Ideographic space → ASCII space.
+        '\u{3000}' => ' ',
+        other => other,
+    }
+}
+
 /// Normalize text for numeric-PII detection (ADR-213, ADR-214). Maps:
 ///   - full-width digits (U+FF10..=U+FF19, `０`..`９`) → ASCII `0`..`9`;
 ///   - the full-width full stop (`．`, U+FF0E) → `.` (so a full-width IPv4
@@ -152,18 +171,7 @@ pub fn normalize_for_detection(text: &str) -> String {
         // carries zero-width spaces, so an ordinary copy-paste can smuggle a
         // credit-card number past the classifier and out to the cloud (I2).
         .filter(|c| !crate::guard::is_invisible(*c))
-        .map(|c| match c {
-            // '０' (U+FF10) → '0' … '９' (U+FF19) → '9'
-            '\u{FF10}'..='\u{FF19}' => char::from(b'0' + (c as u32 - 0xFF10) as u8),
-            // Full-width full stop → ASCII dot.
-            '\u{FF0E}' => '.',
-            // Full-width hyphen-minus and the Unicode dash family → ASCII hyphen.
-            '\u{FF0D}' | '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}'
-            | '\u{2015}' => '-',
-            // Ideographic space → ASCII space.
-            '\u{3000}' => ' ',
-            other => other,
-        })
+        .map(fold_char_for_detection)
         .collect()
 }
 

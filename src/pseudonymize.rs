@@ -371,6 +371,58 @@ fn replace_in_json_strings(json: &str, ctx: &mut Ctx) -> String {
 
 /// Span-based pre-pass helper: apply `spans` (byte ranges in `text`) replacing
 /// each with a token from `ctx.token_for(original, category)`.
+/// Build the detection-normalized form of `text` alongside a map from each byte
+/// of that form back to a byte offset in the ORIGINAL text (ADR-251).
+///
+/// The classifier can normalize freely because it only returns category labels,
+/// but the pseudonymizer needs byte *spans* to mask, and those must index the
+/// original string. Without this, a value carrying a soft hyphen or a zero-width
+/// space — which ADR-250 taught the classifier to see — is still invisible to the
+/// `*_spans` detectors, so it would be classified sensitive yet left unmasked.
+///
+/// `map` has one entry per byte of the normalized string plus a trailing
+/// sentinel equal to `text.len()`, so both ends of a span can be translated.
+fn normalized_with_offsets(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(text.len());
+    let mut map: Vec<usize> = Vec::with_capacity(text.len() + 1);
+    for (orig_idx, c) in text.char_indices() {
+        if crate::guard::is_invisible(c) {
+            continue;
+        }
+        let folded = crate::privacy::fold_char_for_detection(c);
+        let before = out.len();
+        out.push(folded);
+        // Every byte the folded char contributes maps back to the ORIGINAL
+        // char's start offset, so a span boundary lands on a char boundary.
+        for _ in before..out.len() {
+            map.push(orig_idx);
+        }
+    }
+    map.push(text.len()); // sentinel for an exclusive span end
+    (out, map)
+}
+
+/// Run a `*_spans` detector over the normalized form of `text` and translate the
+/// results back to original-text byte offsets (ADR-251). Spans that would be
+/// empty or out of range after translation are dropped.
+fn spans_via_normalized(
+    text: &str,
+    detect: fn(&str) -> Vec<(usize, usize)>,
+) -> Vec<(usize, usize)> {
+    let (norm, map) = normalized_with_offsets(text);
+    // Fast path: nothing was stripped or folded, so offsets already match.
+    if norm == text {
+        return detect(text);
+    }
+    detect(&norm)
+        .into_iter()
+        .filter_map(|(s, e)| {
+            let (os, oe) = (*map.get(s)?, *map.get(e)?);
+            (os < oe && oe <= text.len()).then_some((os, oe))
+        })
+        .collect()
+}
+
 fn apply_spans(text: &str, spans: Vec<(usize, usize)>, ctx: &mut Ctx, category: &str) -> String {
     if spans.is_empty() {
         return text.to_string();
@@ -395,7 +447,12 @@ fn apply_spans(text: &str, spans: Vec<(usize, usize)>, ctx: &mut Ctx, category: 
 /// space/hyphen separators (`4111 1111 1111 1111`) and so span multiple
 /// whitespace tokens that the tokenizer would never reassemble.
 fn mask_credit_cards(text: &str, ctx: &mut Ctx) -> String {
-    apply_spans(text, crate::privacy::credit_card_spans(text), ctx, "CARD")
+    apply_spans(
+        text,
+        spans_via_normalized(text, crate::privacy::credit_card_spans),
+        ctx,
+        "CARD",
+    )
 }
 
 /// Mask IBAN bank account numbers with `<IBAN_n>` tokens (ADR-240). Runs before
@@ -403,7 +460,12 @@ fn mask_credit_cards(text: &str, ctx: &mut Ctx) -> String {
 /// part of the whole IBAN, prefix letters included) rather than partially caught
 /// by the 13–19-digit card scan. Compact form only; see `privacy::iban_spans`.
 fn mask_ibans(text: &str, ctx: &mut Ctx) -> String {
-    apply_spans(text, crate::privacy::iban_spans(text), ctx, "IBAN")
+    apply_spans(
+        text,
+        spans_via_normalized(text, crate::privacy::iban_spans),
+        ctx,
+        "IBAN",
+    )
 }
 
 /// Mask Japanese My Numbers (マイナンバー) with `<MYNUMBER_n>` tokens (ADR-212).
@@ -411,7 +473,12 @@ fn mask_ibans(text: &str, ctx: &mut Ctx) -> String {
 /// (`1234 5678 9018`), spanning multiple whitespace tokens, so it needs a
 /// checksum-validated span pre-pass exactly like credit cards.
 fn mask_my_numbers(text: &str, ctx: &mut Ctx) -> String {
-    apply_spans(text, crate::privacy::my_number_spans(text), ctx, "MYNUMBER")
+    apply_spans(
+        text,
+        spans_via_normalized(text, crate::privacy::my_number_spans),
+        ctx,
+        "MYNUMBER",
+    )
 }
 
 /// Mask international (`+`-prefixed) phone numbers with `<PHONE_n>` tokens
@@ -421,7 +488,12 @@ fn mask_my_numbers(text: &str, ctx: &mut Ctx) -> String {
 /// agnostic span pre-pass closes that gap. Single-token domestic forms
 /// (`090-1234-5678`) keep flowing through the per-token loop.
 fn mask_phones(text: &str, ctx: &mut Ctx) -> String {
-    apply_spans(text, crate::privacy::phone_spans(text), ctx, "PHONE")
+    apply_spans(
+        text,
+        spans_via_normalized(text, crate::privacy::phone_spans),
+        ctx,
+        "PHONE",
+    )
 }
 
 /// Mask URL-embedded credentials (`user:password` in `scheme://user:pass@host`)
@@ -668,6 +740,51 @@ mod tests {
             out[0].content
         );
         assert!(out[0].content.contains("12345"), "short number preserved");
+    }
+
+    #[test]
+    fn test_obfuscated_values_are_masked_and_restored() {
+        // ADR-251: ADR-250 taught the CLASSIFIER to see through invisible
+        // characters, but the *_spans detectors still read raw bytes, so an
+        // obfuscated value was classified sensitive yet left unmasked. These all
+        // returned the value verbatim before the offset-mapped span pass.
+        let cases: [(&str, &str); 4] = [
+            ("charge 4111 1111 11\u{00AD}11 1111 now", "<CARD_1>"),
+            ("charge 4111 1111 1111\u{200B} 1111 now", "<CARD_1>"),
+            // Full-width digits were unmasked too — the same root cause.
+            ("charge ４１１１１１１１１１１１１１１１ now", "<CARD_1>"),
+            ("wire DE8937040044\u{200B}0532013000 now", "<IBAN_1>"),
+        ];
+        for (input, token) in cases {
+            let (out, mapping) = pseudonymize_messages(&[msg(input)]);
+            assert!(
+                out[0].content.contains(token),
+                "obfuscated value must be masked as {token}: {:?}",
+                out[0].content
+            );
+            // The raw digits must not survive anywhere in the masked text.
+            assert!(
+                !out[0].content.contains("1111 1111"),
+                "raw value must not remain: {:?}",
+                out[0].content
+            );
+            // And masking must be exactly reversible, invisible chars included.
+            assert_eq!(
+                restore(&out[0].content, &mapping),
+                input,
+                "must round-trip byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalized_span_pass_leaves_clean_text_untouched() {
+        // Fast path: text needing no normalization must be byte-identical, so
+        // the offset mapping can never perturb ordinary prompts.
+        let clean = "hello world, nothing sensitive here";
+        let (out, mapping) = pseudonymize_messages(&[msg(clean)]);
+        assert_eq!(out[0].content, clean);
+        assert!(mapping.is_empty());
     }
 
     #[test]
