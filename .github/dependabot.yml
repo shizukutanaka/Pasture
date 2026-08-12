@@ -1,3 +1,14 @@
 version: 2
 updates:
-  - package-ecosystem: "cargo"\n    directory: "/"\n    schedule:\n      interval: "weekly"\n  - package-ecosystem: "github-actions"\n    directory: "/"\n    schedule:\n      interval: "weekly"\n
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    allow:
+      - dependency-type: "direct"
+    automerge:
+      - dependency-type: "direct"
+    schedule:
+      interval: "weekly"
