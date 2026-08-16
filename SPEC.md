@@ -454,6 +454,15 @@ system-override phrases (`role_switch`) and data-exfiltration phrases (`exfil_at
 `block` returns `400`. Only the matched **label** is ever recorded — never prompt
 content (I3).
 
+Matching runs over normalized text (ADR-249: invisible/bidi/tag characters
+stripped; full-width letters and Cyrillic/Greek homoglyphs folded) and covers
+tool-call arguments as well as message content (ADR-247). A third label,
+**`encoded_payload`**, is emitted when an injection phrase is recovered by
+decoding a base64 / hex / ROT13 run and re-screening the **decoded** text
+(decode-and-rescreen, ADR-252) — a flag always requires a real phrase, so
+merely looking encoded is never sufficient. The plaintext pass runs first, so
+`encoded_payload` is reserved for phrases that were genuinely hidden.
+
 ---
 
 ## 8. Configuration
