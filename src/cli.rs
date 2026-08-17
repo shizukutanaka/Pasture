@@ -34,6 +34,7 @@ COMMANDS:
     calibrate --logprob       Recommend PASTURE_CASCADE_LOGPROB from logged cascade confidence
     calibrate --error --labels <f.jsonl> [--target E]
     calibrate --auroc --labels <f.jsonl>     Self-test: does the confidence signal actually predict correctness?
+    label --prompts <f> [--out <f>]          Build that labels file: answer prompts locally and mark each right/wrong
                              Recommend PASTURE_CASCADE_LOGPROB for a target error rate E
                              (default 0.1) from labelled answers: {\"logprob\": -0.4, \"correct\": true}
     donate                   Show how to support development ($1/month)
@@ -448,6 +449,7 @@ pub fn run(args: &[String]) -> i32 {
         "eval" => run_eval(rest),
         "stats" => run_stats(&config, rest),
         "calibrate" => run_calibrate(&config, rest),
+        "label" => run_label(&config, rest),
         "improvements" => {
             let review = rest.iter().any(|a| a == "--review");
             run_improvements(positional(rest).first().copied(), review)
@@ -1480,6 +1482,107 @@ fn run_calibrate_sweep(config: &Config, lang: crate::i18n::Lang, logprob_mode: b
 /// Published per-model AUROCs for confidence signals span roughly 0.58 (barely
 /// above chance) to 0.84 (genuinely useful) on the same task, so this is
 /// model-specific and must be measured, not assumed.
+/// `pasture label --prompts <file> [--out <file>]` (ADR-257): build the labelled
+/// confidence file that `calibrate --auroc` and `calibrate --error` require.
+///
+/// Those commands consume `{"logprob":…,"correct":…}` JSONL, but nothing in
+/// Pasture produced it — a workflow dead end shipped with ADR-246. It cannot be
+/// recovered after the fact either: the cost log records `logprob` but, by
+/// design, no prompt or answer text (I3), so there is nothing to review. Labels
+/// therefore have to be captured at request time, which is what this does —
+/// run each prompt locally, show the answer, record the operator's verdict.
+///
+/// The output keeps I3: only the score and the verdict are written, never the
+/// prompt or the answer.
+fn run_label(config: &Config, rest: &[String]) -> i32 {
+    use std::io::{BufRead, Write};
+    let Some(prompts_path) = option_value(rest, "--prompts") else {
+        eprintln!("label needs --prompts <file> (one prompt per line, # comments allowed)");
+        return 1;
+    };
+    let out_path = option_value(rest, "--out").unwrap_or("pasture-labels.jsonl");
+    let prompts = match crate::difficulty::load_hard_prompts(prompts_path) {
+        Ok(p) if !p.is_empty() => p,
+        Ok(_) => {
+            eprintln!("{prompts_path} has no prompts");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let backend = make_local_backend(config);
+    let mut out = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("cannot open {out_path}: {e}");
+            return 1;
+        }
+    };
+    println!(
+        "Labelling {} prompt(s) with the local backend; appending to {out_path}.",
+        prompts.len()
+    );
+    println!("For each answer: y = correct, n = incorrect, s = skip, q = quit.\n");
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let (mut written, mut unscored) = (0usize, 0usize);
+    for (i, prompt) in prompts.iter().enumerate() {
+        let req = chat_request(&config.local_model, prompt);
+        let (resp, logprob) = match backend.complete_scored(&req) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("[{}/{}] backend error: {e}", i + 1, prompts.len());
+                continue;
+            }
+        };
+        let Some(lp) = logprob else {
+            // Without a score the row is useless to --auroc/--error, so say so
+            // rather than writing a row that silently degrades the analysis.
+            unscored += 1;
+            continue;
+        };
+        println!("[{}/{}] {}", i + 1, prompts.len(), prompt);
+        println!("  -> {}", resp.content.trim());
+        print!("  correct? [y/n/s/q] ");
+        let _ = std::io::stdout().flush();
+        let Some(Ok(answer)) = lines.next() else {
+            break;
+        };
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" => {
+                let _ = writeln!(out, "{{\"logprob\":{lp},\"correct\":true}}");
+                written += 1;
+            }
+            "n" => {
+                let _ = writeln!(out, "{{\"logprob\":{lp},\"correct\":false}}");
+                written += 1;
+            }
+            "q" => break,
+            _ => {}
+        }
+    }
+    println!("\nWrote {written} label(s) to {out_path}.");
+    if unscored > 0 {
+        // The default local backend is Ollama, which does not return logprobs,
+        // so this is the common case rather than an edge case. Be explicit.
+        eprintln!(
+            "{unscored} answer(s) had no logprob and were skipped. `calibrate --auroc`/`--error` \
+score confidence, so they need a backend that returns logprobs — set \
+PASTURE_LOCAL_BACKEND to an OpenAI-compatible server (LM Studio, llama.cpp, vLLM)."
+        );
+    }
+    if written > 0 {
+        println!("Next: pasture calibrate --auroc --labels {out_path}");
+    }
+    0
+}
+
 fn run_calibrate_auroc(lang: crate::i18n::Lang, rest: &[String]) -> i32 {
     use crate::calibrate::SignalVerdict;
     use crate::i18n::{t, tf};
@@ -2019,6 +2122,37 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_label_requires_prompts_flag() {
+        // ADR-257: without --prompts there is nothing to label; fail loudly
+        // rather than silently producing an empty labels file.
+        let cfg = Config::default();
+        assert_eq!(run_label(&cfg, &[]), 1);
+    }
+
+    #[test]
+    fn test_label_rejects_missing_or_empty_prompt_file() {
+        let cfg = Config::default();
+        assert_eq!(
+            run_label(
+                &cfg,
+                &["--prompts".to_string(), "/no/such/file".to_string()]
+            ),
+            1
+        );
+        // A file of only comments/blank lines has no prompts.
+        let path = std::env::temp_dir().join("pasture_label_empty_test.txt");
+        std::fs::write(&path, "# just a comment\n\n").unwrap();
+        assert_eq!(
+            run_label(
+                &cfg,
+                &["--prompts".to_string(), path.to_string_lossy().to_string()]
+            ),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
     use super::*;
     use crate::hardware::GpuInfo;
 

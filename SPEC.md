@@ -48,6 +48,7 @@ library only; the cloud (HTTPS/TLS) path is gated behind the optional `cloud` fe
 | `setup` | beginner welcome + `doctor` check |
 | `connect <app>` | print client setup (Cursor / Open WebUI / Continue / SDK / lmstudio) |
 | `calibrate [--target R \| --sweep \| --logprob \| --error --labels <f> \| --auroc --labels <f>]` | recommend `PASTURE_THRESHOLD` / cascade threshold from the cost log; `--auroc` self-tests whether the confidence signal predicts correctness at all (IMP-47) |
+| `label --prompts <f> [--out <f>]` | answer each prompt locally and record right/wrong, producing the `{"logprob","correct"}` JSONL that `calibrate --auroc`/`--error` consume (ADR-257). Writes only the score and verdict — never prompt or answer text (I3) |
 | `models` | recommend local models for this machine |
 | `doctor` | diagnose setup and print fixes |
 | `eval [--external <file>] [--json]` | routing accuracy + threshold sweep |

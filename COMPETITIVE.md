@@ -378,6 +378,17 @@ zero-dep/single-user/privacy wedge):**
 | **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
 | **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | ◐ **PARTIALLY SHIPPED (ADR-254)** — injecting `cache_control` was already done (IMP-18), but the *accounting* half was not, and was **proven broken**: cached prompt tokens land in `cache_creation_input_tokens`/`cache_read_input_tokens` and were dropped entirely, undercounting a realistic cached request **1025×** and silently defeating `PASTURE_BUDGET_DAILY_TOKENS`. Both the buffered and streaming paths now sum all prompt-side fields. **Still open:** cached tokens are counted at face value, so their differing *prices* (cache writes cost more than base input, reads far less) are not modelled by the flat per-1M rate — that needs a richer price config. |
 
+### 4e-6. Closing the loop on routing validation (2026-08)
+
+> F4/W6 — "routing decisions are never validated" — keeps blocking other work
+> (it is why ADR-256 shipped opt-in). This tick attacked the workflow gap rather
+> than the (unaffordable) quality-oracle gap.
+
+| Finding | Verdict |
+|---|---|
+| **V1. The AUROC self-test had no way to get labels** | ✅ **FIXED (ADR-257)** — ADR-246 shipped `calibrate --auroc --labels <f>` and ADR-124 `--error --labels <f>`, both consuming `{"logprob","correct"}` JSONL that **nothing in Pasture produced**; the user had to hand-write it. Worse, it could not be reconstructed afterwards: the cost log keeps `logprob` but deliberately no prompt/answer text (I3), so there is nothing to review. `pasture label` captures verdicts at request time and writes only score+verdict, preserving I3. |
+| **V2. The default backend cannot score confidence** | ⏸️ **Surfaced, not hidden.** `complete_scored` returns no logprob on the trait default, so **Ollama — the default local backend — yields none**, making `--auroc`/`--error` unusable there. `label` now detects this, writes zero rows rather than junk, and names the fix (point `PASTURE_LOCAL_BACKEND` at LM Studio / llama.cpp / vLLM). A real limitation of the cascade-confidence feature line, now documented instead of failing mysteriously. |
+
 ### 4e-5. Task-shape routing revisited (2026-08)
 
 > 2026 SLM reporting draws a sharper line than Pasture's `format` signal does:
