@@ -459,7 +459,9 @@ stripped; full-width letters and Cyrillic/Greek homoglyphs folded) and covers
 tool-call arguments as well as message content (ADR-247). A third label,
 **`encoded_payload`**, is emitted when an injection phrase is recovered by
 decoding a base64 / hex / ROT13 run and re-screening the **decoded** text
-(decode-and-rescreen, ADR-252) — a flag always requires a real phrase, so
+(decode-and-rescreen, ADR-252). Decoding is iterative (ADR-253), so nested and
+mixed layerings (`base64(base64(x))`, `hex(base64(x))`, `base64(rot13(x))`) are
+peeled; the traversal is bounded by depth, node-count and byte budgets — a flag always requires a real phrase, so
 merely looking encoded is never sufficient. The plaintext pass runs first, so
 `encoded_payload` is reserved for phrases that were genuinely hidden.
 
