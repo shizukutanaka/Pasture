@@ -350,7 +350,9 @@ impl Provider {
                         "missing content[0].text and no tool_use".into(),
                     ));
                 }
-                let (p, c) = usage(&v, "input_tokens", "output_tokens");
+                // ADR-254: cached prompt tokens live in separate fields.
+                let p = anthropic_prompt_tokens(v.get("usage"));
+                let (_, c) = usage(&v, "input_tokens", "output_tokens");
                 Ok((content, tool_calls, p, c))
             }
         }
@@ -568,12 +570,12 @@ pub fn parse_anthropic_stream_line(line: &str) -> Option<OpenAiStreamEvent> {
         // message_start.message.usage.input_tokens — prompt tokens (output is a
         // placeholder here, filled by the later message_delta).
         Some("message_start") => {
-            let input = v
-                .get("message")
-                .and_then(|m| m.get("usage"))
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(json_u64);
-            input.map(|p| OpenAiStreamEvent::Usage(p, 0))
+            // ADR-254: include cache_creation/cache_read, else a cached prompt
+            // reports a fraction of its real size on the streaming path too.
+            let u = v.get("message").and_then(|m| m.get("usage"));
+            let input = anthropic_prompt_tokens(u);
+            // Only emit when a usage object was actually present.
+            u.map(|_| OpenAiStreamEvent::Usage(input, 0))
         }
         // message_delta.usage.output_tokens — final cumulative completion tokens.
         Some("message_delta") => {
@@ -866,6 +868,31 @@ fn translate_tools_to_anthropic(tools: &JsonValue) -> String {
     format!(",\"tools\":[{}]", items.join(","))
 }
 
+/// Sum every prompt-side token field Anthropic reports (ADR-254).
+///
+/// With prompt caching active — which Pasture itself enables via
+/// `PASTURE_CACHE_CONTROL=1` (IMP-18) — Anthropic bills the bulk of the prompt
+/// under `cache_creation_input_tokens` / `cache_read_input_tokens` and leaves
+/// only the uncached remainder in `input_tokens`. Reading `input_tokens` alone
+/// therefore undercounts the prompt by orders of magnitude on a large cached
+/// system prompt, which silently defeats `PASTURE_BUDGET_DAILY_TOKENS` (a
+/// token-denominated spend cap) and understates the cost log.
+///
+/// Cached tokens are counted at face value: the budget guard is denominated in
+/// tokens, so the true count is exactly what it needs. Their differing *prices*
+/// (cache writes cost more than base input, cache reads far less) are not
+/// modelled by the current flat per-1M rate — see the ADR for that follow-up.
+pub(crate) fn anthropic_prompt_tokens(u: Option<&JsonValue>) -> u64 {
+    [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .filter_map(|k| u.and_then(|x| x.get(k)).and_then(json_u64))
+    .sum()
+}
+
 fn usage(v: &JsonValue, pk: &str, ck: &str) -> (u64, u64) {
     let u = v.get("usage");
     let get = |key: &str| {
@@ -1110,6 +1137,47 @@ mod transport {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_anthropic_cached_prompt_tokens_are_counted() {
+        // ADR-254: with prompt caching active (which PASTURE_CACHE_CONTROL=1
+        // turns on), Anthropic bills most of the prompt under
+        // cache_creation/cache_read and leaves only the remainder in
+        // input_tokens. Counting input_tokens alone undercounted this example
+        // by 1025x, silently defeating the token-denominated budget guard.
+        let body = r#"{"content":[{"type":"text","text":"hi"}],
+          "usage":{"input_tokens":12,"cache_creation_input_tokens":4096,
+                   "cache_read_input_tokens":8192,"output_tokens":40}}"#;
+        let (_c, _t, p, c) = Provider::Anthropic.parse_response(body).unwrap();
+        assert_eq!(
+            p,
+            12 + 4096 + 8192,
+            "all prompt-side tokens must be counted"
+        );
+        assert_eq!(c, 40);
+    }
+
+    #[test]
+    fn test_anthropic_usage_without_cache_fields_unchanged() {
+        // No caching in play: behaviour must be exactly as before.
+        let body = r#"{"content":[{"type":"text","text":"hi"}],
+          "usage":{"input_tokens":31,"output_tokens":7}}"#;
+        let (_c, _t, p, c) = Provider::Anthropic.parse_response(body).unwrap();
+        assert_eq!((p, c), (31, 7));
+    }
+
+    #[test]
+    fn test_anthropic_stream_counts_cached_prompt_tokens() {
+        // Same fix on the streaming path (message_start carries the usage).
+        let line = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"cache_creation_input_tokens":100,"cache_read_input_tokens":900}}}"#;
+        match Provider::Anthropic.parse_stream_line(line) {
+            Some(OpenAiStreamEvent::Usage(p, c)) => {
+                assert_eq!(p, 1005, "cached prompt tokens must be included");
+                assert_eq!(c, 0);
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
     use super::*;
     use crate::backend::Message;
 
