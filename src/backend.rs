@@ -531,6 +531,29 @@ impl OllamaBackend {
         )
     }
 
+    /// Read Ollama's authoritative token counts from a response or final stream
+    /// frame (ADR-255): `prompt_eval_count` / `eval_count`. Returns `None` per
+    /// field when absent, so callers fall back to the length estimate.
+    ///
+    /// Ollama reports what it actually processed. Estimating from the reply text
+    /// instead is not merely imprecise — it is wrong by orders of magnitude for a
+    /// **thinking model**, whose reasoning trace arrives in `message.thinking`
+    /// and never appears in `content`. A response that generated 250 tokens to
+    /// answer "42" estimates as 1, so `/v1/stats`, the cost log and the
+    /// local-savings figure (IMP-37) all understate the work done ~250x.
+    pub fn parse_usage(body: &str) -> (Option<u64>, Option<u64>) {
+        let Ok(v) = parse(body) else {
+            return (None, None);
+        };
+        let get = |k: &str| {
+            v.get(k).and_then(|n| match n {
+                JsonValue::Number(f) if *f >= 0.0 => Some(*f as u64),
+                _ => None,
+            })
+        };
+        (get("prompt_eval_count"), get("eval_count"))
+    }
+
     /// Extract the assistant content from an Ollama `/api/chat` response body.
     pub fn parse_response(body: &str) -> Result<String, BackendError> {
         let v = parse(body).map_err(|e| BackendError::Protocol(e.to_string()))?;
@@ -551,8 +574,12 @@ impl Backend for OllamaBackend {
         let body = Self::build_body(req);
         let response = http_post(&self.host, self.port, "/api/chat", &body, self.timeout)?;
         let content = Self::parse_response(&response)?;
-        let prompt_tokens = crate::routing::estimate_tokens(&req.estimation_text()) as u64;
-        let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
+        // ADR-255: prefer Ollama's own counts; estimate only when it omits them.
+        let (rp, rc) = Self::parse_usage(&response);
+        let prompt_tokens =
+            rp.unwrap_or_else(|| crate::routing::estimate_tokens(&req.estimation_text()) as u64);
+        let completion_tokens =
+            rc.unwrap_or_else(|| crate::routing::estimate_tokens(&content) as u64);
         Ok(CompletionResponse {
             content,
             model: self.model.clone(),
@@ -569,6 +596,7 @@ impl Backend for OllamaBackend {
     ) -> Result<CompletionResponse, BackendError> {
         let body = Self::build_body_streaming(req);
         let mut content = String::new();
+        let mut reported: (Option<u64>, Option<u64>) = (None, None);
         http_post_streaming(
             &self.host,
             self.port,
@@ -580,13 +608,22 @@ impl Backend for OllamaBackend {
                     content.push_str(&d);
                     on_delta(&d);
                 }
+                // ADR-255: the final frame (done:true) carries the real counts.
+                let (p, c) = Self::parse_usage(line);
+                if p.is_some() || c.is_some() {
+                    reported = (p.or(reported.0), c.or(reported.1));
+                }
             },
         )?;
         if content.is_empty() {
             return Err(BackendError::Protocol("empty stream".to_string()));
         }
-        let prompt_tokens = crate::routing::estimate_tokens(&req.estimation_text()) as u64;
-        let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
+        let prompt_tokens = reported
+            .0
+            .unwrap_or_else(|| crate::routing::estimate_tokens(&req.estimation_text()) as u64);
+        let completion_tokens = reported
+            .1
+            .unwrap_or_else(|| crate::routing::estimate_tokens(&content) as u64);
         Ok(CompletionResponse {
             content,
             model: self.model.clone(),
@@ -950,6 +987,41 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_ollama_parse_usage_reads_reported_counts() {
+        // ADR-255: Ollama reports what it actually processed.
+        let body = r#"{"message":{"role":"assistant","content":"42"},"done":true,
+                       "prompt_eval_count":10,"eval_count":250}"#;
+        assert_eq!(OllamaBackend::parse_usage(body), (Some(10), Some(250)));
+        // Absent fields fall back to None so the caller estimates.
+        let bare = r#"{"message":{"role":"assistant","content":"42"},"done":true}"#;
+        assert_eq!(OllamaBackend::parse_usage(bare), (None, None));
+        // Malformed / negative values are ignored rather than trusted.
+        let bad = r#"{"prompt_eval_count":"ten","eval_count":-5}"#;
+        assert_eq!(OllamaBackend::parse_usage(bad), (None, None));
+        assert_eq!(OllamaBackend::parse_usage("not json"), (None, None));
+    }
+
+    #[test]
+    fn test_thinking_model_usage_is_not_estimated_from_content() {
+        // A thinking model puts its reasoning in message.thinking, so `content`
+        // is just the short answer. Estimating from content counted 1 token for
+        // a response that really generated 250 — a ~250x undercount that flowed
+        // into /v1/stats, the cost log and the local-savings figure (IMP-37).
+        let body = r#"{"message":{"role":"assistant",
+            "thinking":"Let me work through this carefully.","content":"42"},
+            "done":true,"prompt_eval_count":10,"eval_count":250}"#;
+        // Content parsing is unaffected: the reasoning trace is correctly excluded.
+        assert_eq!(OllamaBackend::parse_response(body).unwrap(), "42");
+        let (p, c) = OllamaBackend::parse_usage(body);
+        assert_eq!(c, Some(250), "must use the reported count, not estimate 1");
+        assert_eq!(p, Some(10));
+        assert!(
+            crate::routing::estimate_tokens("42") < 5,
+            "estimate really is tiny"
+        );
+    }
     use super::*;
 
     fn req() -> CompletionRequest {

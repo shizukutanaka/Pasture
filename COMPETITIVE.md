@@ -378,6 +378,19 @@ zero-dep/single-user/privacy wedge):**
 | **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
 | **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | ◐ **PARTIALLY SHIPPED (ADR-254)** — injecting `cache_control` was already done (IMP-18), but the *accounting* half was not, and was **proven broken**: cached prompt tokens land in `cache_creation_input_tokens`/`cache_read_input_tokens` and were dropped entirely, undercounting a realistic cached request **1025×** and silently defeating `PASTURE_BUDGET_DAILY_TOKENS`. Both the buffered and streaming paths now sum all prompt-side fields. **Still open:** cached tokens are counted at face value, so their differing *prices* (cache writes cost more than base input, reads far less) are not modelled by the flat per-1M rate — that needs a richer price config. |
 
+### 4e-4. Peer-software compatibility pass (2026-08)
+
+> Angle: what do the tools Pasture actually sits between — Ollama locally,
+> Anthropic/OpenAI upstream — now do that Pasture does not keep up with?
+> Both findings are **accounting** bugs: the functional paths were correct, but
+> the numbers Pasture reports about them were not.
+
+| Finding | Verdict |
+|---|---|
+| **P1. Anthropic cached prompt tokens dropped** | ✅ **FIXED (ADR-254)** — with `PASTURE_CACHE_CONTROL=1` (Pasture's own IMP-18 feature) Anthropic bills most of the prompt under `cache_creation_input_tokens`/`cache_read_input_tokens`; Pasture read `input_tokens` alone. Proven **1025×** undercount, silently defeating the token-denominated `PASTURE_BUDGET_DAILY_TOKENS`. Enabling the cost-*saving* feature disabled the cost-*control* feature. |
+| **P2. Ollama's real token counts ignored** | ✅ **FIXED (ADR-255)** — Ollama returns `prompt_eval_count`/`eval_count` on every response and Pasture used neither, always estimating from text length. Harmless-ish for plain models; **~250× wrong for a thinking model**, whose reasoning goes to `message.thinking` and never appears in `content`. Now uses the reported counts, estimating only as fallback. |
+| **P3. Thinking-model content handling** | ✅ **Verified correct, no change needed.** Tested against a fake Ollama emitting `message.thinking`: the reasoning trace is correctly excluded from the answer on *both* the buffered and streaming paths. Recorded so the question is not re-opened. |
+
 ### 4e-3. Security pass: prompt-injection surface (2026-08)
 
 > Prompted by 2026 reporting placing prompt injection as OWASP's #1 AI threat,
