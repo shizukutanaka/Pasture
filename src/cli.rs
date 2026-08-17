@@ -1767,7 +1767,8 @@ fn make_engine(profile: &HardwareProfile, config: &Config, cloud_available: bool
             .collect();
         engine = engine.with_skills(skills);
     }
-    engine
+    // ADR-256: applies regardless of whether skill overrides are configured.
+    engine.with_structured_local(config.structured_local)
 }
 
 /// True when the configured local engine is an OpenAI-compatible server.

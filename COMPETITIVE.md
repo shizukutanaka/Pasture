@@ -378,6 +378,17 @@ zero-dep/single-user/privacy wedge):**
 | **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
 | **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | ◐ **PARTIALLY SHIPPED (ADR-254)** — injecting `cache_control` was already done (IMP-18), but the *accounting* half was not, and was **proven broken**: cached prompt tokens land in `cache_creation_input_tokens`/`cache_read_input_tokens` and were dropped entirely, undercounting a realistic cached request **1025×** and silently defeating `PASTURE_BUDGET_DAILY_TOKENS`. Both the buffered and streaming paths now sum all prompt-side fields. **Still open:** cached tokens are counted at face value, so their differing *prices* (cache writes cost more than base input, reads far less) are not modelled by the flat per-1M rate — that needs a richer price config. |
 
+### 4e-5. Task-shape routing revisited (2026-08)
+
+> 2026 SLM reporting draws a sharper line than Pasture's `format` signal does:
+> *"classification, routing, structured extraction, reformatting and
+> short-context QA almost always work on small models; multi-step reasoning,
+> long-context synthesis and open-ended writing usually need a bigger one."*
+
+| Finding | Verdict |
+|---|---|
+| **T1. `format` conflated reformatting with code generation** | ◐ **ADDRESSED, opt-in (ADR-256)** — one marker list held both `as json` / `csv format` / `markdown table` (reformatting, which small models handle reliably) and `write a function` / `dockerfile` / `sql query` (synthesis, which they don't). A bare "give me that as JSON" was escalated to cloud — Pasture spending money on the class it exists to keep local. The lists are now split, and `PASTURE_STRUCTURED_LOCAL=1` stops the structured half escalating. **Deliberately opt-in, not the default:** the evidence is external benchmark reporting and Pasture has no live-model quality harness (W6) to confirm the trade-off locally, so it does not silently re-route existing deployments. Flipping the default should wait on W6. |
+
 ### 4e-4. Peer-software compatibility pass (2026-08)
 
 > Angle: what do the tools Pasture actually sits between — Ollama locally,

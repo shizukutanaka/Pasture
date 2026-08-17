@@ -115,6 +115,10 @@ pub struct Config {
     /// `cache_control: {"type": "ephemeral"}` to enable provider-side KV caching.
     /// For OpenAI this is a no-op. Set via `PASTURE_CACHE_CONTROL=1`.
     pub cache_control: bool,
+    /// ADR-256: when true, pure structured-output markers ("as json", "csv
+    /// format", …) no longer force a cloud escalation. Code generation still
+    /// does. Off by default. Set via `PASTURE_STRUCTURED_LOCAL=1`.
+    pub structured_local: bool,
     /// Pseudonymize PII before sending cloud requests and restore in responses
     /// (IMP-19). Replaces emails, IPs, phone numbers, and API keys with opaque
     /// tokens (`<EMAIL_1>`, etc.) that are reversed after the cloud response.
@@ -202,6 +206,7 @@ impl Default for Config {
             cloud_price_per_1m: (0.0, 0.0),
             max_body_bytes: 16 * 1024 * 1024,
             cache_control: false,
+            structured_local: false,
             pseudonymize: false,
             output_pii_scan: false,
             input_pii_scan: false,
@@ -422,6 +427,12 @@ impl Config {
         if let Ok(v) = std::env::var("PASTURE_MAX_BODY_BYTES") {
             if let Ok(n) = v.parse::<usize>() {
                 self.max_body_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PASTURE_STRUCTURED_LOCAL") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.structured_local = true,
+                _ => {}
             }
         }
         if let Ok(v) = std::env::var("PASTURE_CACHE_CONTROL") {

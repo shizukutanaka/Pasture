@@ -230,7 +230,19 @@ const REASONING_MARKERS: &[&str] = &[
 ];
 
 /// Strict-format / code-generation requests that reward a stronger model.
-const FORMAT_MARKERS: &[&str] = &[
+/// Pure **structured-output / reformatting** markers (ADR-256).
+///
+/// Held separately from the code-generation markers below because 2026 SLM
+/// evidence splits them: classification, structured extraction and reformatting
+/// "almost always work on small models", while multi-step reasoning and
+/// long-context synthesis do not. Escalating a bare "give me that as JSON" to
+/// the cloud therefore spends money on exactly the class a local model handles
+/// reliably — Pasture failing at its own job.
+///
+/// These only stop escalating when `PASTURE_STRUCTURED_LOCAL=1`; the default is
+/// unchanged (see `hard_signals_with`), because the quality trade-off cannot be
+/// verified on this machine without a live-model eval harness.
+const STRUCTURED_MARKERS: &[&str] = &[
     "as json",
     "in json",
     "valid json",
@@ -238,9 +250,17 @@ const FORMAT_MARKERS: &[&str] = &[
     "as xml",
     "csv format",
     "markdown table",
+    "yaml",
+    "json形式",
+    "表形式",
+];
+
+/// **Code-generation** markers. These stay a hard signal regardless of
+/// `PASTURE_STRUCTURED_LOCAL`: writing a program is synthesis, not reformatting,
+/// and is where small models measurably trail.
+const FORMAT_MARKERS: &[&str] = &[
     "regex",
     "sql query",
-    "yaml",
     "openapi",
     "write a function",
     "implement a",
@@ -251,8 +271,6 @@ const FORMAT_MARKERS: &[&str] = &[
     "shell script",
     "bash script",
     "dockerfile",
-    "json形式",
-    "表形式",
     "正規表現",
     "関数を実装",
     "コードを書",
@@ -383,6 +401,21 @@ pub fn detect_skill(text: &str) -> Option<&'static str> {
 /// Aggregate "hard" signals that suggest escalating to the stronger model.
 /// Returns stable labels (no user content).
 pub fn hard_signals(text: &str) -> Vec<&'static str> {
+    hard_signals_with(text, false)
+}
+
+/// `hard_signals` with the ADR-256 structured-output opt-out.
+///
+/// When `structured_local` is true, pure reformatting/extraction markers
+/// (`STRUCTURED_MARKERS`) no longer contribute a hard signal, so a bare
+/// "give me that as JSON" is routed on its own merits (length, other signals)
+/// instead of being forced to the cloud. Code-generation markers are unaffected.
+///
+/// Default is `false` — identical to pre-ADR-256 behaviour. This is deliberately
+/// opt-in: the supporting evidence is external benchmark reporting, and Pasture
+/// has no live-model quality harness (the open W6 gap) with which to confirm the
+/// trade-off locally, so it does not silently re-route everyone's traffic.
+pub fn hard_signals_with(text: &str, structured_local: bool) -> Vec<&'static str> {
     let lower = text.to_lowercase();
     let mut signals = Vec::new();
     if looks_like_code(text) {
@@ -391,7 +424,9 @@ pub fn hard_signals(text: &str) -> Vec<&'static str> {
     if has_marker(&lower, REASONING_MARKERS) {
         signals.push("reasoning");
     }
-    if has_marker(&lower, FORMAT_MARKERS) {
+    if has_marker(&lower, FORMAT_MARKERS)
+        || (!structured_local && has_marker(&lower, STRUCTURED_MARKERS))
+    {
         signals.push("format");
     }
     if question_count(text) >= 3 {
@@ -562,6 +597,8 @@ pub fn is_time_sensitive(text: &str) -> bool {
 pub struct RoutingEngine {
     token_threshold: usize,
     code_to_cloud: bool,
+    /// ADR-256: treat pure structured-output markers as non-escalating.
+    structured_local: bool,
     local_available: bool,
     cloud_available: bool,
     allow_sensitive_cloud: bool,
@@ -583,6 +620,7 @@ impl RoutingEngine {
         Self {
             token_threshold,
             code_to_cloud: true,
+            structured_local: false,
             local_available,
             cloud_available,
             allow_sensitive_cloud: false,
@@ -611,6 +649,15 @@ impl RoutingEngine {
     }
 
     /// Disable the "code goes to cloud" rule (used by `--local`-leaning setups).
+    /// ADR-256: when enabled, pure structured-output / reformatting markers
+    /// ("as json", "csv format", "markdown table", …) stop forcing cloud, so
+    /// they route on length and other signals like any other prompt. Code
+    /// generation still escalates. Off by default.
+    pub fn with_structured_local(mut self, enabled: bool) -> Self {
+        self.structured_local = enabled;
+        self
+    }
+
     pub fn with_code_to_cloud(mut self, enabled: bool) -> Self {
         self.code_to_cloud = enabled;
         self
@@ -756,7 +803,7 @@ impl RoutingEngine {
         }
 
         if self.code_to_cloud {
-            let mut signals = hard_signals(text);
+            let mut signals = hard_signals_with(text, self.structured_local);
             if has_tools {
                 signals.push("tools");
             }
@@ -1193,6 +1240,50 @@ mod tests {
         assert!(hard_signals("output as XML").contains(&"format"));
         // A plain factual prompt is still untouched (no false escalation).
         assert!(hard_signals("what time is it in Tokyo").is_empty());
+    }
+
+    #[test]
+    fn test_structured_local_opt_out() {
+        // ADR-256: pure reformatting/extraction markers stop escalating when the
+        // opt-out is on; code generation is unaffected either way.
+        for structured in [
+            "give me that as json",
+            "output in csv format",
+            "as a markdown table",
+        ] {
+            assert!(
+                hard_signals(structured).contains(&"format"),
+                "default unchanged: {structured:?}"
+            );
+            assert!(
+                !hard_signals_with(structured, true).contains(&"format"),
+                "opt-out must drop the signal: {structured:?}"
+            );
+        }
+        for code in [
+            "write a function to sort",
+            "implement a binary search",
+            "write a dockerfile",
+        ] {
+            assert!(
+                hard_signals_with(code, true).contains(&"format"),
+                "code generation must still escalate: {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_structured_local_default_is_unchanged_behaviour() {
+        // hard_signals() must remain byte-for-byte the pre-ADR-256 behaviour so
+        // no existing deployment is silently re-routed.
+        for t in [
+            "give me that as json",
+            "write a unit test for foo",
+            "output as XML",
+            "what time is it in Tokyo",
+        ] {
+            assert_eq!(hard_signals(t), hard_signals_with(t, false), "{t:?}");
+        }
     }
 
     #[test]

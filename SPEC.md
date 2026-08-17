@@ -314,7 +314,7 @@ returns at the first match (I4):
    markers (EN/JA); `≥3` clause-terminating question marks (ADR-209 — a URL query
    `?` followed by alphanumeric does not count; full-width `？` always counts);
    `≥3` **distinct** math symbol types (ADR-208 — e.g. `^`, `+`, `=` together;
-   single-char repetition like `/` in a URL does not trigger); **multi-step**
+   single-char repetition like `/` in a URL does not trigger); strict-format markers split into **code-generation** (always escalate) and pure **structured-output** ones (`as json`, `csv format`, … — also escalate unless `PASTURE_STRUCTURED_LOCAL=1`, ADR-256); **multi-step**
    (ADR-242 — `≥3` distinct sequencing cues such as *first/then/finally* or
    まず/次に/最後に, matched whole-word so "then" inside "strengthen" does not
    count, **or** a numbered list of `≥3` items; catches short multi-step plans
@@ -517,6 +517,7 @@ wins). Variables:
 | `PASTURE_SEMANTIC_MIN_LEXICAL` | `0.0` | lexical second-gate floor (Jaccard token overlap) a cosine hit must also clear; `0` disables (§6, IMP-46) |
 | `PASTURE_CACHE_TTL` | `0` | cached-entry TTL in seconds; 0 = no TTL (FIFO only) |
 | `PASTURE_CACHE_CONTROL` | off | inject Anthropic `cache_control` prompt-caching hint (no-op for OpenAI) |
+| `PASTURE_STRUCTURED_LOCAL` | _(off)_ | when set, pure structured-output markers (`as json`, `csv format`, `markdown table`, `yaml`, …) no longer force a cloud escalation and route on length/other signals; code-generation markers still escalate (§4, ADR-256) |
 | `PASTURE_HARD_PROMPTS` | _(off)_ | path to known-hard-prompts file; near-matches escalate to cloud (IMP-14) |
 | `PASTURE_HARD_THRESHOLD` | `0.85` | cosine similarity at which a prompt counts as "near a known-hard prompt" |
 | `PASTURE_SKILLS` | _(off)_ | skill→route overrides, e.g. `code:local,math:cloud` (IMP-25) |
