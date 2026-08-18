@@ -6,9 +6,9 @@
 //!
 //! - `off`   (default): disabled, zero overhead.
 //! - `flag`:  detect and annotate with `X-Pasture-Injection-Flag`; request
-//!            still proceeds so legitimate edge cases are not blocked.
+//!   still proceeds so legitimate edge cases are not blocked.
 //! - `block`: detect and reject with 400 Bad Request; use only when you trust
-//!            the pattern set enough to accept false-positive refusals.
+//!   the pattern set enough to accept false-positive refusals.
 //!
 //! **Design constraints (IMP-20, ADR-128):**
 //! - No new dependencies — pure std pattern matching.

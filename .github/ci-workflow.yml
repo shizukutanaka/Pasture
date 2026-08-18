@@ -1,0 +1,96 @@
+name: CI
+
+# The gates ADR-014 names. Until now they existed only as a convention that
+# depended on a human remembering to run them locally — the README carried a CI
+# badge pointing at this file, which did not exist. This makes the claim true.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    name: fmt · clippy · test (MSRV ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.75.0 is the MSRV pinned in rust-toolchain.toml and the version the
+        # crate promises to build on; stable catches lints and breakage that
+        # arrive later. A regression on either is a real regression.
+        rust: ["1.75.0", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.rust }}
+        run: |
+          rustup toolchain install ${{ matrix.rust }} --profile minimal \
+            --component rustfmt,clippy
+          rustup default ${{ matrix.rust }}
+          rustc --version && cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.rust }}-
+
+      # Gate 1 — formatting.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # Gate 2 — lints. Warnings are denied on stable, where the codebase is
+      # currently clean. On the MSRV toolchain lint sets differ (some lints did
+      # not exist in 1.75), so it runs informationally rather than blocking on
+      # warnings a 1.75 user could never see.
+      - name: cargo clippy (deny warnings)
+        if: matrix.rust == 'stable'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo clippy (informational)
+        if: matrix.rust != 'stable'
+        run: cargo clippy --all-targets || true
+
+      # Gate 3 — the test suite. This is the load-bearing one.
+      - name: cargo test
+        run: cargo test --all-targets
+
+      # Gate 4 — the eval harness (ADR-014). Routing accuracy must not regress.
+      - name: pasture eval
+        run: cargo run --release -- eval
+
+      # The headline invariant (I1): the DEFAULT build links no non-std crates.
+      # A stray dependency outside the `cloud` feature would be a silent breach,
+      # so assert the dependency tree has exactly one node — pasture itself.
+      - name: verify zero-dependency default build
+        if: matrix.rust == 'stable'
+        run: |
+          deps=$(cargo tree --edges normal --prefix none | grep -v '^$' | sort -u)
+          echo "$deps"
+          count=$(echo "$deps" | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::I1 violated — default build has $count crates, expected 1 (pasture)"
+            exit 1
+          fi
+
+  cloud-feature:
+    name: cloud feature builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      # The cloud path is feature-gated and pulls a TLS stack, so it is not
+      # covered by the zero-dependency job above. It still has to compile.
+      - name: cargo build --features cloud
+        run: cargo build --features cloud
+      - name: cargo test --features cloud
+        run: cargo test --features cloud

@@ -29,9 +29,9 @@ If a change would weaken one of these, stop and reconsider the approach.
 - **Build/test with `rustup run stable cargo …`.** `rust-toolchain.toml` pins
   1.75.0, which cannot be downloaded here — plain `cargo` fails. `stable` is the
   installed fallback; the code stays MSRV-1.75 compatible regardless.
-- **Known clippy noise:** 9 pre-existing `doc list item` warnings in `guard.rs`
-  (2) and `privacy.rs` (7). They are not from your change — ignore them; only
-  act on warnings in files you touched.
+- **Clippy is clean (ADR-259).** The 9 long-standing `doc list item` warnings in
+  `guard.rs`/`privacy.rs` were fixed, and CI now runs `clippy --all-targets
+  -D warnings` on stable. Any warning you see is yours; fix it.
 - **Git proxy allows pushing the working branch only.** Tag pushes 403; there is
   no `create_release`/`create_tag` MCP tool. Publishing = pushing to the branch.
 - **End-to-end HTTP testing** without a real Ollama: run a fake NDJSON backend in
