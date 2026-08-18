@@ -121,7 +121,7 @@ The local backend talks to [Ollama](https://ollama.com) over plain HTTP. GPU acc
 
 ## Status
 
-Pasture is at v0.26.0. Working today: hardware detection, deterministic hardware-adaptive routing, the OpenAI-compatible proxy, the local Ollama backend, and a fully implemented multi-provider cloud backend (OpenAI/Anthropic, streaming, tool calls, retry + fallback-provider failover, per-backend health tracking with a circuit breaker on both the local and cloud side). Also shipped: exact-match and semantic response caching, a FrugalGPT-style local-first cascade, reversible pseudonymization for cloud-bound PII, a lightweight prompt-injection guard, budget/spike-aware routing, structured JSONL cost + routing-decision audit logs, optional OpenTelemetry GenAI tracing, plus monetization surfaces (`donate` / `refer`) and a serverless Stripe donation Worker (`worker/`). See `ARCHITECTURE.md` for the full ADR history and `SPEC.md` for the complete configuration/API reference.
+Pasture is at v0.27.0. Working today: hardware detection, deterministic hardware-adaptive routing, the OpenAI-compatible proxy, the local Ollama backend, and a fully implemented multi-provider cloud backend (OpenAI/Anthropic, streaming, tool calls, retry + fallback-provider failover, per-backend health tracking with a circuit breaker on both the local and cloud side). Also shipped: exact-match and semantic response caching, a FrugalGPT-style local-first cascade, reversible pseudonymization for cloud-bound PII, a lightweight prompt-injection guard, budget/spike-aware routing, structured JSONL cost + routing-decision audit logs, optional OpenTelemetry GenAI tracing. See `ARCHITECTURE.md` for the full ADR history and `SPEC.md` for the complete configuration/API reference.
 
 ## Privacy
 

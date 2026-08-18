@@ -23,7 +23,6 @@ pub mod health;
 pub mod i18n;
 pub mod improve;
 pub mod json;
-pub mod monetize;
 pub mod output_scan;
 pub mod privacy;
 pub mod proxy;

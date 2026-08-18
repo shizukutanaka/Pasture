@@ -13,9 +13,6 @@ pub struct Config {
     pub cloud_provider: String,
     pub cloud_model: String,
     pub cost_log_path: String,
-    pub donate_url: Option<String>,
-    pub no_nudge: bool,
-    pub state_path: String,
     pub allow_sensitive_cloud: bool,
     pub cascade: bool,
     pub cache_size: usize,
@@ -172,9 +169,6 @@ impl Default for Config {
             cloud_provider: "openai".to_string(),
             cloud_model: "gpt-4o-mini".to_string(),
             cost_log_path: "pasture-cost.jsonl".to_string(),
-            donate_url: None,
-            no_nudge: false,
-            state_path: "pasture-state.txt".to_string(),
             allow_sensitive_cloud: false,
             cascade: false,
             cache_size: 0,
@@ -267,21 +261,6 @@ impl Config {
         }
         if let Ok(v) = std::env::var("PASTURE_COST_LOG") {
             self.cost_log_path = v;
-        }
-        if let Ok(v) = std::env::var("PASTURE_DONATE_URL") {
-            let trimmed = v.trim().to_string();
-            if !trimmed.is_empty() {
-                self.donate_url = Some(trimmed);
-            }
-        }
-        if let Ok(v) = std::env::var("PASTURE_NO_NUDGE") {
-            match v.to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "" => self.no_nudge = true,
-                _ => {}
-            }
-        }
-        if let Ok(v) = std::env::var("PASTURE_STATE") {
-            self.state_path = v;
         }
         if let Ok(v) = std::env::var("PASTURE_ALLOW_SENSITIVE_CLOUD") {
             match v.to_ascii_lowercase().as_str() {
@@ -494,8 +473,6 @@ impl Config {
             "cloud_provider" => self.cloud_provider = val.to_string(),
             "cloud_model" => self.cloud_model = val.to_string(),
             "cost_log_path" => self.cost_log_path = val.to_string(),
-            "donate_url" => self.donate_url = Some(val.to_string()),
-            "state_path" => self.state_path = val.to_string(),
             "cascade" => self.cascade = matches!(val, "1" | "true" | "yes"),
             "cache_size" => {
                 if let Ok(n) = val.parse::<usize>() {
@@ -543,7 +520,6 @@ impl Config {
             }
             "system_prompt" => self.system_prompt = val.to_string(),
             "access_log" => self.access_log = val.to_string(),
-            "no_nudge" => self.no_nudge = matches!(val, "1" | "true" | "yes"),
             "allow_sensitive_cloud" => {
                 self.allow_sensitive_cloud = matches!(val, "1" | "true" | "yes")
             }
@@ -833,14 +809,15 @@ mod tests {
 
     #[test]
     fn test_config_file_boolean_parity_with_env() {
-        // These flags were env-only (PASTURE_NO_NUDGE / PASTURE_ALLOW_SENSITIVE_CLOUD)
-        // and silently ignored in config files before; now they have file parity.
-        let cfg = Config::from_str_with_defaults("no_nudge = true\nallow_sensitive_cloud = yes");
-        assert!(cfg.no_nudge);
+        // These flags were once env-only and silently ignored in config files;
+        // they now have file parity. (The original example used no_nudge, which
+        // ADR-258 deleted along with the nudge; local_only covers the same path.)
+        let cfg = Config::from_str_with_defaults("local_only = true\nallow_sensitive_cloud = yes");
+        assert!(cfg.local_only);
         assert!(cfg.allow_sensitive_cloud);
         // Defaults remain false when unset / falsey.
-        let off = Config::from_str_with_defaults("no_nudge = false");
-        assert!(!off.no_nudge);
+        let off = Config::from_str_with_defaults("local_only = false");
+        assert!(!off.local_only);
         assert!(!off.allow_sensitive_cloud);
     }
 
@@ -874,7 +851,7 @@ mod tests {
         assert!(!disabled2.allow_sensitive_cloud, "\"0\" must NOT enable");
         let disabled3 = Config::from_str_with_defaults("allow_sensitive_cloud = no");
         assert!(!disabled3.allow_sensitive_cloud, "\"no\" must NOT enable");
-        // Same for local_only, no_nudge, cascade, inject_context
+        // Same for local_only, cascade, inject_context
         let lo = Config::from_str_with_defaults("local_only = 1");
         assert!(lo.local_only);
         let lo_off = Config::from_str_with_defaults("local_only = 0");

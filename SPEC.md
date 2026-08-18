@@ -55,7 +55,6 @@ library only; the cloud (HTTPS/TLS) path is gated behind the optional `cloud` fe
 | `stats [--json]` | summarize the cost log |
 | `improvements [path] [--review]` | print the self-improvement ledger (verified change history) |
 | `config` | print effective configuration |
-| `donate` / `refer` | monetization surfaces (links only) |
 | `version` / `help` | version / usage |
 
 Global flags: `--local` / `--cloud` force a route; `--addr host:port` sets the listen
@@ -525,9 +524,6 @@ wins). Variables:
 | `PASTURE_SYSTEM_PROMPT` | _(off)_ | system prompt prepended to every proxied request |
 | `PASTURE_ACCESS_LOG` | _(off)_ | path for a per-request JSONL access log (PII-free, I3) |
 | `PASTURE_OTEL_LOG` | _(off)_ | path for an OpenTelemetry GenAI trace log (§9.1, IMP-23) |
-| `PASTURE_STATE` | `pasture-state.txt` | small state file (donation-nudge counter) |
-| `PASTURE_DONATE_URL` | _(off)_ | donation URL surfaced by `donate` and the nudge |
-| `PASTURE_NO_NUDGE` | off | disable the periodic stderr donation nudge |
 
 > **Spec-drift note (this round):** earlier spec text referenced `PASTURE_PROXY_TOKEN`;
 > the implemented variable is **`PASTURE_AUTH_TOKEN`** (the only name recognised). The

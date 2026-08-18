@@ -40,7 +40,6 @@ These are **not** performed automatically. Each needs explicit maintainer approv
 - ⬜ `git tag vX.Y.Z` + `git push --tags` (triggers `release.yml` binary build)
 - ⬜ Create the GitHub repository `github.com/shizukutanaka/pasture` and first GitHub Release
 - ⬜ Choose & apply final license confirmation (currently MIT, holder shizukutanaka 2026)
-- ⬜ Donation worker: deploy Cloudflare Worker, switch Stripe from test (`sk_test_*`) to live — billing change, Class B/C
 - ⬜ Affiliate/referral URLs: real sign-ups (`PASTURE_REF_*`)
 
 ## Pre-publish hygiene (done this pass)

@@ -464,12 +464,30 @@ Keeping the wedge means saying no to several common peer features:
 
 ---
 
-## 6. Monetization surfaces (referenced by ADR-006)
+## 6. Monetization surfaces — REMOVED (ADR-258, supersedes ADR-006)
 
-The proxy layer is the natural place to surface **cloud-provider referral links**
-(the operator's own affiliate URLs from config) and a donation link — never handling
-cards or secrets itself (hosted Stripe Checkout via `worker/`). No user PII is
-collected. This is surface-only and orthogonal to the routing IP above.
+Deleted in the first-principles pass: `monetize.rs`, the `donate` / `refer`
+commands, the periodic donation nudge, the `worker/` Stripe Cloudflare Worker,
+and their config knobs (`PASTURE_DONATE_URL`, `PASTURE_NO_NUDGE`,
+`PASTURE_STATE`).
+
+Three reasons, in order of weight:
+
+1. **Misaligned incentive.** Referral revenue is earned when a user signs up
+   for a *cloud* provider. Pasture's entire job is to send *less* work to the
+   cloud. The monetization paid out precisely when the product failed at its
+   purpose — an incentive pointing the wrong way, in a tool asking to be trusted
+   with the user's prompts.
+2. **Not a requirement from anyone.** It served none of the four irreducible
+   jobs (accept, route, execute, account). It was a speculative revenue plan for
+   a product with no users yet.
+3. **It cost real complexity.** The nudge existed only to interrupt the user
+   asking for money, and was the *sole* reason Pasture wrote a state file to
+   disk. The Worker put 137 lines of JavaScript and a Stripe dependency inside a
+   "zero-dependency, single-binary, std-only" project.
+
+Reversible if wanted — it is one `git revert` away — but it should come back, if
+at all, as something that does not pay more when the user routes to the cloud.
 
 ---
 

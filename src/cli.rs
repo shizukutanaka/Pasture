@@ -37,8 +37,6 @@ COMMANDS:
     label --prompts <f> [--out <f>]          Build that labels file: answer prompts locally and mark each right/wrong
                              Recommend PASTURE_CASCADE_LOGPROB for a target error rate E
                              (default 0.1) from labelled answers: {\"logprob\": -0.4, \"correct\": true}
-    donate                   Show how to support development ($1/month)
-    refer [provider]         Show configurable cloud-provider referral links
     version                  Print the version
     help                     Show this help
 
@@ -455,14 +453,6 @@ pub fn run(args: &[String]) -> i32 {
             run_improvements(positional(rest).first().copied(), review)
         }
         "config" => run_config(&config),
-        "donate" => {
-            println!(
-                "{}",
-                crate::monetize::donation_text(config.donate_url.as_deref())
-            );
-            0
-        }
-        "refer" => run_refer(rest),
         other => {
             eprintln!("unknown command: {other}\n");
             print!("{USAGE}");
@@ -657,37 +647,6 @@ fn run_stats(config: &Config, rest: &[String]) -> i32 {
     }
 }
 
-/// `pasture refer [provider]`: print referral links (or the configured list).
-fn run_refer(rest: &[String]) -> i32 {
-    let pos = positional(rest);
-    if let Some(key) = pos.first() {
-        match crate::monetize::provider(key) {
-            Some(p) => {
-                match crate::monetize::referral_url(p.key, env_referral_resolver) {
-                    Some(u) => println!("{}: {u}", p.display),
-                    None => println!(
-                        "{}: not configured. Set PASTURE_REF_{}=<your affiliate url>\n({})",
-                        p.display,
-                        p.key.to_uppercase(),
-                        p.homepage
-                    ),
-                }
-                0
-            }
-            None => {
-                eprintln!("unknown provider: {key}");
-                2
-            }
-        }
-    } else {
-        println!(
-            "{}",
-            crate::monetize::referral_list_text(env_referral_resolver)
-        );
-        0
-    }
-}
-
 fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
     let profile = HardwareProfile::detect();
     let cloud = make_cloud_backend(config);
@@ -738,7 +697,6 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
                     } else {
                         println!("{}", lr.content);
                     }
-                    maybe_nudge(config);
                     return 0;
                 }
                 Err(e) => {
@@ -763,7 +721,6 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
         return match backend.complete(&req) {
             Ok(resp) => {
                 println!("{}", resp.content);
-                maybe_nudge(config);
                 0
             }
             Err(e) => {
@@ -788,7 +745,6 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
     match result {
         Ok(_) => {
             let _ = out.write_all(b"\n");
-            maybe_nudge(config);
             0
         }
         Err(e) => {
@@ -1840,7 +1796,6 @@ fn run_config(config: &Config) -> i32 {
         );
     }
     println!("  cost_log:          {}", config.cost_log_path);
-    println!("  donate_url:        {}", yn(config.donate_url.is_some()));
     println!("  lang:              {}", lang.code());
     0
 }
@@ -1920,28 +1875,8 @@ fn chat_request(model: &str, text: &str) -> CompletionRequest {
     }
 }
 
-/// Resolve a referral URL from `PASTURE_REF_<KEY>` (key uppercased).
-fn env_referral_resolver(key: &str) -> Option<String> {
-    std::env::var(format!("PASTURE_REF_{}", key.to_uppercase())).ok()
-}
-
 /// Emit a gentle donation nudge to stderr when due (stdout stays clean for
 /// scripting). No-op when disabled or when no donation URL is configured.
-fn maybe_nudge(config: &Config) {
-    if config.no_nudge {
-        return;
-    }
-    let Some(url) = config.donate_url.as_deref() else {
-        return;
-    };
-    let count = crate::monetize::bump_count(&config.state_path);
-    if crate::monetize::should_nudge(count, crate::monetize::NUDGE_EVERY) {
-        if let Some(msg) = crate::monetize::nudge_text(Some(url)) {
-            eprintln!("{msg}");
-        }
-    }
-}
-
 /// True when a listen address binds only the loopback interface, so the proxy is
 /// reachable only from the same machine (ADR-152). Used to decide whether to warn
 /// about an exposed bind without auth. Uses the std parser rather than string
