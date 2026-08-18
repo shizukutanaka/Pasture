@@ -1,6 +1,6 @@
 # Pasture — Specification (SPEC.md)
 
-Version: tracks `Cargo.toml` (0.26.0 + Unreleased, current through ADR-189). Status:
+Version: tracks `Cargo.toml` (**0.28.0**, current through ADR-259). Status:
 normative for the HTTP API and routing engine; descriptive for the CLI. Keywords
 **MUST**, **SHOULD**, **MAY** per RFC 2119.
 

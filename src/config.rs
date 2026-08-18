@@ -720,6 +720,23 @@ mod tests {
     }
 
     #[test]
+    fn test_spec_version_header_matches_cargo_toml() {
+        // ADR-260: SPEC.md's header claims to track Cargo.toml's version. It had
+        // silently drifted to "0.26.0 ... current through ADR-189" while the crate
+        // was at 0.28.0 and ADR-259 — 70 ADRs stale, in the file that is supposed
+        // to be the contract. Docs that assert a fact should be checked like any
+        // other assertion, which is this project's whole premise.
+        let spec = include_str!("../SPEC.md");
+        let version = env!("CARGO_PKG_VERSION");
+        let header: String = spec.lines().take(12).collect::<Vec<_>>().join("\n");
+        assert!(
+            header.contains(version),
+            "SPEC.md's header must state the current crate version ({version}); \
+update the `Version:` line. Header was:\n{header}"
+        );
+    }
+
+    #[test]
     fn test_spec_has_no_phantom_pasture_env_vars() {
         // ADR-190 (reverse direction): SPEC.md must not document a PASTURE_* env var
         // that the config layer never reads — that is how `PASTURE_PROXY_TOKEN` crept
