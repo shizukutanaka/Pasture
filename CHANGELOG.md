@@ -5,6 +5,99 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-08-16
+
+### Security — prompt-injection guard hardened against real evasions (ADR-247–253)
+
+Each of these was **reproduced against Pasture's own guard before being fixed**,
+not taken on faith from the literature.
+
+- **Tool-call arguments are now scanned** (ADR-247). ADR-187 had already extended
+  the *privacy* scan to `tool_calls_json`; the injection guard had never received
+  the same treatment, so a payload sitting only in tool-call arguments walked past
+  it — the indirect-injection path, since prior `tool_calls` are round-tripped
+  every turn (ADR-183).
+- **Structural override detection** (ADR-248). The literal pattern list was
+  defeated by inserting one word: of six canonical phrasings only
+  `ignore previous instructions` matched — **not** `ignore all previous
+  instructions`. Replaced with verb→scope→target shape matching. Recall 1/6 → 9/9,
+  false positives 0/7.
+- **Unicode normalization before matching** (ADR-249). A single zero-width space,
+  soft hyphen, full-width letter or Cyrillic homoglyph inside a keyword reduced the
+  guard to `Allow` while the model read the word intact — 5 of 8 obfuscations
+  bypassed it. 11/11 now caught; CJK untouched.
+- **Decode-and-rescreen, iterative** (ADR-252, ADR-253). base64 / hex / ROT13
+  payloads were invisible to a lexical scanner. Decoding is now iterative, so
+  nested and mixed layerings (`base64(base64(x))`, `hex(base64(x))`,
+  `base64(rot13(x))`) are peeled too. Bounded on three axes — depth, node count and
+  bytes — so a 292 KiB six-level decode bomb returns in ~8 ms. **Cannot raise the
+  false-positive rate**: a flag still requires the *decoded* text to match.
+
+### Fixed — privacy: invisible characters defeated PII detection (ADR-250, ADR-251)
+
+- **Not primarily an adversarial bug.** PDF viewers insert soft hyphens at line
+  breaks and web text carries zero-width spaces, so pasting your own card number
+  out of a document could defeat invariant **I2** with no attacker involved. A card
+  number with a soft hyphen classified as `[]`; with a zero-width space it
+  classified as `my_number` — actively *wrong*. Every detector now runs on
+  normalized text (ADR-250).
+- **Masking follows detection** (ADR-251). The `*_spans` detectors still read raw
+  bytes, so obfuscated values were classified sensitive yet left unmasked. Spans are
+  now computed on the normalized form and mapped back to original offsets. This also
+  fixed full-width card numbers, which were never masked.
+
+### Fixed — accounting: two silent undercounts (ADR-254, ADR-255)
+
+- **Anthropic cached prompt tokens were dropped** (ADR-254). With
+  `PASTURE_CACHE_CONTROL=1` — Pasture's own feature — Anthropic bills most of the
+  prompt under `cache_creation_input_tokens` / `cache_read_input_tokens`, and only
+  `input_tokens` was read. Proven **1025×** undercount, silently defeating the
+  token-denominated `PASTURE_BUDGET_DAILY_TOKENS`: enabling the cost-*saving*
+  feature disabled the cost-*control* feature.
+- **Ollama's real token counts were ignored** (ADR-255). `prompt_eval_count` /
+  `eval_count` are reported on every response and neither was used. Harmless-ish for
+  plain models, **~250× wrong for a thinking model**, whose reasoning goes to
+  `message.thinking` and never appears in `content`.
+
+### Added
+
+- **`GET /v1/history`** (ADR-245) — per-UTC-day rollups of routes, tokens, spend and
+  estimated savings, plus a dashboard trend strip. `/v1/stats` answers "what is true
+  now"; this answers "is it getting better?". No new history file: the existing
+  PII-free cost log is rolled up on read.
+- **`calibrate --auroc`** (ADR-246) — measures whether the cascade's confidence
+  signal actually separates correct from incorrect answers, and says plainly when it
+  does not. A constant signal scores exactly 0.5, not 1.0.
+- **`pasture label`** (ADR-257) — produces the labelled file `--auroc` / `--error`
+  consume. They previously required a file nothing could generate, and it could not
+  be reconstructed afterwards because the cost log deliberately keeps no prompt text
+  (I3). Writes only score + verdict.
+- **Semantic-cache lexical gate** (ADR-243) — opt-in
+  `PASTURE_SEMANTIC_MIN_LEXICAL`: a cosine hit must also clear a token-overlap floor,
+  rejecting embedding false-positives that would serve a *wrong* cached answer.
+- **`PASTURE_STRUCTURED_LOCAL`** (ADR-256) — reformatting markers (`as json`,
+  `csv format`) no longer force cloud when enabled; code generation still does.
+  Opt-in, because the quality trade-off cannot be verified without a live-model
+  harness.
+
+### Changed
+
+- **`/v1/moderations` no longer claims unverified safety** (ADR-244). It returned
+  `flagged:false` with all-zero scores for text it never examined, while advertising
+  OpenAI's real `text-moderation-stable`. Now `model: "pasture-no-moderation"` plus
+  `x_pasture_moderated: false`. `results[0]` is unchanged so SDKs still parse.
+  **Behaviour change**: clients string-matching the old model name see a new value.
+
+### Removed
+
+- **The monetization surface** (ADR-258, supersedes ADR-006): `monetize.rs`, the
+  `donate` / `refer` commands, the periodic donation nudge, the `worker/` Stripe
+  Cloudflare Worker, and `PASTURE_DONATE_URL` / `PASTURE_NO_NUDGE` /
+  `PASTURE_STATE`. Net −542 lines. Referral revenue is earned when a user signs up
+  for a *cloud* provider, while Pasture's job is to send *less* work to the cloud —
+  it paid out precisely when the product failed at its purpose. The nudge was also
+  the sole reason Pasture wrote a state file to disk.
+
 ### Added — Responses API, IBAN masking, multi-step routing (IMP-38/43/40, ADR-240–242)
 
 - **`POST /v1/responses`** — an OpenAI Responses API compatibility shim (IMP-38,
