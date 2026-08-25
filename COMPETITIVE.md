@@ -395,6 +395,8 @@ zero-dep/single-user/privacy wedge):**
 | **A12. Two dead CI dirs + two docs for one excuse** | ✅ **FIXED (ADR-263)** — self-inflicted: `ci/ci.yml` predated this session (ADR-134 hit the same permission wall), and my ADR-259 added a second without noticing. Consolidated into one workflow, keeping the older file's unique `cargo deny` supply-chain job. **CI is still inactive** — it needs the documented one-command `git mv` from someone whose token has `workflows` permission, so the badge still 404s until then. |
 | **A5. Config-file layer was test-only** | ✅ **FIXED (ADR-264)** — SPEC §8 promised *defaults → file → env* and the parser had existed since ADR-190, but nothing ever read a file: zero non-test callers. Questioned rather than deleted — 53 env vars make a persistent file genuinely useful, and wiring it up cost ~15 lines vs deleting ~150 tested ones. `PASTURE_CONFIG` (else `~/.config/pasture/config`) is now read before env, so the document is true. |
 
+| **A11. Nothing pinned any of it** | ✅ **FIXED (ADR-268)** — every fix above was verified once, by hand, against a release build; `run_doctor`/`run_up`/`run_stats`/`run_models` print and spawn, so no unit test reached them and all seven were regressions waiting to happen. `tests/cli_onboarding.rs` runs the real binary in a **cleared environment** (empty `PATH`, throwaway `HOME`, no inherited `PASTURE_*`, Ollama port pointed at a closed one) and asserts on exit code and output. Each of the 7 tests was **mutation-checked**: the corresponding fix was reverted in turn and the intended test — and only it — failed. |
+
 ### 4e-6. Closing the loop on routing validation (2026-08)
 
 > F4/W6 — "routing decisions are never validated" — keeps blocking other work
