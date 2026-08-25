@@ -406,6 +406,11 @@ pub fn run(args: &[String]) -> i32 {
     };
     let rest = &args[2..];
     let config = Config::default().with_config_file().with_env();
+    // ADR-266: a misspelled or malformed PASTURE_* setting is otherwise silently
+    // ignored forever. Warn once, to stderr, so normal stdout output is clean.
+    for w in crate::config::env_warnings() {
+        eprintln!("pasture: {w}");
+    }
 
     match command {
         "version" => {

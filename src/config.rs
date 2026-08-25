@@ -213,6 +213,125 @@ impl Default for Config {
     }
 }
 
+/// Every `PASTURE_*` variable the binary honours (ADR-266).
+///
+/// Used to spot typos: a misspelled name is otherwise invisible and permanent —
+/// `PASTURE_LOCAL_BAKEND=lmstudio` silently does nothing forever. A test asserts
+/// this list covers everything the source actually reads, so it cannot drift.
+pub const KNOWN_ENV: &[&str] = &[
+    "PASTURE_ACCESS_LOG",
+    "PASTURE_ALLOW_SENSITIVE_CLOUD",
+    "PASTURE_ANTHROPIC_API_KEY",
+    "PASTURE_AUTH_TOKEN",
+    "PASTURE_BUDGET_ACTION",
+    "PASTURE_BUDGET_DAILY_TOKENS",
+    "PASTURE_CACHE",
+    "PASTURE_CACHE_CONTROL",
+    "PASTURE_CACHE_TTL",
+    "PASTURE_CASCADE",
+    "PASTURE_CASCADE_LOGPROB",
+    "PASTURE_CLOUD_FALLBACK_MODEL",
+    "PASTURE_CLOUD_FALLBACK_PROVIDER",
+    "PASTURE_CLOUD_MODEL",
+    "PASTURE_CLOUD_PRICE_PER_1M",
+    "PASTURE_CLOUD_PROVIDER",
+    "PASTURE_CLOUD_RETRY",
+    "PASTURE_CONFIG",
+    "PASTURE_CORS_ORIGINS",
+    "PASTURE_COST_LOG",
+    "PASTURE_DECISION_LOG",
+    "PASTURE_FAST_THRESHOLD",
+    "PASTURE_GPU_VRAM_MB",
+    "PASTURE_HARD_PROMPTS",
+    "PASTURE_HARD_THRESHOLD",
+    "PASTURE_HEALTH_COOLDOWN_SECS",
+    "PASTURE_INJECTION_GUARD",
+    "PASTURE_INJECT_CONTEXT",
+    "PASTURE_INPUT_PII_SCAN",
+    "PASTURE_LANG",
+    "PASTURE_LISTEN_ADDR",
+    "PASTURE_LOCAL_BACKEND",
+    "PASTURE_LOCAL_FAST_MODEL",
+    "PASTURE_LOCAL_MODEL",
+    "PASTURE_LOCAL_ONLY",
+    "PASTURE_LOCAL_OPENAI_URL",
+    "PASTURE_LOCAL_TIMEOUT",
+    "PASTURE_MAX_BODY_BYTES",
+    "PASTURE_OLLAMA_HOST",
+    "PASTURE_OLLAMA_PORT",
+    "PASTURE_OPENAI_API_KEY",
+    "PASTURE_OTEL_LOG",
+    "PASTURE_OUTPUT_PII_SCAN",
+    "PASTURE_PSEUDONYMIZE",
+    "PASTURE_RAM_MB",
+    "PASTURE_RATE_LIMIT",
+    "PASTURE_REQUEST_TIMEOUT",
+    "PASTURE_SEMANTIC_CACHE",
+    "PASTURE_SEMANTIC_MIN_LEXICAL",
+    "PASTURE_SEMANTIC_THRESHOLD",
+    "PASTURE_SKILLS",
+    "PASTURE_SPIKE_FACTOR",
+    "PASTURE_STRUCTURED_LOCAL",
+    "PASTURE_SYSTEM_PROMPT",
+    "PASTURE_THRESHOLD",
+];
+
+/// Variables whose value must parse as a number. A non-numeric value is silently
+/// discarded by `with_env`'s `if let Ok(..)` parses, so the user's setting simply
+/// never applies — worth saying out loud. (`PASTURE_CLOUD_PRICE_PER_1M` is
+/// deliberately absent: it is a comma-separated pair, not a bare number.)
+const NUMERIC_ENV: &[&str] = &[
+    "PASTURE_BUDGET_DAILY_TOKENS",
+    "PASTURE_CACHE",
+    "PASTURE_CACHE_TTL",
+    "PASTURE_CASCADE_LOGPROB",
+    "PASTURE_CLOUD_RETRY",
+    "PASTURE_FAST_THRESHOLD",
+    "PASTURE_GPU_VRAM_MB",
+    "PASTURE_HARD_THRESHOLD",
+    "PASTURE_HEALTH_COOLDOWN_SECS",
+    "PASTURE_LOCAL_TIMEOUT",
+    "PASTURE_MAX_BODY_BYTES",
+    "PASTURE_OLLAMA_PORT",
+    "PASTURE_RAM_MB",
+    "PASTURE_RATE_LIMIT",
+    "PASTURE_REQUEST_TIMEOUT",
+    "PASTURE_SEMANTIC_CACHE",
+    "PASTURE_SEMANTIC_MIN_LEXICAL",
+    "PASTURE_SEMANTIC_THRESHOLD",
+    "PASTURE_SPIKE_FACTOR",
+    "PASTURE_THRESHOLD",
+];
+
+/// Warn about `PASTURE_*` settings that will not take effect (ADR-266).
+///
+/// `with_env` parses with `if let Ok(..)` and no `else`, so a malformed value is
+/// dropped in silence; and a misspelled variable name matches nothing at all.
+/// Either way the user believes they configured something that was ignored.
+/// Returns the warnings rather than printing, so it is testable.
+pub fn env_warnings() -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, v) in std::env::vars() {
+        if !k.starts_with("PASTURE_") {
+            continue;
+        }
+        if !KNOWN_ENV.contains(&k.as_str()) {
+            out.push(format!("unknown setting {k} (typo? it is being ignored)"));
+            continue;
+        }
+        if NUMERIC_ENV.contains(&k.as_str())
+            && !v.trim().is_empty()
+            && v.trim().parse::<f64>().is_err()
+        {
+            out.push(format!(
+                "{k}={v:?} is not a number - ignoring it and using the default"
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
 impl Config {
     /// Apply `key = value` lines from a config file body onto the defaults.
     /// Unknown keys are ignored; blank lines and `#` comments are skipped.
@@ -808,6 +927,48 @@ mod tests {
             "SPEC.md's header must state the current crate version ({version}); \
 update the `Version:` line. Header was:\n{header}"
         );
+    }
+
+    #[test]
+    fn test_known_env_covers_everything_config_reads() {
+        // ADR-266: KNOWN_ENV drives the typo warning, so a variable the code
+        // reads but the list omits would be reported as "unknown" — actively
+        // misleading. Derive the truth from the source and require coverage.
+        // `PASTURE_PROXY_TOKEN` appears only inside a test comment documenting a
+        // historical drift bug, so it is not a real read.
+        let read = env_vars_read_by_config();
+        let missing: Vec<&String> = read
+            .iter()
+            .filter(|v| v.as_str() != "PASTURE_PROXY_TOKEN")
+            .filter(|v| !KNOWN_ENV.contains(&v.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "KNOWN_ENV is missing variables that config.rs reads: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_env_warnings_flag_typos_and_bad_numbers() {
+        // Uses real process env, so pick names no other test touches.
+        std::env::set_var("PASTURE_TOTALLY_BOGUS_NAME", "x");
+        std::env::set_var("PASTURE_OLLAMA_PORT", "not-a-port");
+        let w = env_warnings();
+        assert!(
+            w.iter()
+                .any(|m| m.contains("PASTURE_TOTALLY_BOGUS_NAME") && m.contains("unknown")),
+            "typo must be reported: {w:?}"
+        );
+        assert!(
+            w.iter()
+                .any(|m| m.contains("PASTURE_OLLAMA_PORT") && m.contains("not a number")),
+            "malformed number must be reported: {w:?}"
+        );
+        std::env::remove_var("PASTURE_TOTALLY_BOGUS_NAME");
+        std::env::remove_var("PASTURE_OLLAMA_PORT");
+        // A clean environment produces no warnings about these.
+        let w2 = env_warnings();
+        assert!(!w2.iter().any(|m| m.contains("PASTURE_TOTALLY_BOGUS_NAME")));
     }
 
     #[test]
