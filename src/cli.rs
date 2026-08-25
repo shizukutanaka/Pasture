@@ -1081,6 +1081,21 @@ fn run_doctor(config: &Config) -> i32 {
     }
 }
 
+/// Which message `pasture up` should print when Ollama is not answering
+/// (ADR-267). Kept pure so both branches are testable without a process.
+///
+/// `on_path` is whether the `ollama` command exists. The distinction matters:
+/// "not installed" and "installed but did not start" have different fixes, and
+/// the old code printed the install advice for both — after spawning nothing
+/// and waiting 3 s.
+fn ollama_unreachable_key(on_path: bool) -> &'static str {
+    if on_path {
+        "up.ollama_required"
+    } else {
+        "up.ollama_notinstalled"
+    }
+}
+
 /// One-command path to running: ensure the model is present (auto-pull if not),
 /// then start the proxy. Minimises steps from "Ollama installed" to "serving".
 fn run_up(config: &Config, addr: &str) -> i32 {
@@ -1104,12 +1119,26 @@ fn run_up(config: &Config, addr: &str) -> i32 {
     // Ollama must be reachable to pull or serve through. Try to start it.
     let mut st = crate::doctor::probe_ollama(&config.ollama_host, config.ollama_port);
     if !st.reachable {
+        // A command that is not on PATH can never be spawned, so say so now
+        // instead of spawning nothing, sleeping 3 s and blaming "not running"
+        // (ADR-267).
+        if !crate::doctor::on_path("ollama") {
+            eprintln!("{}", t(lang, ollama_unreachable_key(false)));
+            return 1;
+        }
         println!("{}", t(lang, "up.starting_ollama"));
-        let _ = std::process::Command::new("ollama")
+        if let Err(e) = std::process::Command::new("ollama")
             .arg("serve")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .spawn()
+        {
+            eprintln!(
+                "{}",
+                tf(lang, "up.ollama_spawn_failed", &[("error", &e.to_string())])
+            );
+            return 1;
+        }
         for _ in 0..15 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             st = crate::doctor::probe_ollama(&config.ollama_host, config.ollama_port);
@@ -1118,7 +1147,7 @@ fn run_up(config: &Config, addr: &str) -> i32 {
             }
         }
         if !st.reachable {
-            eprintln!("{}", t(lang, "up.ollama_required"));
+            eprintln!("{}", t(lang, ollama_unreachable_key(true)));
             return 1;
         }
         println!("{}", t(lang, "up.ollama_started"));
@@ -2178,6 +2207,40 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::i18n::{t, Lang};
+
+    /// ADR-267: `up` must distinguish "no `ollama` command" from "it did not
+    /// start". Before this, both printed the install advice, so a user whose
+    /// Ollama was installed-but-wedged was told to install it again.
+    #[test]
+    fn test_ollama_unreachable_key_splits_by_path_presence() {
+        assert_eq!(ollama_unreachable_key(false), "up.ollama_notinstalled");
+        assert_eq!(ollama_unreachable_key(true), "up.ollama_required");
+        for lang in [Lang::En, Lang::Ja] {
+            let missing = t(lang, ollama_unreachable_key(false));
+            let wedged = t(lang, ollama_unreachable_key(true));
+            assert_ne!(missing, wedged, "the two cases must read differently");
+            // The actionable half of each: install vs. start.
+            assert!(missing.contains("https://ollama.com"), "{missing}");
+            assert!(wedged.contains("ollama serve"), "{wedged}");
+        }
+    }
+
+    /// The messages `up` reaches for must all exist in both catalogs; `t()`
+    /// falls back to the key itself when one is missing, which would ship the
+    /// raw key to the user.
+    #[test]
+    fn test_up_ollama_messages_are_translated() {
+        for key in [
+            "up.ollama_required",
+            "up.ollama_notinstalled",
+            "up.ollama_spawn_failed",
+        ] {
+            for lang in [Lang::En, Lang::Ja] {
+                assert_ne!(t(lang, key), key, "{key} missing from a catalog");
+            }
+        }
+    }
 
     #[test]
     fn test_serve_refuses_occupied_port_without_success_banner() {

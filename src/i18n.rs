@@ -122,7 +122,15 @@ All commands:               pasture help\n",
     ("up.checking", "pasture up — getting you running\n"),
     (
         "up.ollama_required",
-        "Ollama is required and not running. Install it (https://ollama.com), then re-run `pasture up`.",
+        "Ollama is installed but did not come up. Start it yourself, then re-run `pasture up`:  ollama serve",
+    ),
+    (
+        "up.ollama_notinstalled",
+        "The `ollama` command was not found on PATH, so it cannot be started. Install it (https://ollama.com), then re-run `pasture up`.",
+    ),
+    (
+        "up.ollama_spawn_failed",
+        "Could not run `ollama serve` ({error}). Start Ollama yourself, then re-run `pasture up`.",
     ),
     ("up.have_model", "Model '{model}' is ready."),
     ("up.pulling", "Downloading model '{model}' (one-time)..."),
@@ -331,7 +339,15 @@ const JA: &[(&str, &str)] = &[
     ("up.checking", "pasture up — 実行までを自動で進めます\n"),
     (
         "up.ollama_required",
-        "Ollama が必要ですが動作していません。導入（https://ollama.com）後、もう一度 `pasture up` を実行してください。",
+        "Ollama はインストール済みですが起動しませんでした。手動で起動してから `pasture up` を再実行してください:  ollama serve",
+    ),
+    (
+        "up.ollama_notinstalled",
+        "`ollama` コマンドが PATH に見つからないため起動できません。導入（https://ollama.com）後、もう一度 `pasture up` を実行してください。",
+    ),
+    (
+        "up.ollama_spawn_failed",
+        "`ollama serve` を実行できませんでした（{error}）。Ollama を手動で起動してから `pasture up` を再実行してください。",
     ),
     ("up.have_model", "モデル '{model}' は準備済みです。"),
     ("up.pulling", "モデル '{model}' をダウンロード中（初回のみ）..."),
