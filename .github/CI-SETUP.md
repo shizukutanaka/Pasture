@@ -15,13 +15,31 @@ To activate it, run this locally (or move the file in the GitHub web UI):
 ```sh
 mkdir -p .github/workflows
 git mv .github/ci-workflow.yml .github/workflows/ci.yml
+
+# Put the badge back — the test below will fail until you do.
+sed -i '3a\
+\
+[![CI](https://github.com/shizukutanaka/pasture/actions/workflows/ci.yml/badge.svg)](https://github.com/shizukutanaka/pasture/actions/workflows/ci.yml)' README.md
+
 git rm .github/CI-SETUP.md
+cargo test --lib test_ci_badge_and_workflow_agree
 git commit -m "ci: activate the CI workflow"
 git push
 ```
 
-The README's CI badge already points at `workflows/ci.yml`, so it starts
-resolving as soon as the file is in place.
+**The badge is deliberately not in the README right now.** It used to be, and it
+served a 404 — a green-looking claim that the gates run on every push, when no
+workflow existed (ADR-269). `test_ci_badge_and_workflow_agree` in `src/config.rs`
+now enforces the biconditional: badge without workflow is a lie, workflow without
+badge means CI is live and the README is hiding it. Either way the test tells you
+which side to fix.
+
+The `sed` line above is what restores it; if you would rather do it by hand, paste
+this under the "New to this?" line in `README.md`:
+
+```markdown
+[![CI](https://github.com/shizukutanaka/pasture/actions/workflows/ci.yml/badge.svg)](https://github.com/shizukutanaka/pasture/actions/workflows/ci.yml)
+```
 
 ## What it enforces
 

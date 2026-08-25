@@ -930,6 +930,30 @@ update the `Version:` line. Header was:\n{header}"
     }
 
     #[test]
+    fn test_ci_badge_and_workflow_agree() {
+        // ADR-269: the README carried a CI badge pointing at
+        // `.github/workflows/ci.yml`, a file that does not exist — so it served
+        // a 404 while implying "the gates run on every push". Same shape as
+        // ADR-260 above: a document asserting a fact nothing checks.
+        //
+        // The check is a biconditional on purpose. Badge without workflow is a
+        // lie; workflow without badge means someone activated CI and the README
+        // still hides it. Either direction should fail here, and the fix is
+        // whichever side is missing.
+        let readme = include_str!("../README.md");
+        let has_badge = readme.contains("actions/workflows/ci.yml/badge.svg");
+        let workflow =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
+        assert_eq!(
+            has_badge,
+            workflow.exists(),
+            "README's CI badge and .github/workflows/ci.yml must agree \
+(badge present: {has_badge}, workflow present: {}). See .github/CI-SETUP.md.",
+            workflow.exists()
+        );
+    }
+
+    #[test]
     fn test_known_env_covers_everything_config_reads() {
         // ADR-266: KNOWN_ENV drives the typo warning, so a variable the code
         // reads but the list omits would be reported as "unknown" — actively
