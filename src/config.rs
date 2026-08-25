@@ -231,6 +231,58 @@ impl Config {
         cfg
     }
 
+    /// Default config-file locations, in order (ADR-264).
+    /// `PASTURE_CONFIG` overrides both when set.
+    fn config_file_path() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("PASTURE_CONFIG") {
+            let p = p.trim();
+            if !p.is_empty() {
+                return Some(std::path::PathBuf::from(p));
+            }
+        }
+        // XDG-ish home location; falls back to the Windows profile var.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()?;
+        Some(std::path::Path::new(&home).join(".config/pasture/config"))
+    }
+
+    /// Overlay a `key = value` config file onto the current values (ADR-264).
+    ///
+    /// SPEC §8 documents the precedence *defaults → config file → env vars*, and
+    /// the parsing for it (`from_str_with_defaults` / `apply`) has existed and
+    /// been tested since ADR-190 — but nothing in the binary ever read a file,
+    /// so a user following the spec got silence. This is the missing call.
+    ///
+    /// A missing or unreadable file is not an error: the file is optional, and
+    /// env vars alone remain a complete configuration. Call this BEFORE
+    /// `with_env` so environment variables win, as documented.
+    pub fn with_config_file(self) -> Self {
+        let path = Self::config_file_path();
+        self.with_config_file_at(path.as_deref())
+    }
+
+    /// `with_config_file` with the path supplied explicitly, so the parsing and
+    /// precedence can be tested without touching `HOME`/`PASTURE_CONFIG`.
+    pub fn with_config_file_at(mut self, path: Option<&std::path::Path>) -> Self {
+        let Some(path) = path else {
+            return self;
+        };
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            return self;
+        };
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, val)) = line.split_once('=') {
+                self.apply(key.trim(), val.trim());
+            }
+        }
+        self
+    }
+
     /// Overlay environment variables (`PASTURE_LISTEN_ADDR`, etc.).
     pub fn with_env(mut self) -> Self {
         if let Ok(v) = std::env::var("PASTURE_LISTEN_ADDR") {
@@ -717,6 +769,28 @@ mod tests {
             undocumented.is_empty(),
             "these env vars are read by config.rs but undocumented in SPEC.md: {undocumented:?}"
         );
+    }
+
+    #[test]
+    fn test_config_file_is_actually_read_and_env_wins() {
+        // ADR-264: SPEC §8 documented "defaults -> config file -> env" but
+        // nothing in the binary ever read a file, so `from_str_with_defaults` /
+        // `apply` were reachable only from tests. Pin the real chain.
+        let dir = std::env::temp_dir().join("pasture_cfgfile_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config");
+        std::fs::write(&path, "# comment\nlocal_model = from-file\n\n").unwrap();
+
+        // The file is applied on top of the defaults.
+        let cfg = Config::default().with_config_file_at(Some(path.as_path()));
+        assert_eq!(cfg.local_model, "from-file");
+
+        // A missing file is not an error — defaults survive untouched.
+        let missing = Config::default()
+            .with_config_file_at(Some(std::path::Path::new("/no/such/pasture/config")));
+        assert_eq!(missing.local_model, Config::default().local_model);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

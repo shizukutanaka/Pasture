@@ -405,7 +405,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let rest = &args[2..];
-    let config = Config::default().with_env();
+    let config = Config::default().with_config_file().with_env();
 
     match command {
         "version" => {
@@ -1740,8 +1740,10 @@ fn run_config(config: &Config) -> i32 {
 
     let profile = HardwareProfile::detect();
     let hw_default = RoutingEngine::for_hardware(&profile, true, true).threshold();
+    // ADR-264: an explicit threshold can now come from the config file as well
+    // as PASTURE_THRESHOLD, so don't attribute it to the env var specifically.
     let (threshold, thr_src) = match config.threshold {
-        Some(t) => (t, "PASTURE_THRESHOLD"),
+        Some(t) => (t, "configured"),
         None => (hw_default, "hardware default"),
     };
 

@@ -469,11 +469,13 @@ merely looking encoded is never sufficient. The plaintext pass runs first, so
 
 ## 8. Configuration
 
-Precedence: built-in defaults → key=value config file → `PASTURE_*` env vars (env
+Precedence: built-in defaults → key=value config file (`PASTURE_CONFIG`, else
+`~/.config/pasture/config`; optional — a missing file is not an error) → `PASTURE_*` env vars (env
 wins). Variables:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
+| `PASTURE_CONFIG` | `~/.config/pasture/config` | path to the optional `key = value` config file (§8, ADR-264); missing file is not an error |
 | `PASTURE_LISTEN_ADDR` | `127.0.0.1:8645` | proxy listen address |
 | `PASTURE_OLLAMA_HOST` / `PASTURE_OLLAMA_PORT` | `127.0.0.1` / `11434` | local Ollama endpoint |
 | `PASTURE_LOCAL_MODEL` | `llama3.2` | local model id |
