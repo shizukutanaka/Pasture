@@ -485,6 +485,7 @@ wins). Variables:
 | `PASTURE_CLOUD_FALLBACK_PROVIDER` / `PASTURE_CLOUD_FALLBACK_MODEL` | _(off)_ | secondary cloud provider/model tried when the primary fails all retries (IMP-9) |
 | `PASTURE_OPENAI_API_KEY` / `PASTURE_ANTHROPIC_API_KEY` | — | BYOK (never logged) |
 | `PASTURE_RAM_MB` | _(auto)_ | override detected total RAM in MB; use when auto-detection is unavailable on your OS (§4, ADR-261) |
+| `PASTURE_GPU_VRAM_MB` | _(auto)_ | override detected GPU VRAM in MB; discrete-GPU detection is NVIDIA-only, so Apple Silicon / AMD machines tier by RAM unless this is set (§4) |
 | `PASTURE_THRESHOLD` | hardware | token length threshold override |
 | `PASTURE_CASCADE` | off | enable cascade |
 | `PASTURE_CASCADE_LOGPROB` | `-1.0` | cascade escalation threshold |

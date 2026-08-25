@@ -845,31 +845,36 @@ mod tests {
         let spec = std::fs::read_to_string(path).expect("SPEC.md must be readable");
         let mut found = std::collections::BTreeSet::new();
         for line in spec.lines() {
-            if !line.trim_start().starts_with('|') {
-                continue;
+            if line.trim_start().starts_with('|') {
+                found.extend(env_names_in(line));
             }
-            let bytes = line.as_bytes();
-            let mut i = 0;
-            while i + 8 <= bytes.len() {
-                if &bytes[i..i + 8] == b"PASTURE_" {
-                    let start = i;
-                    let mut j = i + 8;
-                    while j < bytes.len()
-                        && (bytes[j].is_ascii_uppercase()
-                            || bytes[j].is_ascii_digit()
-                            || bytes[j] == b'_')
-                    {
-                        j += 1;
-                    }
-                    // Require a non-empty suffix so the bare `PASTURE_*` glob in prose
-                    // never registers as a variable name.
-                    if j > start + 8 {
-                        found.insert(line[start..j].to_string());
-                    }
-                    i = j;
-                } else {
-                    i += 1;
+        }
+        found
+    }
+
+    /// Every `PASTURE_*` name appearing in `text`. A non-empty suffix is required
+    /// so the bare prefix that prose uses never registers as a variable name.
+    fn env_names_in(text: &str) -> std::collections::BTreeSet<String> {
+        let bytes = text.as_bytes();
+        let mut found = std::collections::BTreeSet::new();
+        let mut i = 0;
+        while i + 8 <= bytes.len() {
+            if &bytes[i..i + 8] == b"PASTURE_" {
+                let start = i;
+                let mut j = i + 8;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_uppercase()
+                        || bytes[j].is_ascii_digit()
+                        || bytes[j] == b'_')
+                {
+                    j += 1;
                 }
+                if j > start + 8 {
+                    found.insert(text[start..j].to_string());
+                }
+                i = j;
+            } else {
+                i += 1;
             }
         }
         found
@@ -926,6 +931,56 @@ mod tests {
             header.contains(version),
             "SPEC.md's header must state the current crate version ({version}); \
 update the `Version:` line. Header was:\n{header}"
+        );
+    }
+
+    #[test]
+    fn test_readme_documents_every_setting() {
+        // ADR-270: the README documented settings TWICE — a 430-word prose
+        // paragraph and a partial table — and between the two, 15 real settings
+        // appeared in neither, including PASTURE_ALLOW_SENSITIVE_CLOUD, the switch
+        // that turns off the privacy invariant. Two partial lists of one thing is
+        // a guarantee of drift, so there is now one list and this test keeps it
+        // whole.
+        //
+        // Biconditional on purpose, as in test_ci_badge_and_workflow_agree: a
+        // setting missing from the README is undiscoverable, and a README entry
+        // that is not a real setting is advice that silently does nothing.
+        let readme = include_str!("../README.md");
+        let missing: Vec<&str> = KNOWN_ENV
+            .iter()
+            .copied()
+            .filter(|v| !readme.contains(v))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "README.md must document every setting; missing: {missing:?}"
+        );
+
+        let invented: Vec<String> = env_names_in(readme)
+            .into_iter()
+            .filter(|v| !KNOWN_ENV.contains(&v.as_str()))
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "README.md documents settings that do not exist: {invented:?}"
+        );
+    }
+
+    #[test]
+    fn test_spec_documents_every_setting() {
+        // Same guarantee for the contract document. SPEC.md was missing
+        // PASTURE_GPU_VRAM_MB, which the older drift guard could not see because
+        // that variable is read in hardware.rs, not config.rs.
+        let spec = include_str!("../SPEC.md");
+        let missing: Vec<&str> = KNOWN_ENV
+            .iter()
+            .copied()
+            .filter(|v| !spec.contains(v))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "SPEC.md must document every setting; missing: {missing:?}"
         );
     }
 
@@ -997,28 +1052,25 @@ update the `Version:` line. Header was:\n{header}"
 
     #[test]
     fn test_spec_has_no_phantom_pasture_env_vars() {
-        // ADR-190 (reverse direction): SPEC.md must not document a PASTURE_* env var
-        // that the config layer never reads — that is how `PASTURE_PROXY_TOKEN` crept
-        // in. A handful of non-config vars are read elsewhere (proxy/cli/cost) or are
-        // documented prefixes; allow-list those so the test targets real drift.
+        // ADR-190 (reverse direction): SPEC.md must not document a PASTURE_* env
+        // var that nothing honours — that is how `PASTURE_PROXY_TOKEN` crept in.
+        //
+        // ADR-270: this used to compare against `env_vars_read_by_config()` plus a
+        // hand-maintained allow-list of vars resolved outside config.rs (BYOK keys,
+        // the i18n language var, hardware overrides). That allow-list was itself a
+        // second list of the same thing, and it drifted the moment a new hardware
+        // override was documented. KNOWN_ENV is already the authoritative set of
+        // honoured names — and is itself pinned by
+        // `test_known_env_covers_everything_config_reads` — so compare against
+        // that and delete the allow-list.
         let documented = env_vars_documented_in_spec();
-        let read = env_vars_read_by_config();
-        // Vars surfaced in SPEC.md but resolved outside config.rs (BYOK keys read by
-        // the cloud layer; the i18n language var; hardware overrides read by
-        // hardware.rs, which probes the machine directly rather than via Config).
-        let allow_external: &[&str] = &[
-            "PASTURE_OPENAI_API_KEY",
-            "PASTURE_ANTHROPIC_API_KEY",
-            "PASTURE_LANG",
-            "PASTURE_RAM_MB",
-        ];
         let phantom: Vec<&String> = documented
             .iter()
-            .filter(|v| !read.contains(*v) && !allow_external.contains(&v.as_str()))
+            .filter(|v| !KNOWN_ENV.contains(&v.as_str()))
             .collect();
         assert!(
             phantom.is_empty(),
-            "SPEC.md documents PASTURE_* vars that config.rs never reads (drift or typo): {phantom:?}"
+            "SPEC.md documents PASTURE_* vars that nothing honours (drift or typo): {phantom:?}"
         );
     }
 

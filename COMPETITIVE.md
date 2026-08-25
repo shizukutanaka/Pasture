@@ -378,6 +378,29 @@ zero-dep/single-user/privacy wedge):**
 | **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
 | **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | ◐ **PARTIALLY SHIPPED (ADR-254)** — injecting `cache_control` was already done (IMP-18), but the *accounting* half was not, and was **proven broken**: cached prompt tokens land in `cache_creation_input_tokens`/`cache_read_input_tokens` and were dropped entirely, undercounting a realistic cached request **1025×** and silently defeating `PASTURE_BUDGET_DAILY_TOKENS`. Both the buffered and streaming paths now sum all prompt-side fields. **Still open:** cached tokens are counted at face value, so their differing *prices* (cache writes cost more than base input, reads far less) are not modelled by the flat per-1M rate — that needs a richer price config. |
 
+### 4e-8. Deletion audit: applying step 2 to the shipped surface (2026-08)
+
+> Musk's algorithm puts *delete* before *simplify* and *automate*, and names the
+> failure mode as optimising something that should have been removed. A standing
+> "PART B" list proposed deleting ~4,300 lines of default-off surface. This tick
+> measured that list instead of acting on it. **Most of it does not survive
+> contact with the evidence — and saying so is the point of step 1.**
+
+| Candidate | Verdict |
+|---|---|
+| `guard.rs` (580 code) · `pseudonymize.rs` (582) | ⛔ **KEEP.** Both are wired (11 call sites each in `proxy.rs`), default-off, documented, and `guard::is_invisible` is a dependency of `privacy.rs`'s I2 classifier. The honest criticism — that the injection guard is heuristic and evadable (S8) — is answered by documentation, which it already carries; deleting a hardened, research-grounded defence because it is not perfect would be the opposite of the audit's own standard. |
+| `ratelimit.rs` (86 code) | ⛔ **KEEP — the requirement survives questioning.** The obvious argument ("a single-user localhost proxy rate-limiting *you* is theatre") fails on evidence: `PASTURE_AUTH_TOKEN` exists, so an exposed deployment is a *supported* mode, and a limiter is a coherent part of it rather than a half-measure in front of an open proxy. |
+| `telemetry.rs` (163 code) | ⛔ **KEEP.** Questioned as "spans for a collector Pasture doesn't have", but the format is the OTel Collector's JSON file receiver — a real, standards-based consumer path needing no dependency on Pasture's side. |
+| `decision_log.rs` (170) · `difficulty.rs` (43) · `dashboard.rs` (17) | ⛔ **KEEP.** Each serves one of the four irreducible jobs (route / account) and each is cheap. `difficulty.rs` is the *only* signal that catches hard prompts reading as plain prose — the W6 gap — for 43 lines. |
+| `RESEARCH.md` (594 lines), claimed "already absorbed into COMPETITIVE.md" | ⛔ **KEEP — the claim was false.** `COMPETITIVE.md` §4b cites it as the *source* for a whole backlog section, and `SPEC.md` / `ARCHITECTURE.md` / `SELF_IMPROVEMENT.md` all link it. Deleting it would have orphaned four documents on the strength of an unverified memory. |
+| Three hand-rolled JSONL appenders (`cost`/`decision_log`/`telemetry`) | ⛔ **KEEP as-is.** Measured before collapsing: each is a 2–3 line `OpenOptions` idiom. A shared helper would save ~6 lines and add an indirection — the premature-abstraction trap. |
+| **README documented every setting twice** | ✅ **DELETED (ADR-270).** The one thing that failed. A 430-word prose paragraph listed ~15 settings; a table below listed 27; **15 real settings appeared in neither**, including `PASTURE_ALLOW_SENSITIVE_CLOUD` — the switch that turns off the privacy invariant. Two partial lists of one thing guarantee drift. One grouped table now covers all 55, pinned biconditionally by `test_readme_documents_every_setting`. |
+| **A hand-maintained allow-list inside the SPEC drift guard** | ✅ **DELETED (ADR-270).** Same shape, found while fixing the above: `test_spec_has_no_phantom_pasture_env_vars` excused four vars "read outside config.rs" by name, and had already drifted — it rejected `PASTURE_GPU_VRAM_MB` the moment SPEC documented it. `KNOWN_ENV` was already the authoritative set, so the list is gone. |
+
+**Net:** ~430 words of duplicated prose and one allow-list deleted; ~1,640 lines of
+default-off code kept, each with a written reason. Recorded here so the PART B
+list is not re-proposed from memory a fourth time.
+
 ### 4e-7. Onboarding audit: the differentiator was Linux-only (2026-08)
 
 > A read-only first-run audit asked what a *new user* hits. Most findings were
