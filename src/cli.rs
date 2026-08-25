@@ -609,11 +609,23 @@ fn run_stats(config: &Config, rest: &[String]) -> i32 {
                 return 0;
             }
             if s.total == 0 {
-                println!(
-                    "no cost log yet at {} (run some requests first)",
-                    config.cost_log_path
-                );
-                return 0;
+                // ADR-265: an unwritable path also reads as "no records", so
+                // saying "run some requests first" would be false — the log will
+                // never appear no matter how many run.
+                match crate::doctor::cost_log_problem(&config.cost_log_path) {
+                    Some(why) => {
+                        eprintln!("cost log cannot be written: {why}");
+                        eprintln!("set PASTURE_COST_LOG=<path> to a writable location.");
+                        return 1;
+                    }
+                    None => {
+                        println!(
+                            "no cost log yet at {} (run some requests first)",
+                            config.cost_log_path
+                        );
+                        return 0;
+                    }
+                }
             }
             println!("Cost log: {} ({} records)", config.cost_log_path, s.total);
             println!(
@@ -891,12 +903,39 @@ fn run_doctor(config: &Config) -> i32 {
                     &[("host", &config.ollama_host), ("port", &port)]
                 )
             );
-            println!("{}", t(lang, "doctor.ollama.fix"));
+            // ADR-265: distinguish "not installed" from "installed but stopped"
+            // instead of printing both fixes and making the user guess.
+            let key = if crate::doctor::on_path("ollama") {
+                "doctor.ollama.fix.notrunning"
+            } else {
+                "doctor.ollama.fix.notinstalled"
+            };
+            println!("{}", t(lang, key));
         }
         s
     };
 
     // 2. Is the configured local model available?
+    // ADR-265: when Ollama is down this step used to be SKIPPED, so a bare
+    // machine reported "1 item needs attention" when it had two, and the user
+    // only learned about the missing model on a second run. Always report it.
+    if !st.reachable {
+        problems += 1;
+        println!(
+            "{}",
+            tf(
+                lang,
+                "doctor.model.unknown",
+                &[("model", &config.local_model)]
+            )
+        );
+        if !local_is_openai(config) {
+            println!(
+                "{}",
+                tf(lang, "doctor.model.fix", &[("model", &config.local_model)])
+            );
+        }
+    }
     if st.reachable {
         if crate::doctor::has_model(&st.models, &config.local_model) {
             println!(
@@ -968,7 +1007,32 @@ fn run_doctor(config: &Config) -> i32 {
         println!("{}", t(lang, "doctor.cloud.localonly"));
     }
 
-    // 5. Hardware & the routing threshold it drives (ADR-261). This is the
+    // 5. Can we actually record cost? (ADR-265) Accounting is one of the four
+    //    jobs, and it used to fail silently — one stderr line per request.
+    match crate::doctor::cost_log_problem(&config.cost_log_path) {
+        None => println!(
+            "{}",
+            tf(
+                lang,
+                "doctor.costlog.ok",
+                &[("path", &config.cost_log_path)]
+            )
+        ),
+        Some(why) => {
+            problems += 1;
+            println!(
+                "{}",
+                tf(
+                    lang,
+                    "doctor.costlog.bad",
+                    &[("path", &config.cost_log_path), ("why", &why)]
+                )
+            );
+            println!("{}", t(lang, "doctor.costlog.fix"));
+        }
+    }
+
+    // 6. Hardware & the routing threshold it drives (ADR-261). This is the
     //    product's differentiator; doctor never used to print it.
     let hw = HardwareProfile::detect();
     let threshold = RoutingEngine::for_hardware(&hw, true, false).threshold();
