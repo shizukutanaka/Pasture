@@ -35,9 +35,19 @@ The ADR-014 gates, on a `1.75.0` (MSRV) + `stable` matrix:
 | routing accuracy | `cargo run --release -- eval` |
 | **invariant I1** | default dependency tree must contain exactly one crate |
 | cloud path | separate job: `cargo build/test --features cloud` |
+| supply chain | separate job: `cargo deny check` (config in `deny.toml`, IMP-27) |
 
 Every gate was run locally before this was committed and each passes. Two caveats
 stated honestly: the workflow has never executed on GitHub, so its YAML is
 validated only by local reproduction of each step and may need a fixup commit;
 and the `cloud` job could not be rehearsed in the authoring sandbox because
 crates.io was blocked there, so it is written from the feature contract.
+
+## History
+
+An earlier attempt at this (ADR-134/IMP-27) hit the same `workflows` permission
+wall and staged its workflow at `ci/ci.yml`. ADR-259 then added a second one
+here without noticing, leaving two dead CI directories and two docs explaining
+the same excuse. ADR-263 consolidated them: the older file's one unique
+capability — the `cargo deny` supply-chain audit — was merged into this
+workflow, and `ci/` was deleted.

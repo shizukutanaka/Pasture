@@ -94,3 +94,20 @@ jobs:
         run: cargo build --features cloud
       - name: cargo test --features cloud
         run: cargo test --features cloud
+
+  supply-chain:
+    name: supply-chain audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      # Installed from source rather than via a marketplace action: this job
+      # exists to reason about supply chain, so it should not add one. Slower,
+      # but it is an independent job and blocks nothing else.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      # Governs BOTH builds: the zero-dep default has nothing to audit, the
+      # `cloud` feature pulls native-tls/openssl. Config in deny.toml (IMP-27).
+      - name: cargo deny check
+        run: cargo deny check
