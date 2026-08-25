@@ -268,7 +268,7 @@ impl Config {
         let Some(path) = path else {
             return self;
         };
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Ok(body) = std::fs::read_to_string(path) else {
             return self;
         };
         for line in body.lines() {
