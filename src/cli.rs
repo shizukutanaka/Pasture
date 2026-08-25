@@ -716,7 +716,6 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
                 "build with `--features cloud` and set {}.",
                 cloud_key_hint(config)
             );
-            eprintln!("to compare cloud providers: pasture refer");
             return 1;
         };
         let req = chat_request(&config.cloud_model, text);
@@ -2079,9 +2078,23 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         })
         .with_cloud_system(&config.cloud_provider)
         .with_cloud_fallback(make_fallback_cloud_backend(config));
+    // ADR-262: check the port BEFORE printing "you're connected". Previously the
+    // success banner was printed unconditionally and `serve` then died with a raw
+    // `os error 98`, so a user with 8645 occupied saw a happy connect message
+    // followed by a cryptic failure. `doctor` already had an actionable fix
+    // string for exactly this case; `serve`/`up` never reached it.
+    let lang = crate::i18n::detect();
+    if !crate::doctor::port_available(addr) {
+        eprintln!(
+            "{}",
+            crate::i18n::tf(lang, "doctor.port.inuse", &[("addr", addr)])
+        );
+        eprintln!("{}", crate::i18n::t(lang, "doctor.port.fix"));
+        return 1;
+    }
     print!(
         "{}",
-        crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])
+        crate::i18n::tf(lang, "connect.help", &[("addr", addr)])
     );
     match proxy.serve(addr) {
         Ok(()) => 0,
@@ -2094,6 +2107,27 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_serve_refuses_occupied_port_without_success_banner() {
+        // ADR-262: `serve` used to print the "you're connected" banner and only
+        // then fail with a raw `os error 98`. Binding the port first proves the
+        // pre-check fires and returns non-zero before any success output.
+        use std::net::TcpListener;
+        let held = TcpListener::bind("127.0.0.1:0").expect("bind probe port");
+        let addr = held.local_addr().unwrap().to_string();
+        // Port is held by `held` for the duration of this call.
+        assert!(
+            !crate::doctor::port_available(&addr),
+            "held port must read as unavailable"
+        );
+        let cfg = Config::default();
+        assert_eq!(
+            run_serve(&cfg, &addr),
+            1,
+            "serve must refuse an occupied port rather than claiming success"
+        );
+    }
 
     #[test]
     fn test_label_requires_prompts_flag() {

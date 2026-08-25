@@ -386,7 +386,9 @@ zero-dep/single-user/privacy wedge):**
 | Finding | Verdict |
 |---|---|
 | **A7. Hardware detection was Linux-only and failed OPEN into "weakest machine"** | ✅ **FIXED (ADR-261)** — `detect_ram_mb` read only `/proc/meminfo`, and `detect()` collapsed failure to `ram_mb: 0` via `.unwrap_or(0)`. That 0 fell into the 300 (CPU-only) tier, so an M3 Max / 64 GB Windows box **silently escalated nearly everything to the paid cloud** — the exact inverse of *"GPU PC → keep more work local"*, on the product's only real differentiator. RAM is now detected on macOS (`sysctl`) and Windows (`wmic`), `ram_mb` is `Option<u64>` so "unknown" is representable, unknown leans **local** (800), and `hw`/`models`/`doctor` say so instead of printing `0 MB`. |
-| **A12 / A8 / A6 / A5** | ⏸️ **Open, named.** Dead CI dirs + broken badge; a dangling `pasture refer` reference left by ADR-258; `up`/`serve` print the connect banner *before* binding then die on `os error 98` without pre-checking the port; and the config-**file** layer is test-only while `SPEC.md` documents it normatively. Next iteration. |
+| **A6. `up`/`serve` claimed success, then died on a busy port** | ✅ **FIXED (ADR-262)** — the connect banner printed unconditionally and `serve` then failed with a raw `os error 98`; the actionable fix string already existed and only `doctor` reached it. `run_serve` now pre-checks via `doctor::port_available` and prints it, so `up` inherits the check too. |
+| **A8. Dangling `pasture refer` reference** | ✅ **FIXED (ADR-262)** — residue from this session's own ADR-258 deletion; the binary advertised a command that answers `unknown command`. |
+| **A12 / A5** | ⏸️ **Open, named.** Two dead CI dirs + a badge pointing at a file that isn't under `.github/workflows/` (the token lacks `workflows` permission — see `.github/CI-SETUP.md`); and the config-**file** layer is test-only while `SPEC.md` documents it normatively. Next iteration. |
 
 ### 4e-6. Closing the loop on routing validation (2026-08)
 
