@@ -378,6 +378,16 @@ zero-dep/single-user/privacy wedge):**
 | **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
 | **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | ◐ **PARTIALLY SHIPPED (ADR-254)** — injecting `cache_control` was already done (IMP-18), but the *accounting* half was not, and was **proven broken**: cached prompt tokens land in `cache_creation_input_tokens`/`cache_read_input_tokens` and were dropped entirely, undercounting a realistic cached request **1025×** and silently defeating `PASTURE_BUDGET_DAILY_TOKENS`. Both the buffered and streaming paths now sum all prompt-side fields. **Still open:** cached tokens are counted at face value, so their differing *prices* (cache writes cost more than base input, reads far less) are not modelled by the flat per-1M rate — that needs a richer price config. |
 
+### 4e-7. Onboarding audit: the differentiator was Linux-only (2026-08)
+
+> A read-only first-run audit asked what a *new user* hits. Most findings were
+> bad messages in front of correct behaviour. One was the inverse.
+
+| Finding | Verdict |
+|---|---|
+| **A7. Hardware detection was Linux-only and failed OPEN into "weakest machine"** | ✅ **FIXED (ADR-261)** — `detect_ram_mb` read only `/proc/meminfo`, and `detect()` collapsed failure to `ram_mb: 0` via `.unwrap_or(0)`. That 0 fell into the 300 (CPU-only) tier, so an M3 Max / 64 GB Windows box **silently escalated nearly everything to the paid cloud** — the exact inverse of *"GPU PC → keep more work local"*, on the product's only real differentiator. RAM is now detected on macOS (`sysctl`) and Windows (`wmic`), `ram_mb` is `Option<u64>` so "unknown" is representable, unknown leans **local** (800), and `hw`/`models`/`doctor` say so instead of printing `0 MB`. |
+| **A12 / A8 / A6 / A5** | ⏸️ **Open, named.** Dead CI dirs + broken badge; a dangling `pasture refer` reference left by ADR-258; `up`/`serve` print the connect banner *before* binding then die on `os error 98` without pre-checking the port; and the config-**file** layer is test-only while `SPEC.md` documents it normatively. Next iteration. |
+
 ### 4e-6. Closing the loop on routing validation (2026-08)
 
 > F4/W6 — "routing decisions are never validated" — keeps blocking other work

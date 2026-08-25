@@ -19,6 +19,12 @@ Most desktop AI clients make *you* pick the model. Routing layers that automate 
 
 The same prompt that goes to the cloud on a laptop stays local on a workstation — automatically.
 
+> **Detection scope (ADR-261).** Total RAM is detected on Linux (`/proc/meminfo`),
+> macOS (`sysctl hw.memsize`) and Windows (`wmic`). Discrete-GPU VRAM is detected
+> via `nvidia-smi` only — Apple Silicon and AMD tier by RAM instead. If detection
+> fails, Pasture says so and leans **local** rather than assuming a weak machine;
+> set `PASTURE_RAM_MB` or `PASTURE_THRESHOLD` to make routing exact.
+
 ## Install
 
 Requires Rust 1.75+ to build.

@@ -387,10 +387,12 @@ pub fn hardware_text(p: &HardwareProfile) -> String {
         },
         None => "none".to_string(),
     };
-    format!(
-        "RAM: {} MB\nCPU threads: {}\nGPU: {}",
-        p.ram_mb, p.cpu_count, gpu
-    )
+    // ADR-261: "unknown" is a real state, not 0 MB.
+    let ram = match p.ram_mb {
+        Some(mb) => format!("{mb} MB"),
+        None => "unknown (detection unavailable on this OS)".to_string(),
+    };
+    format!("RAM: {ram}\nCPU threads: {}\nGPU: {gpu}", p.cpu_count)
 }
 
 /// Entry point. Returns a process exit code.
@@ -967,6 +969,37 @@ fn run_doctor(config: &Config) -> i32 {
         println!("{}", t(lang, "doctor.cloud.localonly"));
     }
 
+    // 5. Hardware & the routing threshold it drives (ADR-261). This is the
+    //    product's differentiator; doctor never used to print it.
+    let hw = HardwareProfile::detect();
+    let threshold = RoutingEngine::for_hardware(&hw, true, false).threshold();
+    match hw.ram_mb {
+        Some(mb) => println!(
+            "{}",
+            tf(
+                lang,
+                "doctor.hw.ok",
+                &[
+                    ("ram", &mb.to_string()),
+                    ("threshold", &threshold.to_string())
+                ]
+            )
+        ),
+        None => {
+            // Detection unavailable → routing is running on a best-effort default
+            // (lean-local). Tell the user how to make it exact.
+            println!(
+                "{}",
+                tf(
+                    lang,
+                    "doctor.hw.unknown",
+                    &[("threshold", &threshold.to_string())]
+                )
+            );
+            println!("{}", t(lang, "doctor.hw.unknown.fix"));
+        }
+    }
+
     println!();
     if problems == 0 {
         println!("{}", t(lang, "doctor.allgood"));
@@ -1100,22 +1133,26 @@ fn run_models(_config: &Config) -> i32 {
     use crate::i18n::{detect, t, tf};
     let lang = detect();
     let hw = HardwareProfile::detect();
-    let ram = hw.ram_mb;
     let no_gpu = hw.gpu.is_none();
-    let (tier, show_ultra) = if no_gpu && ram < 8_000 {
-        ("4 GB (CPU-only)", true)
-    } else if ram < 12_000 {
-        ("8 GB", false)
-    } else {
-        ("16 GB", false)
+    // ADR-261: when RAM is undetected, do NOT steer the user to the CPU-only
+    // tier (a 64 GB Mac would otherwise be told to run tinyllama). Assume a mid
+    // machine and say the detection failed.
+    let (tier, show_ultra, ram_label) = match hw.ram_mb {
+        None => ("16 GB", false, "unknown".to_string()),
+        Some(ram) if no_gpu && ram < 8_000 => ("4 GB (CPU-only)", true, ram.to_string()),
+        Some(ram) if ram < 12_000 => ("8 GB", false, ram.to_string()),
+        Some(ram) => ("16 GB", false, ram.to_string()),
     };
     print!("{}", t(lang, "models.title"));
+    if hw.ram_mb.is_none() {
+        println!("{}", t(lang, "models.hw_unknown"));
+    }
     println!(
         "{}",
         tf(
             lang,
             "models.your_machine",
-            &[("ram", &ram.to_string()), ("tier", tier)]
+            &[("ram", &ram_label), ("tier", tier)]
         )
     );
     if show_ultra {
@@ -2163,7 +2200,7 @@ mod tests {
     #[test]
     fn test_hardware_text_with_gpu() {
         let p = HardwareProfile {
-            ram_mb: 16000,
+            ram_mb: Some(16000),
             cpu_count: 8,
             gpu: Some(GpuInfo {
                 vendor: "nvidia".into(),
@@ -2176,9 +2213,26 @@ mod tests {
     }
 
     #[test]
+    fn test_hardware_text_unknown_ram_says_unknown() {
+        // ADR-261: `pasture hw` used to print "RAM: 0 MB" on macOS/Windows,
+        // which reads as a real (tiny) machine rather than a failed probe.
+        let p = HardwareProfile {
+            ram_mb: None,
+            cpu_count: 10,
+            gpu: None,
+        };
+        let out = hardware_text(&p);
+        assert!(out.contains("unknown"), "must say unknown: {out}");
+        assert!(
+            !out.contains("0 MB"),
+            "must not imply a 0 MB machine: {out}"
+        );
+    }
+
+    #[test]
     fn test_hardware_text_without_gpu() {
         let p = HardwareProfile {
-            ram_mb: 8000,
+            ram_mb: Some(8000),
             cpu_count: 4,
             gpu: None,
         };

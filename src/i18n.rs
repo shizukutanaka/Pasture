@@ -160,6 +160,12 @@ All commands:               pasture help\n",
     ),
     ("models.title", "Recommended models (verify tags at ollama.com/library)\n"),
     ("models.your_machine", "Your machine: about {ram} MB RAM -> use the {tier} tier."),
+    // ADR-261: RAM detection can legitimately fail (non-Linux). Say so instead
+    // of reporting 0 MB and steering the user to the CPU-only tier.
+    ("models.hw_unknown", "  (hardware detection is unavailable on this OS - assuming a mid-range machine.\n   Set PASTURE_RAM_MB or PASTURE_THRESHOLD to make this exact.)"),
+    ("doctor.hw.ok", "[ok] hardware: {ram} MB RAM -> routing threshold {threshold} tokens"),
+    ("doctor.hw.unknown", "[--] hardware: RAM not detectable on this OS -> using threshold {threshold} tokens (leaning local)"),
+    ("doctor.hw.unknown.fix", "     set PASTURE_RAM_MB=<total MB> (or PASTURE_THRESHOLD=<tokens>) for exact routing"),
     (
         "models.ultra",
         "CPU-only / <8 GB RAM (ultra-light, runs on any modern laptop):\n    ollama pull phi3:mini          # 3.8B Q4, ~2.3 GB, fast on CPU\n    ollama pull gemma2:2b          # 2.6B, very fast, good quality/size\n    ollama pull qwen2.5:1.5b       # 1.5B, lowest RAM, still capable\n    ollama pull tinyllama          # 1.1B, absolute minimum (fallback)\n\n  For dual-local routing (fast model for simple, main for complex):\n    PASTURE_LOCAL_FAST_MODEL=qwen2.5:1.5b  PASTURE_LOCAL_MODEL=phi3:mini",
@@ -366,6 +372,10 @@ const JA: &[(&str, &str)] = &[
         "models.your_machine",
         "あなたの環境: 約 {ram} MB RAM -> {tier} 段がおすすめ。",
     ),
+    ("models.hw_unknown", "  （この OS ではハードウェア検出が使えません。中位マシンとして扱います。\n   PASTURE_RAM_MB または PASTURE_THRESHOLD を設定すると正確になります）"),
+    ("doctor.hw.ok", "[ok] ハードウェア: RAM {ram} MB -> ルーティング閾値 {threshold} トークン"),
+    ("doctor.hw.unknown", "[--] ハードウェア: この OS では RAM を検出できません -> 閾値 {threshold} トークンを使用（ローカル寄り）"),
+    ("doctor.hw.unknown.fix", "     正確なルーティングには PASTURE_RAM_MB=<合計MB>（または PASTURE_THRESHOLD=<トークン>）を設定してください"),
     (
         "models.ultra",
         "CPU のみ / 8 GB RAM 未満（超軽量。GPU なしのノートでも動作）:\n    ollama pull phi3:mini          # 3.8B Q4、約 2.3 GB、CPU でも速い\n    ollama pull gemma2:2b          # 2.6B、非常に速く品質も良好\n    ollama pull qwen2.5:1.5b       # 1.5B、最低 RAM、日本語対応\n    ollama pull tinyllama          # 1.1B、最小サイズ（フォールバック用）\n\n  デュアルローカルルーティング（簡単な質問→高速モデル、複雑→メインモデル）:\n    PASTURE_LOCAL_FAST_MODEL=qwen2.5:1.5b  PASTURE_LOCAL_MODEL=phi3:mini",

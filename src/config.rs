@@ -745,11 +745,13 @@ update the `Version:` line. Header was:\n{header}"
         let documented = env_vars_documented_in_spec();
         let read = env_vars_read_by_config();
         // Vars surfaced in SPEC.md but resolved outside config.rs (BYOK keys read by
-        // the cloud layer; referral keys read by the CLI; the i18n language var).
+        // the cloud layer; the i18n language var; hardware overrides read by
+        // hardware.rs, which probes the machine directly rather than via Config).
         let allow_external: &[&str] = &[
             "PASTURE_OPENAI_API_KEY",
             "PASTURE_ANTHROPIC_API_KEY",
             "PASTURE_LANG",
+            "PASTURE_RAM_MB",
         ];
         let phantom: Vec<&String> = documented
             .iter()

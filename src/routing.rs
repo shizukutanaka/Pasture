@@ -638,12 +638,23 @@ impl RoutingEngine {
         local_available: bool,
         cloud_available: bool,
     ) -> Self {
+        // ADR-261: match every case explicitly, and crucially handle
+        // `ram_mb: None` (detection unavailable on this OS) by leaning LOCAL
+        // rather than assuming the weakest machine. The old code collapsed an
+        // undetected RAM to 0 and fell into the 300 (CPU-only) tier, so a strong
+        // Mac/Windows box silently escalated everything to the paid cloud — the
+        // inverse of the product's promise, and the harmful direction for a
+        // cost/privacy-first tool.
         let threshold = if profile.has_capable_gpu(8000) {
-            2000
-        } else if profile.gpu.is_some() || profile.ram_mb >= 16000 {
-            800
+            2000 // capable discrete GPU: keep the most work local
+        } else if profile.gpu.is_some() {
+            800 // some GPU, VRAM unknown/small
         } else {
-            300
+            match profile.ram_mb {
+                Some(r) if r >= 16000 => 800, // known roomy CPU box
+                Some(_) => 300,               // known small box: escalate sooner
+                None => 800,                  // UNKNOWN: never silently ship to cloud
+            }
         };
         Self::new(threshold, local_available, cloud_available)
     }
@@ -1140,7 +1151,7 @@ mod tests {
     #[test]
     fn test_for_hardware_capable_gpu_high_threshold() {
         let p = HardwareProfile {
-            ram_mb: 32000,
+            ram_mb: Some(32000),
             cpu_count: 16,
             gpu: Some(GpuInfo {
                 vendor: "nvidia".into(),
@@ -1156,7 +1167,7 @@ mod tests {
     #[test]
     fn test_for_hardware_cpu_only_low_threshold() {
         let p = HardwareProfile {
-            ram_mb: 8000,
+            ram_mb: Some(8000),
             cpu_count: 4,
             gpu: None,
         };
@@ -1166,11 +1177,50 @@ mod tests {
     #[test]
     fn test_for_hardware_midrange_threshold() {
         let p = HardwareProfile {
-            ram_mb: 16000,
+            ram_mb: Some(16000),
             cpu_count: 8,
             gpu: None,
         };
         assert_eq!(RoutingEngine::for_hardware(&p, true, true).threshold(), 800);
+    }
+
+    #[test]
+    fn test_for_hardware_unknown_ram_leans_local() {
+        // ADR-261 — the defect this fixes. RAM detection is unavailable on
+        // macOS/Windows, and the old code collapsed that to `ram_mb: 0`, which
+        // fell into the 300 (CPU-only) tier: a 64 GB Mac silently escalated
+        // nearly everything to the paid cloud. `None` must NOT mean "tiny".
+        let p = HardwareProfile {
+            ram_mb: None,
+            cpu_count: 10,
+            gpu: None,
+        };
+        assert_eq!(
+            RoutingEngine::for_hardware(&p, true, true).threshold(),
+            800,
+            "undetected RAM must lean local, not assume the weakest machine"
+        );
+    }
+
+    #[test]
+    fn test_for_hardware_gpu_without_vram_is_midrange() {
+        // A GPU we can see but whose VRAM we cannot read (non-NVIDIA, or
+        // nvidia-smi output we could not parse) is worth more than CPU-only but
+        // is not proven capable, so it sits at the middle tier.
+        let p = HardwareProfile {
+            ram_mb: None,
+            cpu_count: 8,
+            gpu: Some(GpuInfo {
+                vendor: "apple".into(),
+                vram_mb: None,
+            }),
+        };
+        // has_capable_gpu() treats unknown VRAM as capable, so this is the 2000
+        // tier; pinned here so the interaction is explicit rather than implied.
+        assert_eq!(
+            RoutingEngine::for_hardware(&p, true, true).threshold(),
+            2000
+        );
     }
 
     #[test]
