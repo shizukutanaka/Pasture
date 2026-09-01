@@ -24,7 +24,7 @@ COMMANDS:
     route <text> [--json]    Dry-run: show where a prompt would be routed (--json for scripting)
     chat  <text>             Send one prompt through the router (needs Ollama)
     serve                    Start the OpenAI-compatible proxy server
-    eval [--external <file>] Measure routing quality + token-threshold sweep (--json for machine output)
+    eval [--external <file>] Routing accuracy: regression + held-out sets; exits 1 on regression (--json)
     stats [--json]           Summarize the cost log (routes, tokens, spend)
     improvements [path]      Show the self-improvement ledger (verified change history)
     improvements --review    Show only entries the machine gate cannot auto-approve
@@ -2266,6 +2266,61 @@ mod tests {
     /// ADR-267: `up` must distinguish "no `ollama` command" from "it did not
     /// start". Before this, both printed the install advice, so a user whose
     /// Ollama was installed-but-wedged was told to install it again.
+    /// Every command USAGE advertises must actually dispatch (ADR-272).
+    ///
+    /// ADR-271 deleted the token-threshold sweep and updated README.md and
+    /// SPEC.md — but not this binary's own USAGE string, which went on
+    /// advertising it. The binary is the one surface a user cannot check
+    /// against a doc, and it was stale for a whole commit whose subject was
+    /// making claims true. Same drift as ADR-262's dangling `pasture refer`.
+    ///
+    /// Truth is derived from the `match command` arms in this file's own
+    /// source, so a deleted command fails here without anyone remembering to
+    /// look — the source-scanning trick `env_vars_read_by_config` uses.
+    #[test]
+    fn test_usage_advertises_only_real_commands() {
+        let src = include_str!("cli.rs");
+        let mut dispatched: Vec<String> = Vec::new();
+        for line in src.lines() {
+            let t = line.trim();
+            if !t.starts_with('"') || !t.contains("=>") {
+                continue;
+            }
+            let arm = &t[..t.find("=>").unwrap()];
+            for piece in arm.split('|') {
+                let piece = piece.trim().trim_end_matches(',').trim();
+                if let Some(name) = piece.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                    if !name.is_empty() && !name.starts_with('-') {
+                        dispatched.push(name.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            dispatched.contains(&"eval".to_string()),
+            "dispatcher scan found nothing — the scraper broke, not the USAGE"
+        );
+
+        let commands_block = src
+            .split("COMMANDS:\n")
+            .nth(1)
+            .and_then(|r| r.split("\nOPTIONS:").next())
+            .expect("USAGE must have a COMMANDS block");
+        for line in commands_block.lines() {
+            let t = line.trim();
+            let Some(first) = t.split_whitespace().next() else {
+                continue;
+            };
+            if !first.chars().all(|c| c.is_ascii_lowercase()) || first.is_empty() {
+                continue;
+            }
+            assert!(
+                dispatched.contains(&first.to_string()),
+                "USAGE advertises `{first}`, which the dispatcher does not accept"
+            );
+        }
+    }
+
     #[test]
     fn test_ollama_unreachable_key_splits_by_path_presence() {
         assert_eq!(ollama_unreachable_key(false), "up.ollama_notinstalled");
