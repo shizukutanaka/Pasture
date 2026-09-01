@@ -51,7 +51,7 @@ library only; the cloud (HTTPS/TLS) path is gated behind the optional `cloud` fe
 | `label --prompts <f> [--out <f>]` | answer each prompt locally and record right/wrong, producing the `{"logprob","correct"}` JSONL that `calibrate --auroc`/`--error` consume (ADR-257). Writes only the score and verdict — never prompt or answer text (I3) |
 | `models` | recommend local models for this machine |
 | `doctor` | diagnose setup and print fixes |
-| `eval [--external <file>] [--json]` | routing accuracy + threshold sweep |
+| `eval [--external <file>] [--json]` | routing accuracy on two corpora; **exits 1** on regression or I2 breach |
 | `stats [--json]` | summarize the cost log |
 | `improvements [path] [--review]` | print the self-improvement ledger (verified change history) |
 | `config` | print effective configuration |
@@ -556,9 +556,27 @@ ids are time+counter derived (not crypto-random). No PII (I3).
 
 ## 10. Evaluation
 
-`eval` runs a built-in labelled set (plain→local, hard→cloud, sensitive→local) and a
-threshold sweep, reporting accuracy, cloud rate, false/missed escalations. Fully
-offline (I1).
+`eval` runs **two** labelled corpora, fully offline (I1), and is a real gate: it
+**exits 1** on failure (ADR-271; before that it returned 0 on every path, so CI
+Gate 4 could not fail).
+
+1. **Built-in regression set** (`default_cases`, 18 cases) — plain→local,
+   hard→cloud, sensitive→local. Its labels restate the router's own marker
+   lists, so it scores 100% by construction and is a *regression check*, not a
+   measurement: anything below 100% means a detector changed behaviour.
+2. **Held-out generalisation set** (`holdout_cases`, 30 cases) — labelled by the
+   §4 routing policy but containing **no trigger string from any marker list**,
+   a property enforced by a test that reads the marker lists from the router
+   itself. This is what actually measures generalisation. Recorded baseline:
+   **66.7% (20/30)**, all ten misses being hard-but-plainly-phrased prompts kept
+   local (§4's known limitation: absent a marker or length, hardness is
+   invisible to the router). `HOLDOUT_ACCURACY_FLOOR` ratchets against that
+   baseline.
+
+Both report accuracy, cloud rate, false/missed escalations and
+`sensitive_escalations`. A non-zero `sensitive_escalations` is an **I2 breach**
+and fails the gate unconditionally, regardless of accuracy. Threshold tuning
+lives in `calibrate`, which fits the threshold to the user's own cost log.
 
 ---
 

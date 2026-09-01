@@ -25,6 +25,10 @@ pub struct EvalReport {
     pub false_escalations: usize,
     /// expected Cloud but routed Local (quality risk).
     pub missed_escalations: usize,
+    /// prompts the privacy classifier marked sensitive that routed Cloud
+    /// anyway (ADR-271). Any non-zero value is an I2 breach and `pasture eval`
+    /// exits 1 on it unconditionally.
+    pub sensitive_escalations: usize,
 }
 
 impl EvalReport {
@@ -47,7 +51,7 @@ impl EvalReport {
     /// Machine-readable summary for `pasture eval --json` (CI / scripting).
     pub fn to_json(&self, threshold: usize) -> String {
         format!(
-            "{{\"total\":{},\"correct\":{},\"accuracy\":{:.6},\"cloud_count\":{},\"cloud_rate\":{:.6},\"false_escalations\":{},\"missed_escalations\":{},\"threshold\":{}}}",
+            "{{\"total\":{},\"correct\":{},\"accuracy\":{:.6},\"cloud_count\":{},\"cloud_rate\":{:.6},\"false_escalations\":{},\"missed_escalations\":{},\"sensitive_escalations\":{},\"threshold\":{}}}",
             self.total,
             self.correct,
             self.accuracy(),
@@ -55,39 +59,52 @@ impl EvalReport {
             self.cloud_rate(),
             self.false_escalations,
             self.missed_escalations,
+            self.sensitive_escalations,
             threshold
         )
     }
 }
 
-/// Run the engine over labelled cases and tally correctness. Sensitivity is
-/// derived per case via the privacy classifier (so sensitive -> Local).
-pub fn run_eval(engine: &RoutingEngine, cases: &[EvalCase]) -> EvalReport {
+/// Score `(prompt, expected)` pairs — the single scorer behind both the
+/// static and owned case types (ADR-271; they were the same 20 lines twice,
+/// and the held-out corpus would have made it three).
+fn score<'a>(engine: &RoutingEngine, cases: impl Iterator<Item = (&'a str, Route)>) -> EvalReport {
     let mut report = EvalReport {
-        total: cases.len(),
+        total: 0,
         correct: 0,
         cloud_count: 0,
         false_escalations: 0,
         missed_escalations: 0,
+        sensitive_escalations: 0,
     };
-    for case in cases {
-        let sensitive = classify(case.prompt).is_sensitive();
+    for (prompt, expected) in cases {
+        report.total += 1;
+        let sensitive = classify(prompt).is_sensitive();
         let got = engine
-            .decide_with_sensitivity(case.prompt, None, sensitive)
+            .decide_with_sensitivity(prompt, None, sensitive)
             .map(|d| d.route)
             .unwrap_or(Route::Local);
         if got == Route::Cloud {
             report.cloud_count += 1;
+            if sensitive {
+                report.sensitive_escalations += 1;
+            }
         }
-        if got == case.expected {
+        if got == expected {
             report.correct += 1;
-        } else if case.expected == Route::Local && got == Route::Cloud {
+        } else if expected == Route::Local && got == Route::Cloud {
             report.false_escalations += 1;
         } else {
             report.missed_escalations += 1;
         }
     }
     report
+}
+
+/// Run the engine over labelled cases and tally correctness. Sensitivity is
+/// derived per case via the privacy classifier (so sensitive -> Local).
+pub fn run_eval(engine: &RoutingEngine, cases: &[EvalCase]) -> EvalReport {
+    score(engine, cases.iter().map(|c| (c.prompt, c.expected)))
 }
 
 /// The built-in labelled dataset (EN + JA): plain->Local, hard->Cloud,
@@ -181,34 +198,14 @@ pub struct OwnedEvalCase {
     pub expected: Route,
 }
 
-/// Run the engine over dynamically-loaded eval cases. Identical routing logic
-/// to `run_eval`; a separate type is used because loaded prompts are not `'static`.
+/// Run the engine over dynamically-loaded eval cases (same scorer as
+/// `run_eval`; a separate entry point only because loaded prompts are not
+/// `'static`).
 pub fn run_eval_owned(engine: &RoutingEngine, cases: &[OwnedEvalCase]) -> EvalReport {
-    let mut report = EvalReport {
-        total: cases.len(),
-        correct: 0,
-        cloud_count: 0,
-        false_escalations: 0,
-        missed_escalations: 0,
-    };
-    for case in cases {
-        let sensitive = classify(case.prompt.as_str()).is_sensitive();
-        let got = engine
-            .decide_with_sensitivity(case.prompt.as_str(), None, sensitive)
-            .map(|d| d.route)
-            .unwrap_or(Route::Local);
-        if got == Route::Cloud {
-            report.cloud_count += 1;
-        }
-        if got == case.expected {
-            report.correct += 1;
-        } else if case.expected == Route::Local && got == Route::Cloud {
-            report.false_escalations += 1;
-        } else {
-            report.missed_escalations += 1;
-        }
-    }
-    report
+    score(
+        engine,
+        cases.iter().map(|c| (c.prompt.as_str(), c.expected)),
+    )
 }
 
 /// Load a JSONL eval file (RouterBench-compatible format). Each non-blank,
@@ -271,39 +268,157 @@ pub fn load_eval_cases(path: &str) -> Result<Vec<OwnedEvalCase>, String> {
     Ok(cases)
 }
 
-/// Plain prompts of increasing length (no hard signals, not sensitive) used to
-/// visualise how the token threshold trades locality against cost.
-pub fn length_samples() -> Vec<String> {
-    let unit = "the quiet meadow at dawn ";
-    [1usize, 10, 60, 200]
-        .iter()
-        .map(|n| unit.repeat(*n).trim_end().to_string())
-        .collect()
-}
+/// Held-out accuracy floor for `pasture eval` (ADR-271). **Measured, not
+/// chosen**: on first measurement the router scored 20/30 (66.7%) on
+/// `holdout_cases` — every miss a hard-but-plainly-phrased prompt kept local —
+/// and the floor is set one case below that so any regression of a single case
+/// turns the gate red. Raise it when routing genuinely improves; lowering it
+/// requires a written justification in the ledger.
+pub const HOLDOUT_ACCURACY_FLOOR: f64 = 0.66;
 
-/// Sweep token thresholds, returning (threshold, cloud_rate) over the samples.
-pub fn sweep(samples: &[String], thresholds: &[usize]) -> Vec<(usize, f64)> {
-    thresholds
-        .iter()
-        .map(|&t| {
-            let engine = RoutingEngine::new(t, true, true);
-            let cloud = samples
-                .iter()
-                .filter(|s| {
-                    engine
-                        .decide(s, None)
-                        .map(|d| d.route == Route::Cloud)
-                        .unwrap_or(false)
-                })
-                .count();
-            let rate = if samples.is_empty() {
-                0.0
-            } else {
-                cloud as f64 / samples.len() as f64
-            };
-            (t, rate)
-        })
-        .collect()
+/// The held-out generalisation set (ADR-271). Unlike `default_cases` — whose
+/// labels restate the router's own marker lists and therefore score 100% by
+/// construction — these prompts are labelled by SPEC §4's stated policy
+/// (multi-step reasoning / synthesis / open-ended writing → cloud; short
+/// factual → local; sensitive → local) while containing **no trigger string
+/// from any marker list**, a property enforced by
+/// `test_holdout_prompts_contain_no_detector_marker`. All prompts are short, so
+/// results are identical for any threshold ≥ 50 and machine-independent.
+///
+/// When one of these fails, that is a *finding about the router*, not about the
+/// prompt. Do not reword a failing prompt into passing — that reintroduces the
+/// tautology this set exists to break.
+pub fn holdout_cases() -> Vec<EvalCase> {
+    use Route::{Cloud, Local};
+    vec![
+        // Hard, plainly phrased -> Cloud. Multi-step reasoning or open-ended
+        // synthesis with no cue word; probes missed escalations.
+        EvalCase {
+            prompt: "A train leaves Boston at noon going sixty miles an hour and another leaves New York an hour later going forty; where do they meet",
+            expected: Cloud,
+        },
+        EvalCase {
+            prompt: "Our team missed the deadline again and morale is low; what should I say in the retrospective",
+            expected: Cloud,
+        },
+        EvalCase {
+            prompt: "Which costs less over ten years, a heat pump or a gas furnace, for a drafty house in a cold climate",
+            expected: Cloud,
+        },
+        EvalCase {
+            prompt: "Rewrite the opening of my cover letter so it sounds confident without sounding arrogant",
+            expected: Cloud,
+        },
+        EvalCase {
+            prompt: "Explain the difference between correlation and causation to a manager who thinks statistics are a waste of time",
+            expected: Cloud,
+        },
+        EvalCase {
+            prompt: "My sourdough starter smells like acetone and never doubles in size; what is going wrong",
+            expected: Cloud,
+        },
+        EvalCase {
+            prompt: "Design a seating chart for a wedding where two families are not on speaking terms",
+            expected: Cloud,
+        },
+        EvalCase {
+            prompt: "Argue the strongest case against the position you would normally take on remote work",
+            expected: Cloud,
+        },
+        EvalCase {
+            prompt: "この契約書の条項が借り手に不利かどうか判断して",
+            expected: Cloud,
+        },
+        EvalCase {
+            prompt: "何年も弾いていない人が半年で発表会に出られるようにするピアノの練習計画を立てて",
+            expected: Cloud,
+        },
+        // Easy, detector-adjacent -> Local. Trivial asks that brush a
+        // detector's vocabulary without being work; probes false escalations.
+        EvalCase {
+            prompt: "What does the acronym API stand for",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "What does the abbreviation JSON stand for",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "Is Python a compiled language or an interpreted one",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "Which company originally created the Java language",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "What is the chemical symbol for gold",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "How many players are on a soccer team",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "What colour do you get by mixing blue and yellow",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "Who wrote the novel Dune",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "How many continents are there",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "What is the tallest mountain in the world",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "Which ocean lies between Africa and Australia",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "日本の首都はどこ",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "いちばん大きい惑星は何",
+            expected: Local,
+        },
+        // Sensitive, obliquely phrased -> Local. PII in casual phrasings the
+        // value detectors were not written against; a Cloud route here is an
+        // I2 breach (sensitive_escalations).
+        EvalCase {
+            prompt: "Send the receipt to maria.lopez@contoso.co.uk when you get a chance",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "The box sitting at 10.0.14.7 keeps dropping connections overnight",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "Reach me on +1-415-555-0132 after six",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "Put it on the card 5555 5555 5555 4444 and mail the receipt",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "the password for the shared archive is hunter2hunter2",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "私のメールアドレスは tanaka@example.jp です",
+            expected: Local,
+        },
+        EvalCase {
+            prompt: "the token sk-9fQ2mZx7Lp4Rt8Vw1Nb3 is in the config",
+            expected: Local,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -330,6 +445,7 @@ mod tests {
             cloud_count: 7,
             false_escalations: 0,
             missed_escalations: 0,
+            sensitive_escalations: 0,
         };
         let json = r.to_json(300);
         let v = crate::json::parse(&json).expect("eval --json must be valid JSON");
@@ -351,6 +467,7 @@ mod tests {
             cloud_count: 2,
             false_escalations: 1,
             missed_escalations: 0,
+            sensitive_escalations: 0,
         };
         assert!((r.accuracy() - 0.75).abs() < 1e-9);
         assert!((r.cloud_rate() - 0.5).abs() < 1e-9);
@@ -364,31 +481,89 @@ mod tests {
             cloud_count: 0,
             false_escalations: 0,
             missed_escalations: 0,
+            sensitive_escalations: 0,
         };
         assert_eq!(r.accuracy(), 0.0);
         assert_eq!(r.cloud_rate(), 0.0);
     }
 
     #[test]
-    fn test_sweep_monotonic_nonincreasing_with_threshold() {
-        let samples = length_samples();
-        let res = sweep(&samples, &[50, 100, 300, 800, 5000]);
-        // Higher threshold -> fewer cloud routings (rate is non-increasing).
-        for w in res.windows(2) {
+    fn test_holdout_prompts_contain_no_detector_marker() {
+        // ADR-271, the load-bearing property: the held-out corpus is only a
+        // measurement of generalisation while its prompts share no trigger
+        // string with the router. This is what stops the set decaying back
+        // into a self-graded exam the first time someone "fixes" a failing
+        // prompt by (accidentally or not) pasting a marker into it. Marker
+        // lists are pulled from routing.rs itself, so adding a marker there
+        // automatically re-screens the corpus here.
+        let markers = crate::routing::all_markers();
+        for case in holdout_cases() {
+            let lower = case.prompt.to_lowercase();
+            for m in &markers {
+                assert!(
+                    !lower.contains(m),
+                    "held-out prompt contains detector marker {m:?}: {:?}",
+                    case.prompt
+                );
+            }
             assert!(
-                w[0].1 >= w[1].1,
-                "cloud rate should not increase with threshold: {res:?}"
+                !crate::routing::looks_mathy(case.prompt),
+                "held-out prompt trips the math-density signal: {:?}",
+                case.prompt
             );
         }
-        // Lowest threshold should push at least one sample to cloud.
-        assert!(res[0].1 > 0.0);
     }
 
     #[test]
-    fn test_length_samples_not_sensitive_and_no_hard_signal() {
-        for s in length_samples() {
-            assert!(!classify(&s).is_sensitive());
-            assert!(crate::routing::hard_signals(&s).is_empty());
+    fn test_holdout_accuracy_meets_floor_and_no_i2_breach() {
+        // Pins the measured baseline the CLI gate ratchets against, on a fixed
+        // threshold so the result is machine-independent (all holdout prompts
+        // are far below 300 estimated tokens). If routing changes make this
+        // fail, that is a real regression on prompts with no marker to lean
+        // on — fix the routing or justify moving HOLDOUT_ACCURACY_FLOOR in the
+        // ledger; never reword the prompt.
+        let engine = RoutingEngine::new(300, true, true);
+        let report = run_eval(&engine, &holdout_cases());
+        assert!(
+            report.accuracy() >= HOLDOUT_ACCURACY_FLOOR,
+            "held-out accuracy {:.3} fell below the floor {HOLDOUT_ACCURACY_FLOOR}: {}/{} (false_esc={}, missed_esc={})",
+            report.accuracy(),
+            report.correct,
+            report.total,
+            report.false_escalations,
+            report.missed_escalations
+        );
+        assert_eq!(
+            report.sensitive_escalations, 0,
+            "I2 breach: a sensitive held-out prompt routed to cloud"
+        );
+    }
+
+    #[test]
+    fn test_holdout_sensitive_prompts_are_detected() {
+        // The oblique-PII class only probes I2 if the classifier actually
+        // recognises each prompt as sensitive; silently losing detection would
+        // make sensitive_escalations vacuously zero. Every case past the
+        // sensitive-class boundary must classify sensitive.
+        let sensitive_class: Vec<_> = holdout_cases()
+            .into_iter()
+            .filter(|c| {
+                c.prompt.contains("maria.lopez")
+                    || c.prompt.contains("10.0.14.7")
+                    || c.prompt.contains("+1-415")
+                    || c.prompt.contains("5555 5555")
+                    || c.prompt.contains("hunter2")
+                    || c.prompt.contains("tanaka@")
+                    || c.prompt.contains("sk-9fQ2")
+            })
+            .collect();
+        assert_eq!(sensitive_class.len(), 7, "sensitive class shrank");
+        for c in &sensitive_class {
+            assert!(
+                classify(c.prompt).is_sensitive(),
+                "oblique PII no longer detected: {:?}",
+                c.prompt
+            );
         }
     }
 

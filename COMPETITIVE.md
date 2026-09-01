@@ -378,6 +378,24 @@ zero-dep/single-user/privacy wedge):**
 | **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
 | **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | ◐ **PARTIALLY SHIPPED (ADR-254)** — injecting `cache_control` was already done (IMP-18), but the *accounting* half was not, and was **proven broken**: cached prompt tokens land in `cache_creation_input_tokens`/`cache_read_input_tokens` and were dropped entirely, undercounting a realistic cached request **1025×** and silently defeating `PASTURE_BUDGET_DAILY_TOKENS`. Both the buffered and streaming paths now sum all prompt-side fields. **Still open:** cached tokens are counted at face value, so their differing *prices* (cache writes cost more than base input, reads far less) are not modelled by the flat per-1M rate — that needs a richer price config. |
 
+### 4e-9. The quality gate could not fail (2026-09)
+
+> Socratic pass over the one thing that certifies Pasture's headline claim.
+> *What measures that routing is correct?* `pasture eval`. *What would it say if
+> routing were broken?* — the answer turned out to be "100%, and exit 0".
+
+| Finding | Verdict |
+|---|---|
+| **E1. The eval corpus was a tautology** | ✅ **FIXED (ADR-271)** — all 18 `default_cases` labels restate the router's own marker lists: `"…prove that…step by step"` is two `REASONING_MARKERS`, `"write a function…"` is a `FORMAT_MARKER`, `"return the result as JSON"` is a `STRUCTURED_MARKER`. The suite asserted that detectors detect themselves, so 100% was guaranteed by construction and would stay 100% however badly the rules generalised. A 30-case **held-out** set now carries no trigger string at all — enforced by a test that reads the marker lists out of `routing.rs`, so adding a marker automatically re-screens the corpus. |
+| **E2. The gate could not fail** | ✅ **FIXED (ADR-271)** — `run_eval` returned `0` on every path. CI Gate 4 (`cargo run --release -- eval`) passes on exit code, so accuracy could have been 0% and the gate would still be green: a print statement wearing a gate's name. It now exits 1 when the regression set drops below 100%, when held-out accuracy falls below the recorded floor, or — unconditionally — when any sensitive prompt escalates (I2). All four failure modes were mutation-verified. |
+| **E3. The "threshold sweep" measured arithmetic** | ✅ **DELETED (ADR-271)** — it swept over `length_samples()`: one sentence repeated 1/10/60/200 times. Four samples, no routing content; the published `75/50/50/25/0%` was just "does a longer string exceed a bigger integer". Deleted rather than decorated — `pasture calibrate` already fits the threshold to the user's *real* cost log, which is the honest version of the same idea. |
+| **E4. The measurement it was hiding** | ⚠️ **OPEN, now quantified.** With a genuinely held-out set the router scores **66.7% (20/30)** — and every one of the ten misses is the same failure: a hard, plainly-phrased prompt kept local ("Which costs less over ten years, a heat pump or a gas furnace…", "この契約書の条項が借り手に不利かどうか判断して"). **Absent a trigger string or sheer length, hardness is invisible to the router.** Zero false escalations and zero I2 breaches — the failure is one-directional, in the quality-risk direction. This is the real backlog item E1 was concealing, and the honest ceiling on a purely lexical router. |
+
+**Strength worth stating plainly:** the privacy layer generalises where the
+routing layer does not. All seven obliquely-phrased PII prompts — casual
+phrasings the value detectors were never written against — were correctly
+classified sensitive and kept local. I2 holds outside its own test fixtures.
+
 ### 4e-8. Deletion audit: applying step 2 to the shipped surface (2026-08)
 
 > Musk's algorithm puts *delete* before *simplify* and *automate*, and names the

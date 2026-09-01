@@ -282,6 +282,31 @@ const MATH_CHARS: &[char] = &[
     '=', '+', '*', '/', '^', '∑', '∫', '√', 'π', '≤', '≥', '≠', '∂', 'Σ',
 ];
 
+/// Every literal marker string any detector matches on, as one derived list
+/// (ADR-271).
+///
+/// Exists so the held-out eval corpus can be *proved* free of trigger strings
+/// rather than promised to be. Derived from the consts themselves — adding a
+/// marker automatically tightens the guard, the same discipline `KNOWN_ENV`
+/// applies to settings (ADR-270). Never hand-copy these strings elsewhere.
+#[cfg(test)]
+pub(crate) fn all_markers() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for list in [
+        REASONING_MARKERS,
+        STRUCTURED_MARKERS,
+        FORMAT_MARKERS,
+        SUMMARIZE_MARKERS,
+        TRANSLATE_MARKERS,
+        STEP_CUES_EN,
+        STEP_CUES_JA,
+        TIME_SENSITIVE_MARKERS,
+    ] {
+        out.extend_from_slice(list);
+    }
+    out
+}
+
 fn has_marker(lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| lower.contains(m))
 }

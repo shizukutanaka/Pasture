@@ -53,7 +53,7 @@ pasture label --prompts p.txt   # answer prompts locally and mark each right/wro
 pasture calibrate --auroc --labels labels.jsonl  # self-test: does the confidence signal predict correctness?
 pasture models             # recommended local models for your machine
 pasture doctor             # check your setup and how to fix problems
-pasture eval               # measure routing accuracy + threshold sweep
+pasture eval               # routing accuracy: regression set + held-out set (exits 1 on regression)
 pasture stats              # summarize the cost log (routes, tokens, spend)
 pasture improvements       # show the self-improvement ledger (verified change history)
 ```

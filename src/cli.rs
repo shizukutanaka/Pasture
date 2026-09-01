@@ -553,10 +553,25 @@ fn print_eval_report(report: &crate::eval::EvalReport) {
         "  missed escalations (cloud->local): {}",
         report.missed_escalations
     );
+    println!(
+        "  sensitive escalations (I2 breach): {}",
+        report.sensitive_escalations
+    );
 }
 
-/// `pasture eval`: run the routing eval (built-in cases, or `--external
-/// <file>` JSONL cases) and print accuracy / escalation stats.
+/// `pasture eval`: run the routing eval and GATE on it (ADR-271).
+///
+/// Two corpora, two jobs:
+/// - the built-in set (`default_cases`) restates the router's own markers, so
+///   it is a **regression check**: anything under 100% means a detector broke;
+/// - the held-out set (`holdout_cases`) shares no trigger string with the
+///   router, so it **measures generalisation**; it is gated by the recorded
+///   floor, not by 100%.
+///
+/// Exit is non-zero when the built-in set drops below 100%, when held-out
+/// accuracy falls below `HOLDOUT_ACCURACY_FLOOR`, or — unconditionally — when
+/// any sensitive prompt escalates to cloud (an I2 breach). Before this, every
+/// path returned 0 and CI Gate 4 could not fail.
 fn run_eval(rest: &[String]) -> i32 {
     let profile = HardwareProfile::detect();
     let engine = RoutingEngine::for_hardware(&profile, true, true);
@@ -584,23 +599,62 @@ fn run_eval(rest: &[String]) -> i32 {
         }
         return 0;
     }
-    let report = crate::eval::run_eval(&engine, &crate::eval::default_cases());
-    if rest.iter().any(|a| a == "--json") {
-        println!("{}", report.to_json(engine.threshold()));
-        return 0;
+    let builtin = crate::eval::run_eval(&engine, &crate::eval::default_cases());
+    let holdout = crate::eval::run_eval(&engine, &crate::eval::holdout_cases());
+    let floor = crate::eval::HOLDOUT_ACCURACY_FLOOR;
+
+    let mut failed = false;
+    if builtin.correct < builtin.total {
+        failed = true;
     }
+    if holdout.accuracy() < floor {
+        failed = true;
+    }
+    let i2_breach = builtin.sensitive_escalations + holdout.sensitive_escalations;
+    if i2_breach > 0 {
+        failed = true;
+    }
+
+    if rest.iter().any(|a| a == "--json") {
+        println!(
+            "{{\"builtin\":{},\"holdout\":{},\"holdout_floor\":{floor},\"pass\":{}}}",
+            builtin.to_json(engine.threshold()),
+            holdout.to_json(engine.threshold()),
+            !failed
+        );
+        return i32::from(failed);
+    }
+
     println!(
-        "Routing eval ({} cases, threshold {}):",
-        report.total,
+        "Built-in regression set ({} cases, threshold {}) — restates the marker lists; any miss is a broken detector:",
+        builtin.total,
         engine.threshold()
     );
-    print_eval_report(&report);
-    println!("\nThreshold sweep (plain prompts, cloud rate):");
-    for (t, rate) in crate::eval::sweep(&crate::eval::length_samples(), &[50, 100, 300, 800, 2000])
-    {
-        println!("  thr {t:>5}: {:.0}%", rate * 100.0);
+    print_eval_report(&builtin);
+    println!(
+        "\nHeld-out generalisation set ({} cases) — no prompt contains a trigger string; measures how the rules generalise:",
+        holdout.total
+    );
+    print_eval_report(&holdout);
+    println!(
+        "  floor: {:.1}% (recorded baseline; the gate fails below it)",
+        floor * 100.0
+    );
+    println!("\nthreshold tuning: `pasture calibrate` fits the threshold to your own cost log");
+    if i2_breach > 0 {
+        eprintln!("FAIL: {i2_breach} sensitive prompt(s) escalated to cloud — I2 breach");
     }
-    0
+    if builtin.correct < builtin.total {
+        eprintln!("FAIL: built-in regression set below 100% — a detector changed behaviour");
+    }
+    if holdout.accuracy() < floor {
+        eprintln!(
+            "FAIL: held-out accuracy {:.1}% fell below the recorded floor {:.1}%",
+            holdout.accuracy() * 100.0,
+            floor * 100.0
+        );
+    }
+    i32::from(failed)
 }
 
 /// `pasture stats`: summarize the PII-free cost log (`--json` for scripting).
