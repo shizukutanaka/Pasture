@@ -26,7 +26,7 @@ load-bearing components already have concrete, tiny analogues in this repo:
 | RSI component | Pasture mechanism (already present) |
 |---|---|
 | **Trace Store** | The PII-free JSONL **cost log** — one record per request (route, model, tokens, cost, optional logprob). `stats` reads it back. |
-| **Hidden Benchmark** | The **`eval`** harness — a labelled set (correctness) + threshold sweep (cost/locality), fully offline. |
+| **Hidden Benchmark** | The **`eval`** harness — three labelled corpora (a marker-restating regression set, a held-out routing set, a held-out cascade-answer set), fully offline, and a real gate: it exits 1 on regression or an I2 breach (ADR-271/272). |
 | **Verifier** | **`cargo test`** + `eval` + `cargo fmt --check`, enforced as the CI release gate (ADR-014). |
 | **Skill Compiler** | The **IMP-N → ADR → code** pipeline: each improvement is mined into a rule/feature, recorded as an ADR, and shipped behind a flag. Done by hand, deliberately. |
 | **Governance** | **ADRs** + invariants (I1–I5) + the CI gate + human-gated release/signing. |

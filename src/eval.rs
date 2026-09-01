@@ -191,6 +191,174 @@ pub fn default_cases() -> Vec<EvalCase> {
     ]
 }
 
+/// A labelled cascade case: a local model's answer and whether the cascade
+/// *should* escalate it to the cloud.
+#[derive(Debug, Clone, Copy)]
+pub struct CascadeCase {
+    pub answer: &'static str,
+    pub should_escalate: bool,
+}
+
+/// Held-out floor for the cascade answer classifier (ADR-272). **Measured, not
+/// chosen**: `is_low_confidence` scored **47.8% (11/23)** on first measurement,
+/// catching **0 of 12** held-out weak answers with 0 false escalations.
+///
+/// Read that carefully — a classifier that always returned `false` scores the
+/// same 11/23 (the corpus is 11 keep / 12 escalate). On answers that do not
+/// contain its own literal marker strings, the text heuristic contributes no
+/// signal at all.
+///
+/// **Which means this floor is, today, near-vacuous, and that is stated rather
+/// than hidden.** It was mutation-tested: forcing `is_low_confidence` to return
+/// `false` unconditionally does NOT trip it, precisely because the classifier
+/// already scores what "always false" scores. The assertions with real teeth
+/// are the companion `false_escalations == 0` (verified: widening the
+/// short-answer rule to 40 chars trips it) and the marker guard. The floor
+/// becomes a meaningful ratchet the moment the classifier improves and the
+/// number is raised.
+pub const CASCADE_HOLDOUT_FLOOR: f64 = 0.47;
+
+/// Held-out corpus for `cascade::is_low_confidence` (ADR-272).
+///
+/// ADR-271 found the routing corpus was a tautology; the cascade classifier had
+/// the same problem one layer down — its unit tests feed it its own
+/// `UNCERTAINTY_MARKERS` strings. These answers are ones a small local model
+/// plausibly produces and **contain no marker substring**, a property enforced
+/// by `test_cascade_holdout_contains_no_uncertainty_marker`.
+///
+/// Two classes: hedging non-answers that should escalate, and terse-but-correct
+/// answers that must not (escalating those is wasted cloud spend — the failure
+/// direction a naive "short answer means weak" rule would cause).
+///
+/// As with the routing corpus: a failure here is a finding about the
+/// classifier, not a prompt to reword.
+pub fn cascade_holdout_cases() -> Vec<CascadeCase> {
+    vec![
+        // Weak / evasive answers -> should escalate.
+        CascadeCase {
+            answer: "That depends on a lot of factors, and reasonable people disagree.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "There are several ways to look at this question.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "It is complicated and there is no single right answer.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "Great question! Let me think about what would be best here.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "The answer varies depending on your specific situation.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "You should probably consult a professional about this.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "Well, that is certainly something worth considering carefully.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "The heat pump versus furnace question has many considerations to weigh.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "It really comes down to your own preferences and circumstances.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "Hmm, this is the kind of thing that requires more context to say.",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "難しい質問ですね。状況によって答えは変わります。",
+            should_escalate: true,
+        },
+        CascadeCase {
+            answer: "一概には言えません。人それぞれだと思います。",
+            should_escalate: true,
+        },
+        // Terse but correct -> must NOT escalate.
+        CascadeCase {
+            answer: "Paris.",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "The chemical symbol for gold is Au.",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "Eleven players per side.",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "Green.",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "Frank Herbert wrote Dune in 1965.",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "Python is interpreted, though it compiles to bytecode first.",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "Application Programming Interface.",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "The Indian Ocean.",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "Seven.",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "東京です。",
+            should_escalate: false,
+        },
+        CascadeCase {
+            answer: "木星です。",
+            should_escalate: false,
+        },
+    ]
+}
+
+/// Score the cascade answer classifier over labelled cases (ADR-272).
+/// `false_escalations` = escalated a good answer (wasted spend);
+/// `missed_escalations` = kept a weak answer (quality risk).
+pub fn run_cascade_eval(cases: &[CascadeCase]) -> EvalReport {
+    let mut report = EvalReport {
+        total: cases.len(),
+        correct: 0,
+        cloud_count: 0,
+        false_escalations: 0,
+        missed_escalations: 0,
+        sensitive_escalations: 0,
+    };
+    for case in cases {
+        let got = crate::cascade::is_low_confidence(case.answer);
+        if got {
+            report.cloud_count += 1;
+        }
+        if got == case.should_escalate {
+            report.correct += 1;
+        } else if got {
+            report.false_escalations += 1;
+        } else {
+            report.missed_escalations += 1;
+        }
+    }
+    report
+}
+
 /// A dynamically-loaded evaluation case (prompt owned on the heap, not `'static`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedEvalCase {
@@ -485,6 +653,52 @@ mod tests {
         };
         assert_eq!(r.accuracy(), 0.0);
         assert_eq!(r.cloud_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_cascade_holdout_contains_no_uncertainty_marker() {
+        // ADR-272, mirroring the routing corpus guard: these answers only
+        // measure generalisation while they share no literal marker with
+        // `is_low_confidence`. Markers come from cascade.rs itself, so adding
+        // one automatically re-screens this corpus.
+        let markers = crate::cascade::uncertainty_markers();
+        for case in cascade_holdout_cases() {
+            let lower = case.answer.to_lowercase();
+            for m in markers {
+                assert!(
+                    !lower.contains(m),
+                    "held-out cascade answer contains marker {m:?}: {:?}",
+                    case.answer
+                );
+            }
+            assert!(
+                case.answer.trim().chars().count() >= 2,
+                "near-empty answers escalate by a separate rule, not the text heuristic: {:?}",
+                case.answer
+            );
+        }
+    }
+
+    #[test]
+    fn test_cascade_holdout_meets_floor() {
+        // Pins the measured baseline. Honest limitation, also recorded on
+        // CASCADE_HOLDOUT_FLOOR: because the classifier already scores exactly
+        // what a constant `false` scores, this floor cannot detect the
+        // classifier being disabled — only the *waste* direction below it. The
+        // `false_escalations` assertion underneath is the one with teeth until
+        // the classifier improves.
+        let r = run_cascade_eval(&cascade_holdout_cases());
+        assert!(
+            r.accuracy() >= CASCADE_HOLDOUT_FLOOR,
+            "cascade held-out accuracy {:.3} fell below the floor {CASCADE_HOLDOUT_FLOOR}: {}/{} (false_esc={}, missed_esc={})",
+            r.accuracy(), r.correct, r.total, r.false_escalations, r.missed_escalations
+        );
+        // Escalating a good short answer is wasted cloud spend; the current
+        // classifier never does it, and that should not silently change.
+        assert_eq!(
+            r.false_escalations, 0,
+            "the classifier began escalating correct short answers"
+        );
     }
 
     #[test]

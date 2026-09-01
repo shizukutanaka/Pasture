@@ -67,7 +67,7 @@ One improvement = one commit. For each:
 6. **Gate + commit + push:**
    ```
    rustup run stable cargo fmt
-   rustup run stable cargo test          # 867+ pass, 0 fail
+   rustup run stable cargo test          # 926+ pass, 0 fail
    rustup run stable cargo clippy --all-targets   # no NEW warnings
    git add -A && git commit && git push -u origin <branch>
    ```
@@ -102,7 +102,7 @@ Take items where an existing pattern is copied and the test net is large.
 - **IMP-46** semantic-cache lexical second-gate (contained in `cache.rs`).
 - **IMP-48** daily-counter history file for the dashboard (append-only JSONL).
 - **IMP-49** split `proxy.rs` into modules — pure mechanical extraction, zero
-  behaviour change, guarded by 867 tests.
+  behaviour change, guarded by 926 tests.
 - New PII value recognizers, new i18n keys, doc sync, test-coverage backfill,
   ledger hygiene — all copy an established ADR pattern.
 

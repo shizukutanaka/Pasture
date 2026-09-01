@@ -601,9 +601,14 @@ fn run_eval(rest: &[String]) -> i32 {
     }
     let builtin = crate::eval::run_eval(&engine, &crate::eval::default_cases());
     let holdout = crate::eval::run_eval(&engine, &crate::eval::holdout_cases());
+    let cascade = crate::eval::run_cascade_eval(&crate::eval::cascade_holdout_cases());
     let floor = crate::eval::HOLDOUT_ACCURACY_FLOOR;
+    let cascade_floor = crate::eval::CASCADE_HOLDOUT_FLOOR;
 
     let mut failed = false;
+    if cascade.accuracy() < cascade_floor {
+        failed = true;
+    }
     if builtin.correct < builtin.total {
         failed = true;
     }
@@ -617,9 +622,10 @@ fn run_eval(rest: &[String]) -> i32 {
 
     if rest.iter().any(|a| a == "--json") {
         println!(
-            "{{\"builtin\":{},\"holdout\":{},\"holdout_floor\":{floor},\"pass\":{}}}",
+            "{{\"builtin\":{},\"holdout\":{},\"holdout_floor\":{floor},\"cascade\":{},\"cascade_floor\":{cascade_floor},\"pass\":{}}}",
             builtin.to_json(engine.threshold()),
             holdout.to_json(engine.threshold()),
+            cascade.to_json(engine.threshold()),
             !failed
         );
         return i32::from(failed);
@@ -640,6 +646,29 @@ fn run_eval(rest: &[String]) -> i32 {
         "  floor: {:.1}% (recorded baseline; the gate fails below it)",
         floor * 100.0
     );
+    println!(
+        "  NOTE: the two sets above score the PRE-REQUEST router only. With\n        PASTURE_CASCADE=1 the effective route also depends on the local\n        answer, which this offline harness cannot simulate."
+    );
+    println!(
+        "\nCascade answer classifier, held-out ({} answers) — only active with PASTURE_CASCADE=1:",
+        cascade.total
+    );
+    println!(
+        "  accuracy: {:.1}% ({}/{})   floor: {:.1}%",
+        cascade.accuracy() * 100.0,
+        cascade.correct,
+        cascade.total,
+        cascade_floor * 100.0
+    );
+    println!(
+        "  escalated a good answer (waste): {}   kept a weak answer (quality risk): {}",
+        cascade.false_escalations, cascade.missed_escalations
+    );
+    if cascade.missed_escalations == cascade.total - cascade.correct {
+        println!(
+            "  NOTE: every miss is in one direction — on answers that avoid its own\n        marker strings this heuristic is indistinguishable from \"never\n        escalate\". Logprobs (PASTURE_CASCADE_LOGPROB, needs a backend that\n        reports them) are the signal that does generalise."
+        );
+    }
     println!("\nthreshold tuning: `pasture calibrate` fits the threshold to your own cost log");
     if i2_breach > 0 {
         eprintln!("FAIL: {i2_breach} sensitive prompt(s) escalated to cloud — I2 breach");
@@ -652,6 +681,13 @@ fn run_eval(rest: &[String]) -> i32 {
             "FAIL: held-out accuracy {:.1}% fell below the recorded floor {:.1}%",
             holdout.accuracy() * 100.0,
             floor * 100.0
+        );
+    }
+    if cascade.accuracy() < cascade_floor {
+        eprintln!(
+            "FAIL: cascade held-out accuracy {:.1}% fell below the recorded floor {:.1}%",
+            cascade.accuracy() * 100.0,
+            cascade_floor * 100.0
         );
     }
     i32::from(failed)

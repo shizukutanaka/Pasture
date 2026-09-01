@@ -29,6 +29,15 @@ const UNCERTAINTY_MARKERS: &[&str] = &[
     "お答えでき",
 ];
 
+/// The uncertainty markers `is_low_confidence` matches, for the held-out
+/// cascade corpus guard (ADR-272). Test-only, and derived from the const itself
+/// so adding a marker automatically re-screens the corpus — the same discipline
+/// `routing::all_markers` applies to the routing corpus.
+#[cfg(test)]
+pub(crate) fn uncertainty_markers() -> &'static [&'static str] {
+    UNCERTAINTY_MARKERS
+}
+
 /// True when the local answer looks low-confidence and should escalate.
 /// Conservative: only empty/near-empty answers or explicit uncertainty markers
 /// trigger escalation, to avoid wasting cloud calls on good short answers.
