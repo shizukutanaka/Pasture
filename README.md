@@ -125,7 +125,7 @@ config file as `key = value`, using the lower-case name with the prefix dropped
 | `PASTURE_HARD_PROMPTS` | _(off)_ | file of prompts your local model handles badly, one per line; anything embedding-similar escalates to cloud |
 | `PASTURE_HARD_THRESHOLD` | `0.85` | cosine similarity at which a prompt counts as "near a known-hard prompt" |
 | `PASTURE_CASCADE` | _(off)_ | answer locally first and escalate only when the local answer is weak (needs the `cloud` feature and a key) |
-| `PASTURE_CASCADE_LOGPROB` | `-1.0` | mean-logprob threshold below which a cascade answer is escalated |
+| `PASTURE_CASCADE_LOGPROB` | `-1.0` | mean-logprob threshold below which a cascade answer is escalated; works with Ollama from Nov 2025 onward (older builds fall back to a text heuristic) |
 | `PASTURE_HEALTH_COOLDOWN_SECS` | `30` | circuit-breaker cooldown, both directions: while a backend is Down its traffic is redirected to the other; 0 disables both breakers |
 | `PASTURE_INJECT_CONTEXT` | _(off)_ | prepend a system message with the current date and OS — boosts lightweight models as PC assistants |
 | `PASTURE_SYSTEM_PROMPT` | _(off)_ | system prompt prepended to every proxied request |

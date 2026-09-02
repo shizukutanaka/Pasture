@@ -1749,12 +1749,15 @@ fn run_label(config: &Config, rest: &[String]) -> i32 {
     }
     println!("\nWrote {written} label(s) to {out_path}.");
     if unscored > 0 {
-        // The default local backend is Ollama, which does not return logprobs,
-        // so this is the common case rather than an edge case. Be explicit.
+        // ADR-273: Ollama reports logprobs since 2025-11 (PR #12899) and
+        // Pasture now asks for them, so the common cause of "no logprob" is an
+        // older Ollama, not the backend choice. Name the upgrade before
+        // suggesting a switch.
         eprintln!(
             "{unscored} answer(s) had no logprob and were skipped. `calibrate --auroc`/`--error` \
-score confidence, so they need a backend that returns logprobs — set \
-PASTURE_LOCAL_BACKEND to an OpenAI-compatible server (LM Studio, llama.cpp, vLLM)."
+score confidence, so they need a backend that returns logprobs. Ollama does since \
+2025-11 — check `ollama --version` and upgrade — or set PASTURE_LOCAL_BACKEND to an \
+OpenAI-compatible server that reports them (LM Studio, llama.cpp, vLLM)."
         );
     }
     if written > 0 {

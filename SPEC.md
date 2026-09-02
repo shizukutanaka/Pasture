@@ -382,6 +382,9 @@ false negative = data leak (unacceptable).
   escalate to cloud only when the local mean-logprob `< PASTURE_CASCADE_LOGPROB`
   (else a text heuristic). Never for sensitive content; never for streaming; on cloud
   failure (after retries, §6) it keeps the local answer.
+  Ollama reports per-token logprobs on `/api/chat` since PR #12899 (2025-11-11) and
+  Pasture requests them on scored calls (ADR-273); an older Ollama ignores the flag and
+  the text heuristic in `cascade::is_low_confidence` applies instead.
 - **Cache** (`PASTURE_CACHE=<n>`, opt-in): exact-match on hash(model + messages),
   bounded FIFO. Hits skip the backend (`x_pasture_route:"cache"`, cost 0). Never
   caches sensitive prompts (I2). Applies to both buffered and `stream:true` requests
