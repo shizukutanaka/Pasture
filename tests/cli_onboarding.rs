@@ -174,3 +174,94 @@ fn hw_never_reports_zero_mb_of_ram() {
         "0 MB is the bug ADR-261 fixed, not a hardware reading: {text}"
     );
 }
+
+/// A one-shot std-only HTTP stub speaking just enough Ollama to drive `doctor`:
+/// `/api/tags` (reachability + model list) and `/api/version` (ADR-274). No
+/// python, no crates — it is a thread and a `TcpListener`.
+fn fake_ollama(version: &str, model: &str) -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let version = version.to_string();
+    let model = model.to_string();
+    let handle = std::thread::spawn(move || {
+        // doctor makes two GETs per run; serve a bounded number then exit so
+        // the thread can never outlive the test.
+        for _ in 0..8 {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = if req.contains("/api/version") {
+                format!("{{\"version\":\"{version}\"}}")
+            } else {
+                format!("{{\"models\":[{{\"name\":\"{model}\"}}]}}")
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        }
+    });
+    (port, handle)
+}
+
+/// The problem count and the `[!!]` markers must agree (ADR-274).
+///
+/// `doctor` ends with "N item(s) need attention (see [!!] above)". The catalog
+/// splits markers by meaning — `[!!]` is a counted defect, `[--]` is
+/// information that is never counted. ADR-274 initially incremented the
+/// counter while printing a `[--]` line, so `doctor` reported one item needing
+/// attention with no `[!!]` on screen at all.
+///
+/// Asserted on the real binary's real output, because that is where the
+/// invariant lives: a source-scan version of this test passed the very
+/// mutation it existed to catch, since a neighbouring `[!!]` message sat
+/// inside its window.
+#[test]
+fn doctor_problem_count_matches_the_bang_markers() {
+    let cases = [
+        // (ollama version, cascade on) — the ADR-274 branch both ways, plus
+        // the bare machine, which exercises the pre-existing counted lines.
+        ("0.12.11", false),
+        ("0.12.10", false),
+        ("0.12.10", true),
+    ];
+    for (version, cascade) in cases {
+        let (port, handle) = fake_ollama(version, "llama3.2:latest");
+        let p = port.to_string();
+        let mut env: Vec<(&str, &str)> = vec![
+            ("PASTURE_OLLAMA_PORT", &p),
+            ("PASTURE_LOCAL_MODEL", "llama3.2"),
+        ];
+        if cascade {
+            env.push(("PASTURE_CASCADE", "1"));
+        }
+        let out = run("doctor-markers", &["doctor"], &env);
+        let text = stdout(&out);
+        // The summary line itself reads "(see [!!] above)", so exclude it or
+        // it counts as one of the very markers it is describing.
+        let bangs = text
+            .lines()
+            .filter(|l| l.contains("[!!]") && !l.contains("need attention"))
+            .count();
+        let claimed: usize = text
+            .lines()
+            .find_map(|l| {
+                l.split_whitespace()
+                    .next()
+                    .and_then(|w| w.parse().ok())
+                    .filter(|_| l.contains("need attention"))
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            claimed, bangs,
+            "ollama {version}, cascade={cascade}: doctor claims {claimed} item(s) need \
+attention but printed {bangs} [!!] line(s).\n{text}"
+        );
+        drop(handle);
+    }
+}

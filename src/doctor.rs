@@ -62,6 +62,39 @@ pub fn probe_ollama(host: &str, port: u16) -> OllamaStatus {
     }
 }
 
+/// The first Ollama release that reports per-token logprobs on `/api/chat`
+/// (v0.12.11, published 2025-11-12, PR #12899). Below this, `"logprobs":true`
+/// is silently ignored and the cascade falls back to its text heuristic.
+pub const OLLAMA_LOGPROBS_MIN: (u64, u64, u64) = (0, 12, 11);
+
+/// Ask a running Ollama for its version via `GET /api/version`
+/// (`{"version":"0.12.11"}`). `None` when unreachable or unparsable.
+pub fn probe_ollama_version(host: &str, port: u16) -> Option<String> {
+    tcp_get(host, port, "/api/version", Duration::from_secs(2)).and_then(|b| parse_version(&b))
+}
+
+/// Extract the `version` string from an `/api/version` body.
+pub fn parse_version(body: &str) -> Option<String> {
+    let v = crate::json::parse(body).ok()?;
+    v.get("version")?.as_str().map(|s| s.trim().to_string())
+}
+
+/// Parse `"0.12.11"`, `"v0.12.11"`, or `"0.13.0-rc2"` into (major, minor,
+/// patch). Pre-release suffixes are dropped: an rc of 0.12.11 already carries
+/// the feature. Anything that does not start with three numbers is `None`.
+pub fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next()?;
+    let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
+    Some((it.next()??, it.next()??, it.next()??))
+}
+
+/// Whether an Ollama version string reports logprobs. `None` when the version
+/// cannot be parsed - say "unknown", never guess.
+pub fn ollama_supports_logprobs(version: &str) -> Option<bool> {
+    parse_semver(version).map(|v| v >= OLLAMA_LOGPROBS_MIN)
+}
+
 /// Split an OpenAI-style base URL into (host, port, base_path).
 /// e.g. "http://127.0.0.1:1234/v1" -> ("127.0.0.1", 1234, "/v1").
 /// Missing port defaults to 1234 (LM Studio's default).
@@ -245,6 +278,44 @@ mod tests {
         assert!(!on_path("definitely-not-a-real-binary-xyzzy"));
     }
     use super::*;
+
+    #[test]
+    fn test_parse_version_reads_ollama_shape() {
+        // routes.go: r.GET("/api/version", ...) -> {"version": version.Version}
+        assert_eq!(
+            parse_version(r#"{"version":"0.12.11"}"#).as_deref(),
+            Some("0.12.11")
+        );
+        assert_eq!(
+            parse_version(r#"{"version":" v0.13.0-rc2 "}"#).as_deref(),
+            Some("v0.13.0-rc2")
+        );
+        assert_eq!(parse_version("{}"), None);
+        assert_eq!(parse_version("not json"), None);
+    }
+
+    #[test]
+    fn test_parse_semver_tolerates_prefix_and_prerelease() {
+        assert_eq!(parse_semver("0.12.11"), Some((0, 12, 11)));
+        assert_eq!(parse_semver("v0.12.11"), Some((0, 12, 11)));
+        assert_eq!(parse_semver("0.12.11-rc0"), Some((0, 12, 11)));
+        assert_eq!(parse_semver("0.33.2+build.7"), Some((0, 33, 2)));
+        assert_eq!(parse_semver("0.12"), None);
+        assert_eq!(parse_semver("dev"), None);
+        assert_eq!(parse_semver(""), None);
+    }
+
+    #[test]
+    fn test_ollama_supports_logprobs_boundary() {
+        // v0.12.11 (2025-11-12) is the first release with PR #12899.
+        assert_eq!(ollama_supports_logprobs("0.12.10"), Some(false));
+        assert_eq!(ollama_supports_logprobs("0.12.11"), Some(true));
+        assert_eq!(ollama_supports_logprobs("0.12.11-rc0"), Some(true));
+        assert_eq!(ollama_supports_logprobs("0.13.0"), Some(true));
+        assert_eq!(ollama_supports_logprobs("1.0.0"), Some(true));
+        assert_eq!(ollama_supports_logprobs("0.9.99"), Some(false));
+        assert_eq!(ollama_supports_logprobs("garbage"), None);
+    }
 
     #[test]
     fn test_parse_model_names() {

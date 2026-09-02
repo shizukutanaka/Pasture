@@ -54,8 +54,8 @@ pub fn is_low_confidence(answer: &str) -> bool {
 /// research-backed mean token log-probability signal when the backend provides
 /// it (arXiv 2605.02241: average log-prob matches or beats supervised routers
 /// for local->cloud routing, with no training data). When unavailable (a
-/// backend that does not report logprobs, or an Ollama build older than
-/// 2025-11 — see ADR-273), falls back to the text heuristic.
+/// backend that does not report logprobs, or an Ollama older than v0.12.11
+/// — see ADR-273), falls back to the text heuristic.
 ///
 /// `mean_logprob` is <= 0; escalate when it drops below `logprob_threshold`.
 ///

@@ -382,7 +382,7 @@ false negative = data leak (unacceptable).
   escalate to cloud only when the local mean-logprob `< PASTURE_CASCADE_LOGPROB`
   (else a text heuristic). Never for sensitive content; never for streaming; on cloud
   failure (after retries, §6) it keeps the local answer.
-  Ollama reports per-token logprobs on `/api/chat` since PR #12899 (2025-11-11) and
+  Ollama reports per-token logprobs on `/api/chat` from v0.12.11 (2025-11-12, PR #12899) and
   Pasture requests them on scored calls (ADR-273); an older Ollama ignores the flag and
   the text heuristic in `cascade::is_low_confidence` applies instead.
 - **Cache** (`PASTURE_CACHE=<n>`, opt-in): exact-match on hash(model + messages),

@@ -494,7 +494,7 @@ impl OllamaBackend {
 
     /// Build the `/api/chat` body asking Ollama to return per-token log
     /// probabilities (ADR-273). Ollama has honoured `"logprobs": true` since
-    /// PR #12899 (2025-11-11); older builds ignore the unknown field and simply
+    /// v0.12.11 (2025-11-12, PR #12899); older builds ignore the unknown field and simply
     /// omit `logprobs` from the response, which `parse_mean_logprob` reads as
     /// `None` — the pre-existing text-heuristic fallback. Only `complete_scored`
     /// sends it; plain and streaming bodies are byte-identical to before.
@@ -546,7 +546,7 @@ impl OllamaBackend {
     /// (ADR-273). Ollama's wire shape (api/types.go `ChatResponse.Logprobs`)
     /// is a top-level array: `"logprobs":[{"token":"Par","logprob":-0.05,
     /// "bytes":[80,97,114],"top_logprobs":[…]},…]`. Returns `None` when the
-    /// field is absent (Ollama older than 2025-11, or a runner that omits it)
+    /// field is absent (Ollama older than v0.12.11, or a runner that omits it)
     /// or carries no finite values, so callers fall back to the text heuristic
     /// exactly as before. Mirrors `cloud::mean_logprob_from_openai`, which
     /// reads the same signal in OpenAI shape.
@@ -628,7 +628,7 @@ impl Backend for OllamaBackend {
     /// (`None`), so the cascade fell back to a text heuristic that ADR-272
     /// measured as no better than a constant `false`, and `pasture label`
     /// skipped every answer as unscored — while Ollama had been reporting the
-    /// signal since 2025-11. Same shape as `complete`; only the body differs.
+    /// signal since v0.12.11 (2025-11-12). Same shape as `complete`; only the body differs.
     fn complete_scored(
         &self,
         req: &CompletionRequest,
@@ -1253,7 +1253,7 @@ mod tests {
 
     #[test]
     fn test_ollama_parse_mean_logprob_absent_is_none() {
-        // Ollama older than 2025-11 ignores the request flag and omits the
+        // Ollama older than v0.12.11 ignores the request flag and omits the
         // field entirely; that must read as "no signal", not as an error.
         let body = r#"{"message":{"role":"assistant","content":"Paris"},"done":true}"#;
         assert_eq!(OllamaBackend::parse_mean_logprob(body), None);

@@ -988,6 +988,38 @@ fn run_doctor(config: &Config) -> i32 {
                 )
             );
             print_doctor_models(lang, &s.models);
+            // ADR-274: since ADR-273 the difference between a cascade that
+            // scores confidence and one that falls back to a text heuristic
+            // is the Ollama build. Say which side the user is on, from
+            // Ollama's own /api/version, against a verified threshold.
+            if let Some(v) =
+                crate::doctor::probe_ollama_version(&config.ollama_host, config.ollama_port)
+            {
+                match crate::doctor::ollama_supports_logprobs(&v) {
+                    Some(true) => println!(
+                        "{}",
+                        tf(lang, "doctor.ollama.version.ok", &[("version", &v)])
+                    ),
+                    Some(false) => {
+                        // Only a problem when something actually consumes the
+                        // signal; otherwise it is information. The marker must
+                        // match: `doctor.problems` tells the user to look for
+                        // [!!], and every other counted line uses it, while
+                        // [--] lines (cloud.off, hw.unknown) are never counted.
+                        // Counting a [--] line sent the user hunting for a
+                        // marker that was not on screen.
+                        let key = if config.cascade {
+                            problems += 1;
+                            "doctor.ollama.version.stale"
+                        } else {
+                            "doctor.ollama.version.old"
+                        };
+                        println!("{}", tf(lang, key, &[("version", &v)]));
+                        println!("{}", t(lang, "doctor.ollama.version.old.fix"));
+                    }
+                    None => {}
+                }
+            }
         } else {
             problems += 1;
             println!(
@@ -1749,15 +1781,15 @@ fn run_label(config: &Config, rest: &[String]) -> i32 {
     }
     println!("\nWrote {written} label(s) to {out_path}.");
     if unscored > 0 {
-        // ADR-273: Ollama reports logprobs since 2025-11 (PR #12899) and
+        // ADR-273: Ollama reports logprobs from v0.12.11 (2025-11-12, PR #12899) and
         // Pasture now asks for them, so the common cause of "no logprob" is an
         // older Ollama, not the backend choice. Name the upgrade before
         // suggesting a switch.
         eprintln!(
             "{unscored} answer(s) had no logprob and were skipped. `calibrate --auroc`/`--error` \
-score confidence, so they need a backend that returns logprobs. Ollama does since \
-2025-11 — check `ollama --version` and upgrade — or set PASTURE_LOCAL_BACKEND to an \
-OpenAI-compatible server that reports them (LM Studio, llama.cpp, vLLM)."
+score confidence, so they need a backend that returns logprobs. Ollama does from \
+v0.12.11 (2025-11-12) — check `ollama --version` and upgrade — or set PASTURE_LOCAL_BACKEND \
+to an OpenAI-compatible server that reports them (LM Studio, llama.cpp, vLLM)."
         );
     }
     if written > 0 {
@@ -2305,6 +2337,64 @@ mod tests {
     /// ADR-267: `up` must distinguish "no `ollama` command" from "it did not
     /// start". Before this, both printed the install advice, so a user whose
     /// Ollama was installed-but-wedged was told to install it again.
+    /// Every `doctor` line that counts as a problem must carry the `[!!]`
+    /// marker (ADR-274).
+    ///
+    /// `doctor.problems` ends the report with "N item(s) need attention (see
+    /// [!!] above)", and the catalog splits markers by meaning: `[!!]` is a
+    /// defect, `[--]` is information that is never counted (`cloud.off`,
+    /// `local_only`, `hw.unknown`). ADR-274 broke that by incrementing
+    /// `problems` while printing a `[--]` line, so `pasture doctor` reported
+    /// "1 item(s) need attention" with no `[!!]` anywhere on screen — the user
+    /// was sent hunting for a marker that was not there.
+    ///
+    /// Derives both halves from the source: the `problems += 1` sites in this
+    /// file and the message bodies in the catalog. A new counted line with the
+    /// wrong marker fails here without anyone remembering to check.
+    #[test]
+    fn test_counted_doctor_lines_use_the_bang_marker() {
+        let src = include_str!("cli.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut checked = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim().starts_with("problems += 1") {
+                continue;
+            }
+            // Keys can be printed just before or just after the increment.
+            let lo = i.saturating_sub(12);
+            let hi = (i + 20).min(lines.len());
+            let window = lines[lo..hi].join("\n");
+            let keys: Vec<&str> = window
+                .match_indices("\"doctor.")
+                .filter_map(|(at, _)| {
+                    let rest = &window[at + 1..];
+                    rest.find('"').map(|end| &rest[..end])
+                })
+                .filter(|k| !k.ends_with(".fix") && !k.ends_with(".ok"))
+                .collect();
+            assert!(
+                !keys.is_empty(),
+                "cli.rs:{}: a `problems += 1` with no doctor.* message nearby — \
+the scraper window may need widening, or the line prints nothing",
+                i + 1
+            );
+            let has_bang = keys
+                .iter()
+                .any(|k| crate::i18n::t(crate::i18n::Lang::En, k).starts_with("[!!]"));
+            assert!(
+                has_bang,
+                "cli.rs:{}: this line counts a problem but none of its messages {keys:?} \
+start with [!!]; `doctor.problems` tells the user to look for [!!]",
+                i + 1
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 7,
+            "expected 7 problem-counting sites; the scraper or the code changed"
+        );
+    }
+
     /// Every command USAGE advertises must actually dispatch (ADR-272).
     ///
     /// ADR-271 deleted the token-threshold sweep and updated README.md and

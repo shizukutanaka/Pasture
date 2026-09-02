@@ -77,7 +77,7 @@ performance-first, minimal-dependency philosophy (Carmack / Pike).
   falls back to the local answer rather than erroring. Future (IMP-2): replace
   heuristics with calibrated confidence.
   *Update (ADR-273):* the mean-logprob signal now reaches the default Ollama backend
-  too — Ollama has reported logprobs since 2025-11 and `OllamaBackend::complete_scored`
+  too — Ollama has reported logprobs since v0.12.11 (2025-11-12) and `OllamaBackend::complete_scored`
   asks for them; the v0 heuristic remains only as the fallback for older builds.
 - **ADR-012 Evaluation harness (IMP-5).** Routing quality is measured, not
   asserted: a labelled set checks correctness (regression) and a threshold
