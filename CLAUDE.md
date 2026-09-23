@@ -67,7 +67,7 @@ One improvement = one commit. For each:
 6. **Gate + commit + push:**
    ```
    rustup run stable cargo fmt
-   rustup run stable cargo test          # 939+ pass, 0 fail
+   rustup run stable cargo test          # 950+ pass, 0 fail
    rustup run stable cargo clippy --all-targets   # no NEW warnings
    git add -A && git commit && git push -u origin <branch>
    ```

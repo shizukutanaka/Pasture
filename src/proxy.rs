@@ -669,13 +669,13 @@ impl Proxy {
             || path.starts_with("/v1/models")
             || path.starts_with("/v1/engines")
         {
-            Some("GET, OPTIONS")
+            Some("GET, HEAD, OPTIONS")
         } else if path.starts_with("/health") {
             Some("GET, HEAD")
         } else if path == "/dashboard" || path == "/" {
             // Embedded dashboard (IMP-36): GET-only. Exact match — the caller
             // passes the query-stripped path, and "/" must not match every route.
-            Some("GET")
+            Some("GET, HEAD")
         } else if path.starts_with("/v1/audio") || path.starts_with("/v1/images") {
             // Recognised but not implemented; allow POST so the 405 vs 501 distinction is correct.
             Some("POST, OPTIONS")
@@ -2964,7 +2964,16 @@ impl Proxy {
             );
         }
         let payload = build_error_response(message, "invalid_request_error");
-        write_response(stream, status, &payload, &extra, false)
+        let head_only = method == "HEAD";
+        write_typed(
+            stream,
+            status,
+            "application/json",
+            &payload,
+            &extra,
+            false,
+            head_only,
+        )
     }
 
     fn handle_connection(&self, stream: &mut std::net::TcpStream) -> std::io::Result<()> {
@@ -3040,6 +3049,10 @@ impl Proxy {
             let norm_path = path.split('?').next().unwrap_or(&path);
             // Local macros log and write each response (IMP-access-log). Using
             // macros (not closures) so `stream` can be borrowed mutably in the body.
+            // HEAD (RFC 9110 §9.1/§9.3.2, ADR-280): served by the GET branch with
+            // GET's header fields and no content. Bound here, before the macros,
+            // because macro_rules resolves locals at the definition site.
+            let head_only = method == "HEAD";
             macro_rules! access_log {
                 ($s:expr) => {
                     if let Some(ref log_path) = self.access_log {
@@ -3057,25 +3070,35 @@ impl Proxy {
             macro_rules! wr {
                 ($s:expr, $b:expr, $e:expr, $ka:expr) => {{
                     access_log!($s);
-                    write_response(stream, $s, $b, $e, $ka)?;
+                    write_typed(stream, $s, "application/json", $b, $e, $ka, head_only)?;
                 }};
             }
             macro_rules! wrp {
                 ($b:expr, $e:expr, $ka:expr) => {{
                     access_log!(200u16);
-                    write_plain_response(stream, $b, $e, $ka)?;
-                }};
-            }
-            macro_rules! wrh {
-                ($s:expr, $l:expr, $e:expr, $ka:expr) => {{
-                    access_log!($s);
-                    write_head_response(stream, $s, $l, $e, $ka)?;
+                    write_typed(
+                        stream,
+                        200,
+                        "text/plain; version=0.0.4",
+                        $b,
+                        $e,
+                        $ka,
+                        head_only,
+                    )?;
                 }};
             }
             macro_rules! wrhtml {
                 ($b:expr, $e:expr, $ka:expr) => {{
                     access_log!(200u16);
-                    write_html_response(stream, $b, $e, $ka)?;
+                    write_typed(
+                        stream,
+                        200,
+                        "text/html; charset=utf-8",
+                        $b,
+                        $e,
+                        $ka,
+                        head_only,
+                    )?;
                 }};
             }
             // Handler error: write the OpenAI error envelope and close.
@@ -3122,6 +3145,9 @@ impl Proxy {
                 }
                 continue;
             }
+            // Dispatch HEAD as GET (ADR-280). Shadowed *after* the macros so
+            // access_log! still records the method the client actually sent.
+            let method: &str = if head_only { "GET" } else { &method };
             // Auth + rate-limit gating (IMP-15); /health is exempt. A 429 carries
             // a Retry-After header (RFC 7231 §7.1.3) so clients back off precisely.
             if let Some((status, msg, kind, retry_after)) = self.check_gate(&path, auth.as_deref())
@@ -3138,12 +3164,14 @@ impl Proxy {
                     _ => None,
                 };
                 access_log!(status);
-                write_response(
+                write_typed(
                     stream,
                     status,
+                    "application/json",
                     &build_error_response_coded(msg, kind, code),
                     &gate_extra,
                     false,
+                    head_only,
                 )?;
                 return Ok(());
             }
@@ -3253,19 +3281,15 @@ impl Proxy {
                 } else {
                     wr!(200, &build_models_response(&self.models), &te(), keep_alive);
                 }
-            } else if (method == "GET" || method == "HEAD") && path.starts_with("/health") {
-                // HEAD: identical headers to GET but no body (RFC 7231 §4.3.2).
+            } else if method == "GET" && path.starts_with("/health") {
+                // HEAD reaches here as GET and is answered body-less by wr! (ADR-280).
                 // Include the version so health-check scripts can detect mismatched deploys.
                 const HEALTH_BODY: &str = concat!(
                     "{\"status\":\"ok\",\"version\":\"",
                     env!("CARGO_PKG_VERSION"),
                     "\"}"
                 );
-                if method == "HEAD" {
-                    wrh!(200, HEALTH_BODY.len(), &te(), keep_alive);
-                } else {
-                    wr!(200, HEALTH_BODY, &te(), keep_alive);
-                }
+                wr!(200, HEALTH_BODY, &te(), keep_alive);
             } else if method == "GET" && (norm_path == "/dashboard" || norm_path == "/") {
                 // Embedded web dashboard (IMP-36/ADR-235): a static HTML shell
                 // that polls GET /v1/stats client-side. Match on the query-
@@ -3296,12 +3320,14 @@ impl Proxy {
                 // Known path, wrong method → 405 with Allow header (RFC 7231 §6.5.5).
                 let method_extra = format!("Allow: {allow}\r\n{}", te());
                 access_log!(405u16);
-                write_response(
+                write_typed(
                     stream,
                     405,
+                    "application/json",
                     &build_error_response("method not allowed", "invalid_request_error"),
                     &method_extra,
                     false,
+                    head_only,
                 )?;
                 return Ok(());
             } else {
