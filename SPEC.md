@@ -422,6 +422,11 @@ false negative = data leak (unacceptable).
   timeout (`PASTURE_REQUEST_TIMEOUT`, default 30s; 0 disables) so a slow/dead client
   cannot pin a worker (slow-loris). A read that times out before the request completes
   yields `408`.
+- **Rejections are ordinary responses (ADR-277).** A `413` or `408` MUST carry the
+  same header block as any served response — `X-Request-ID` (the caller's, or a minted
+  one), CORS headers for an allowed `Origin`, `Server`, `X-Response-Time` — and MUST
+  be written to `PASTURE_ACCESS_LOG` like any other request. When a timeout fires
+  before the header block is complete, method and path are logged as `-`.
 - **Auth (opt-in, IMP-15).** When `PASTURE_AUTH_TOKEN` is set, every `/v1/*` request
   MUST carry `Authorization: Bearer <token>` (compared in constant time); a missing or
   wrong token yields `401`. `/health` is exempt. Default (unset) = no auth, matching the

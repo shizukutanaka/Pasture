@@ -2904,6 +2904,68 @@ impl Proxy {
         Ok(())
     }
 
+    /// The header block every response carries (ADR-277: shared with
+    /// `reject_early` so rejected requests cannot drift from served ones).
+    /// CORS headers so a browser can read the response; X-Request-ID so the
+    /// caller can correlate it; X-RateLimit-* so clients self-throttle (empty
+    /// when the limiter is disabled — the localhost default; snapshotted
+    /// before the gate consumes a token, so `remaining` includes the in-flight
+    /// request); and a Server header identifying the proxy + version (peer
+    /// parity: nginx, LiteLLM, Ollama all send one).
+    fn response_extra(&self, origin: Option<&str>, request_id: Option<&str>) -> String {
+        const SERVER_HDR: &str = concat!("Server: pasture/", env!("CARGO_PKG_VERSION"), "\r\n");
+        let cors = self.cors_headers(origin);
+        let req_id_hdr = request_id
+            .map(|id| format!("X-Request-ID: {id}\r\n"))
+            .unwrap_or_default();
+        let rl_hdr = self.ratelimit_headers();
+        format!("{cors}{req_id_hdr}{rl_hdr}{SERVER_HDR}")
+    }
+
+    /// Answer a request rejected before dispatch — 413 (body too large) or 408
+    /// (read timed out) — and close the connection (ADR-277).
+    ///
+    /// These used to be written from an early return with no extra headers
+    /// and no access-log line. For a 413 the headers had already been parsed,
+    /// so the method, path, Origin and caller's X-Request-ID were known and
+    /// dropped: a browser client got an unreadable opaque error (no CORS), and
+    /// an operator got no trace id and no log line — the two responses most
+    /// likely to indicate abuse were the two you could not see. `head` is
+    /// `None` only for a timeout before the header block completed; then the
+    /// id is minted and the log records "-" for method and path.
+    fn reject_early(
+        &self,
+        stream: &mut std::net::TcpStream,
+        status: u16,
+        message: &str,
+        head: Option<RejectedHead>,
+    ) -> std::io::Result<()> {
+        let t0 = std::time::Instant::now();
+        let (method, path, origin, request_id) = match head {
+            Some(h) => (h.method, h.path, h.origin, h.request_id),
+            None => ("-".to_string(), "-".to_string(), None, None),
+        };
+        let request_id = request_id.unwrap_or_else(next_request_id);
+        let extra = format!(
+            "{}X-Response-Time: {}ms\r\n",
+            self.response_extra(origin.as_deref(), Some(&request_id)),
+            t0.elapsed().as_millis()
+        );
+        if let Some(ref log_path) = self.access_log {
+            let norm_path = path.split('?').next().unwrap_or(&path);
+            append_access_log(
+                log_path,
+                &method,
+                norm_path,
+                status,
+                t0.elapsed().as_millis(),
+                Some(&request_id),
+            );
+        }
+        let payload = build_error_response(message, "invalid_request_error");
+        write_response(stream, status, &payload, &extra, false)
+    }
+
     fn handle_connection(&self, stream: &mut std::net::TcpStream) -> std::io::Result<()> {
         // Bound how long a slow/dead client can hold a worker (slow-loris guard).
         if let Some(d) = self.io_timeout {
@@ -2937,38 +2999,23 @@ impl Proxy {
                         request_id,
                         content_type,
                     ),
-                    ReadOutcome::TooLarge => {
-                        let payload =
-                            build_error_response("request body too large", "invalid_request_error");
-                        write_response(stream, 413, &payload, "", false)?;
-                        return Ok(());
+                    ReadOutcome::TooLarge { head } => {
+                        return self.reject_early(
+                            stream,
+                            413,
+                            "request body too large",
+                            Some(head),
+                        );
                     }
-                    ReadOutcome::TimedOut => {
-                        let payload =
-                            build_error_response("request timed out", "invalid_request_error");
-                        write_response(stream, 408, &payload, "", false)?;
-                        return Ok(());
+                    ReadOutcome::TimedOut { head } => {
+                        return self.reject_early(stream, 408, "request timed out", head);
                     }
                     ReadOutcome::Closed => return Ok(()), // normal EOF / graceful close
                 };
             // Every response is traceable: echo the caller's X-Request-ID, or mint
             // one server-side when absent (OpenAI/LiteLLM always return x-request-id).
             let request_id = Some(request_id.unwrap_or_else(next_request_id));
-            // CORS headers reflected on every response so the browser can read it.
-            let cors = self.cors_headers(origin.as_deref());
-            // Echo X-Request-ID back to the caller so clients can correlate responses.
-            let req_id_hdr = request_id
-                .as_ref()
-                .map(|id| format!("X-Request-ID: {id}\r\n"))
-                .unwrap_or_default();
-            // X-RateLimit-* headers so clients self-throttle (empty when the
-            // limiter is disabled — the localhost default). Snapshotted before the
-            // gate consumes a token, so `remaining` includes the in-flight request.
-            let rl_hdr = self.ratelimit_headers();
-            // Server header identifies the proxy + version (peer parity: nginx,
-            // LiteLLM, Ollama all send one); compile-time constant.
-            const SERVER_HDR: &str = concat!("Server: pasture/", env!("CARGO_PKG_VERSION"), "\r\n");
-            let extra = format!("{cors}{req_id_hdr}{rl_hdr}{SERVER_HDR}");
+            let extra = self.response_extra(origin.as_deref(), request_id.as_deref());
             // Append X-Response-Time (elapsed ms) to every response's header block.
             // Timing begins after request parsing, just before dispatch, so it covers
             // routing + backend time but not TCP accept or header reading.

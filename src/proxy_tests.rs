@@ -647,6 +647,125 @@ fn test_roundtrip_bad_json_is_400_envelope() {
     );
 }
 
+fn tmp_access_log(tag: &str) -> String {
+    let p = std::env::temp_dir().join(format!("pasture_access_{tag}_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p.to_string_lossy().into_owned()
+}
+
+#[test]
+fn test_413_is_traceable_cors_readable_and_access_logged() {
+    // ADR-277: the 413 was written from an early return in handle_connection,
+    // before the request id, CORS and Server headers or the access-log macro
+    // existed. The headers were already parsed (http.rs rejects on
+    // Content-Length after reading them), so method, path, origin and the
+    // caller's X-Request-ID were known and discarded. A browser client got an
+    // unreadable opaque error; an operator got no log line and no trace id.
+    let access = tmp_access_log("413");
+    let p = proxy_with(true, false, 100, "unused")
+        .with_max_body_bytes(100)
+        .with_cors(CorsPolicy::parse("https://ok.com"))
+        .with_access_log(Some(access.clone()));
+    let resp = roundtrip_raw(
+        p,
+        "POST /v1/chat/completions?x=1 HTTP/1.1\r\nHost: x\r\nOrigin: https://ok.com\r\n\
+X-Request-ID: trace-413\r\nContent-Type: application/json\r\nContent-Length: 101\r\n\r\n"
+            .to_string(),
+    );
+    assert!(resp.starts_with("HTTP/1.1 413 "), "{resp}");
+    assert!(resp.contains("X-Request-ID: trace-413\r\n"), "{resp}");
+    assert!(
+        resp.contains("Access-Control-Allow-Origin: https://ok.com\r\n"),
+        "{resp}"
+    );
+    assert!(resp.contains("Server: pasture/"), "{resp}");
+    let log = std::fs::read_to_string(&access).unwrap_or_default();
+    assert!(
+        log.contains("\"method\":\"POST\"")
+            && log.contains("\"path\":\"/v1/chat/completions\"")
+            && log.contains("\"status\":413")
+            && log.contains("\"request_id\":\"trace-413\""),
+        "413 must be access-logged with its method, path and trace id: {log:?}"
+    );
+    let _ = std::fs::remove_file(&access);
+}
+
+#[test]
+fn test_408_mid_body_is_traceable_and_access_logged() {
+    // Headers complete, body never arrives: method/path/trace id are known.
+    let access = tmp_access_log("408body");
+    let p = proxy_with(true, false, 100, "unused")
+        .with_request_timeout(Some(std::time::Duration::from_millis(50)))
+        .with_access_log(Some(access.clone()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(addr).unwrap();
+        c.write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nX-Request-ID: trace-408\r\n\
+Content-Type: application/json\r\nContent-Length: 50\r\n\r\n{\"partial\":",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut resp = String::new();
+        let _ = c.read_to_string(&mut resp);
+        resp
+    });
+    let (mut s, _) = listener.accept().unwrap();
+    p.handle_connection(&mut s).unwrap();
+    drop(s);
+    let resp = client.join().unwrap();
+    assert!(resp.starts_with("HTTP/1.1 408 "), "{resp}");
+    assert!(resp.contains("X-Request-ID: trace-408\r\n"), "{resp}");
+    assert!(resp.contains("Server: pasture/"), "{resp}");
+    let log = std::fs::read_to_string(&access).unwrap_or_default();
+    assert!(
+        log.contains("\"path\":\"/v1/chat/completions\"")
+            && log.contains("\"status\":408")
+            && log.contains("\"request_id\":\"trace-408\""),
+        "{log:?}"
+    );
+    let _ = std::fs::remove_file(&access);
+}
+
+#[test]
+fn test_408_before_headers_still_gets_a_trace_id_and_log_line() {
+    // Headers never terminate, so nothing about the request is known. The
+    // response must still carry a minted X-Request-ID and the Server header,
+    // and the log line uses "-" for the unknown method/path (the common-log
+    // convention) rather than being skipped.
+    let access = tmp_access_log("408head");
+    let p = proxy_with(true, false, 100, "unused")
+        .with_request_timeout(Some(std::time::Duration::from_millis(50)))
+        .with_access_log(Some(access.clone()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(addr).unwrap();
+        c.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut resp = String::new();
+        let _ = c.read_to_string(&mut resp);
+        resp
+    });
+    let (mut s, _) = listener.accept().unwrap();
+    p.handle_connection(&mut s).unwrap();
+    drop(s);
+    let resp = client.join().unwrap();
+    assert!(resp.starts_with("HTTP/1.1 408 "), "{resp}");
+    assert!(resp.contains("X-Request-ID: req_"), "{resp}");
+    assert!(resp.contains("Server: pasture/"), "{resp}");
+    let log = std::fs::read_to_string(&access).unwrap_or_default();
+    assert!(
+        log.contains("\"method\":\"-\"")
+            && log.contains("\"path\":\"-\"")
+            && log.contains("\"status\":408"),
+        "{log:?}"
+    );
+    let _ = std::fs::remove_file(&access);
+}
+
 #[test]
 fn test_roundtrip_oversized_body_is_413() {
     let p = proxy_with(true, true, 100, "unused");

@@ -44,12 +44,24 @@ pub(crate) enum ReadOutcome {
         /// return 415 Unsupported Media Type for non-JSON POST bodies.
         content_type: Option<String>,
     },
-    /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413.
-    TooLarge,
+    /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413. Always
+    /// raised after the header block was parsed, so its head is known.
+    TooLarge { head: RejectedHead },
     /// A socket read timed out before the request completed → 408 (IMP-timeout).
-    TimedOut,
+    /// `head` is `None` when the timeout hit before the headers were complete.
+    TimedOut { head: Option<RejectedHead> },
     /// Connection closed early or headers were malformed/oversized → 400.
     Closed,
+}
+
+/// What was already parsed when a request was rejected before dispatch
+/// (ADR-277), so the 413/408 can carry the same trace id, CORS headers and
+/// access-log line as every other response instead of being anonymous.
+pub(crate) struct RejectedHead {
+    pub method: String,
+    pub path: String,
+    pub origin: Option<String>,
+    pub request_id: Option<String>,
 }
 
 /// True for an I/O error that means "no data within the read timeout window".
@@ -76,7 +88,7 @@ pub(crate) fn read_request(
         }
         let n = match stream.read(&mut chunk) {
             Ok(n) => n,
-            Err(e) if is_timeout(&e) => return Ok(ReadOutcome::TimedOut),
+            Err(e) if is_timeout(&e) => return Ok(ReadOutcome::TimedOut { head: None }),
             Err(e) => return Err(e),
         };
         if n == 0 {
@@ -144,9 +156,16 @@ pub(crate) fn read_request(
         }
     }
 
+    let head = || RejectedHead {
+        method: method.clone(),
+        path: path.clone(),
+        origin: origin.clone(),
+        request_id: request_id.clone(),
+    };
+
     // Reject oversized bodies before reading them (DoS guard, SPEC §7).
     if content_length > max_body_bytes {
-        return Ok(ReadOutcome::TooLarge);
+        return Ok(ReadOutcome::TooLarge { head: head() });
     }
 
     // The body starts right after the \r\n\r\n. bytes already in conn_buf
@@ -158,7 +177,7 @@ pub(crate) fn read_request(
     while conn_buf.len() < body_end {
         let n = match stream.read(&mut chunk) {
             Ok(n) => n,
-            Err(e) if is_timeout(&e) => return Ok(ReadOutcome::TimedOut),
+            Err(e) if is_timeout(&e) => return Ok(ReadOutcome::TimedOut { head: Some(head()) }),
             Err(e) => return Err(e),
         };
         if n == 0 {
@@ -166,7 +185,7 @@ pub(crate) fn read_request(
         }
         conn_buf.extend_from_slice(&chunk[..n]);
         if conn_buf.len() > body_end + max_body_bytes {
-            return Ok(ReadOutcome::TooLarge);
+            return Ok(ReadOutcome::TooLarge { head: head() });
         }
     }
 
