@@ -85,11 +85,19 @@ pub(crate) fn read_request(
     max_body_bytes: usize,
 ) -> std::io::Result<ReadOutcome> {
     let mut chunk = [0u8; 1024];
-    // Accumulate bytes until the header terminator is found.
+    // Accumulate bytes until the header terminator is found. The search is
+    // incremental (ADR-279): bytes before `scanned` are known not to start a
+    // terminator, so each pass only covers what arrived since the last one,
+    // resuming 3 bytes back in case a "\r\n\r\n" straddles two reads. Searching
+    // the whole buffer on every 1 KiB read was quadratic up to the 1 MiB cap —
+    // ~457 ms of release-build CPU per oversized-header connection, reachable
+    // before any auth check.
+    let mut scanned = 0usize;
     let header_end = loop {
-        if let Some(pos) = find_subslice(conn_buf, b"\r\n\r\n") {
-            break pos;
+        if let Some(pos) = find_subslice(&conn_buf[scanned..], b"\r\n\r\n") {
+            break scanned + pos;
         }
+        scanned = conn_buf.len().saturating_sub(3);
         let n = match stream.read(&mut chunk) {
             Ok(n) => n,
             Err(e) if is_timeout(&e) => return Ok(ReadOutcome::TimedOut { head: None }),

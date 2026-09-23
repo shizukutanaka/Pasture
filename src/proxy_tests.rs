@@ -841,6 +841,48 @@ fn test_oversized_header_block_is_431_and_logged() {
 }
 
 #[test]
+fn test_header_terminator_split_across_reads_is_found() {
+    // ADR-279 made the header-terminator search incremental: it resumes three
+    // bytes before the end of what was already searched. Get that overlap
+    // wrong and a "\r\n\r\n" straddling two socket reads is never found and
+    // the request hangs until the read timeout. Split the terminator at each
+    // of its three internal boundaries, pausing so the server sees two reads.
+    for split in 1..4 {
+        let p = proxy_with(true, false, 100, "unused")
+            .with_request_timeout(Some(std::time::Duration::from_secs(3)));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let head = b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close";
+            let term = b"\r\n\r\n";
+            let mut first = head.to_vec();
+            first.extend_from_slice(&term[..split]);
+            c.write_all(&first).unwrap();
+            c.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            c.write_all(&term[split..]).unwrap();
+            let mut resp = String::new();
+            let _ = c.read_to_string(&mut resp);
+            resp
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        let started = std::time::Instant::now();
+        p.handle_connection(&mut s).unwrap();
+        drop(s);
+        let resp = client.join().unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200 "),
+            "split at {split}: terminator not found across reads: {resp:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "split at {split}: request only completed via timeout"
+        );
+    }
+}
+
+#[test]
 fn test_roundtrip_oversized_body_is_413() {
     let p = proxy_with(true, true, 100, "unused");
     // Declare a Content-Length far beyond the default body limit; no body sent.
