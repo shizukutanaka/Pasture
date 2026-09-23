@@ -50,7 +50,11 @@ pub(crate) enum ReadOutcome {
     /// A socket read timed out before the request completed → 408 (IMP-timeout).
     /// `head` is `None` when the timeout hit before the headers were complete.
     TimedOut { head: Option<RejectedHead> },
-    /// Connection closed early or headers were malformed/oversized → 400.
+    /// The header block exceeded the 1 MiB cap or the 1000-field cap → 431
+    /// (RFC 6585 §5, ADR-278). `head` is `None` for the byte cap, which fires
+    /// before the header terminator is seen.
+    HeadersTooLarge { head: Option<RejectedHead> },
+    /// The client closed the connection (EOF before a complete header block).
     Closed,
 }
 
@@ -97,7 +101,8 @@ pub(crate) fn read_request(
         }
         conn_buf.extend_from_slice(&chunk[..n]);
         if conn_buf.len() > 1_048_576 {
-            return Ok(ReadOutcome::Closed); // 1 MiB header guard
+            // 1 MiB header guard (ADR-278: answered with 431, not a silent drop).
+            return Ok(ReadOutcome::HeadersTooLarge { head: None });
         }
     };
 
@@ -118,8 +123,16 @@ pub(crate) fn read_request(
     let mut content_type: Option<String> = None;
     for (header_idx, line) in lines.enumerate() {
         if header_idx >= 1000 {
-            // Too many header fields — reject as malformed (DoS guard, ADR-097).
-            return Ok(ReadOutcome::Closed);
+            // Too many header fields (DoS guard, ADR-097). ADR-278: the request
+            // line and the fields before the cutoff are parsed, so keep them.
+            return Ok(ReadOutcome::HeadersTooLarge {
+                head: Some(RejectedHead {
+                    method,
+                    path,
+                    origin,
+                    request_id,
+                }),
+            });
         }
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
@@ -269,6 +282,7 @@ pub(crate) fn write_response(
         408 => "Request Timeout",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        431 => "Request Header Fields Too Large",
         429 => "Too Many Requests",
         501 => "Not Implemented",
         502 => "Bad Gateway",

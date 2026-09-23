@@ -282,6 +282,7 @@ All error responses MUST use the OpenAI envelope:
 | missing/invalid bearer token when auth is enabled (§7) | `401` | `invalid_request_error` |
 | a socket read times out before the request completes (§7) | `408` | `invalid_request_error` |
 | request body exceeds the size cap (§7) | `413` | `invalid_request_error` |
+| request header block exceeds 1 MiB or 1000 fields (§7) | `431` | `invalid_request_error` |
 | rate limit exceeded when a limit is set (§7) | `429` | `rate_limit_error` |
 | unknown route/path or method | `404` | `invalid_request_error` |
 | no backend available / sensitive-but-no-local / forced-route-unavailable | `503` | `routing_error` |
@@ -416,13 +417,15 @@ false negative = data leak (unacceptable).
 
 - The proxy MUST cap the request **header** block (1 MiB) and the request **body**
   (`MAX_BODY_BYTES`, 16 MiB). A `Content-Length` over the cap, or a body that grows
-  past it, MUST yield `413` (not unbounded reads) — DoS hardening (IMP-21).
+  past it, MUST yield `413` (not unbounded reads) — DoS hardening (IMP-21). A header
+  block over 1 MiB or over 1000 fields MUST yield `431 Request Header Fields Too Large`
+  (RFC 6585 §5) rather than a silent close (ADR-278).
 - The JSON parser MUST bound recursion depth (128) (ADR-026).
 - **Connection timeout (IMP-timeout).** Each connection SHOULD have a read/write
   timeout (`PASTURE_REQUEST_TIMEOUT`, default 30s; 0 disables) so a slow/dead client
   cannot pin a worker (slow-loris). A read that times out before the request completes
   yields `408`.
-- **Rejections are ordinary responses (ADR-277).** A `413` or `408` MUST carry the
+- **Rejections are ordinary responses (ADR-277).** A `413`, `408` or `431` MUST carry the
   same header block as any served response — `X-Request-ID` (the caller's, or a minted
   one), CORS headers for an allowed `Origin`, `Server`, `X-Response-Time` — and MUST
   be written to `PASTURE_ACCESS_LOG` like any other request. When a timeout fires

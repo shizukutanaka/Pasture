@@ -2922,8 +2922,9 @@ impl Proxy {
         format!("{cors}{req_id_hdr}{rl_hdr}{SERVER_HDR}")
     }
 
-    /// Answer a request rejected before dispatch — 413 (body too large) or 408
-    /// (read timed out) — and close the connection (ADR-277).
+    /// Answer a request rejected before dispatch — 413 (body too large), 408
+    /// (read timed out) or 431 (header block too large, ADR-278) — and close
+    /// the connection (ADR-277).
     ///
     /// These used to be written from an early return with no extra headers
     /// and no access-log line. For a 413 the headers had already been parsed,
@@ -3009,6 +3010,14 @@ impl Proxy {
                     }
                     ReadOutcome::TimedOut { head } => {
                         return self.reject_early(stream, 408, "request timed out", head);
+                    }
+                    ReadOutcome::HeadersTooLarge { head } => {
+                        return self.reject_early(
+                            stream,
+                            431,
+                            "request header fields too large",
+                            head,
+                        );
                     }
                     ReadOutcome::Closed => return Ok(()), // normal EOF / graceful close
                 };
