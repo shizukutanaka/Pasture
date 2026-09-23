@@ -62,6 +62,39 @@ pub fn probe_ollama(host: &str, port: u16) -> OllamaStatus {
     }
 }
 
+/// The first Ollama release that reports per-token logprobs on `/api/chat`
+/// (v0.12.11, published 2025-11-12, PR #12899). Below this, `"logprobs":true`
+/// is silently ignored and the cascade falls back to its text heuristic.
+pub const OLLAMA_LOGPROBS_MIN: (u64, u64, u64) = (0, 12, 11);
+
+/// Ask a running Ollama for its version via `GET /api/version`
+/// (`{"version":"0.12.11"}`). `None` when unreachable or unparsable.
+pub fn probe_ollama_version(host: &str, port: u16) -> Option<String> {
+    tcp_get(host, port, "/api/version", Duration::from_secs(2)).and_then(|b| parse_version(&b))
+}
+
+/// Extract the `version` string from an `/api/version` body.
+pub fn parse_version(body: &str) -> Option<String> {
+    let v = crate::json::parse(body).ok()?;
+    v.get("version")?.as_str().map(|s| s.trim().to_string())
+}
+
+/// Parse `"0.12.11"`, `"v0.12.11"`, or `"0.13.0-rc2"` into (major, minor,
+/// patch). Pre-release suffixes are dropped: an rc of 0.12.11 already carries
+/// the feature. Anything that does not start with three numbers is `None`.
+pub fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next()?;
+    let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
+    Some((it.next()??, it.next()??, it.next()??))
+}
+
+/// Whether an Ollama version string reports logprobs. `None` when the version
+/// cannot be parsed - say "unknown", never guess.
+pub fn ollama_supports_logprobs(version: &str) -> Option<bool> {
+    parse_semver(version).map(|v| v >= OLLAMA_LOGPROBS_MIN)
+}
+
 /// Split an OpenAI-style base URL into (host, port, base_path).
 /// e.g. "http://127.0.0.1:1234/v1" -> ("127.0.0.1", 1234, "/v1").
 /// Missing port defaults to 1234 (LM Studio's default).
@@ -109,6 +142,63 @@ pub fn port_available(addr: &str) -> bool {
     TcpListener::bind(addr).is_ok()
 }
 
+/// True when `name` is an executable on `PATH` (ADR-265).
+///
+/// Lets `doctor` tell "Ollama isn't installed" from "Ollama isn't running" —
+/// previously one TCP probe produced a single message carrying both fixes, so a
+/// new user had to guess which applied to them.
+pub fn on_path(name: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    // Windows needs the extension; checking the bare name too is harmless.
+    let candidates = [name.to_string(), format!("{name}.exe")];
+    std::env::split_paths(&path).any(|dir| {
+        candidates.iter().any(|c| {
+            std::fs::metadata(dir.join(c))
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Why the cost log cannot be written, or `None` when it can (ADR-265).
+///
+/// Accounting is one of Pasture's four jobs, and it failed *silently*: the only
+/// signal was one stderr line per request that scrolls off a running server.
+/// Worse, `read_log` maps `NotFound` to "no records", and a missing *directory*
+/// is also `NotFound` — so an unwritable path was indistinguishable from
+/// "no data yet", and `stats` reported it as such forever.
+///
+/// Probes without creating the log itself: an existing file must be openable
+/// for append; otherwise the parent directory must exist and accept a temp file,
+/// which is removed again.
+pub fn cost_log_problem(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    if p.exists() {
+        return match std::fs::OpenOptions::new().append(true).open(p) {
+            Ok(_) => None,
+            Err(e) => Some(format!("cannot append to {path}: {e}")),
+        };
+    }
+    // Empty parent means a bare filename — the current directory.
+    let dir = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    if !dir.exists() {
+        return Some(format!("directory does not exist: {}", dir.display()));
+    }
+    let probe = dir.join(".pasture-write-probe");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            None
+        }
+        Err(e) => Some(format!("directory is not writable: {}: {e}", dir.display())),
+    }
+}
+
 /// Minimal plain-HTTP GET returning the response body on 200 OK, or None on
 /// any failure (connection error, non-200 status). A non-200 response means
 /// the server exists but is not a recognized Ollama/OpenAI-compat endpoint;
@@ -149,7 +239,83 @@ fn tcp_get(host: &str, port: u16, path: &str, timeout: Duration) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_cost_log_problem_detects_missing_directory() {
+        // ADR-265: the case that used to be reported as "no cost log yet".
+        let why = cost_log_problem("/nonexistent-dir-xyz/pasture.jsonl");
+        assert!(why.is_some(), "missing directory must be a problem");
+        assert!(
+            why.unwrap().contains("does not exist"),
+            "message must name the cause"
+        );
+    }
+
+    #[test]
+    fn test_cost_log_problem_none_for_writable_path() {
+        // A writable directory is fine, and probing must NOT leave the log
+        // behind (doctor is a diagnostic, not a side effect).
+        let dir = std::env::temp_dir().join("pasture_costlog_probe_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("cost.jsonl");
+        assert_eq!(cost_log_problem(&target.to_string_lossy()), None);
+        assert!(!target.exists(), "probe must not create the cost log");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cost_log_problem_none_for_existing_writable_file() {
+        let path = std::env::temp_dir().join("pasture_costlog_existing.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(cost_log_problem(&path.to_string_lossy()), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_on_path_finds_real_binary_and_rejects_nonsense() {
+        // `sh` exists on every platform this is built for; the other cannot.
+        assert!(on_path("sh"), "sh must be found on PATH");
+        assert!(!on_path("definitely-not-a-real-binary-xyzzy"));
+    }
     use super::*;
+
+    #[test]
+    fn test_parse_version_reads_ollama_shape() {
+        // routes.go: r.GET("/api/version", ...) -> {"version": version.Version}
+        assert_eq!(
+            parse_version(r#"{"version":"0.12.11"}"#).as_deref(),
+            Some("0.12.11")
+        );
+        assert_eq!(
+            parse_version(r#"{"version":" v0.13.0-rc2 "}"#).as_deref(),
+            Some("v0.13.0-rc2")
+        );
+        assert_eq!(parse_version("{}"), None);
+        assert_eq!(parse_version("not json"), None);
+    }
+
+    #[test]
+    fn test_parse_semver_tolerates_prefix_and_prerelease() {
+        assert_eq!(parse_semver("0.12.11"), Some((0, 12, 11)));
+        assert_eq!(parse_semver("v0.12.11"), Some((0, 12, 11)));
+        assert_eq!(parse_semver("0.12.11-rc0"), Some((0, 12, 11)));
+        assert_eq!(parse_semver("0.33.2+build.7"), Some((0, 33, 2)));
+        assert_eq!(parse_semver("0.12"), None);
+        assert_eq!(parse_semver("dev"), None);
+        assert_eq!(parse_semver(""), None);
+    }
+
+    #[test]
+    fn test_ollama_supports_logprobs_boundary() {
+        // v0.12.11 (2025-11-12) is the first release with PR #12899.
+        assert_eq!(ollama_supports_logprobs("0.12.10"), Some(false));
+        assert_eq!(ollama_supports_logprobs("0.12.11"), Some(true));
+        assert_eq!(ollama_supports_logprobs("0.12.11-rc0"), Some(true));
+        assert_eq!(ollama_supports_logprobs("0.13.0"), Some(true));
+        assert_eq!(ollama_supports_logprobs("1.0.0"), Some(true));
+        assert_eq!(ollama_supports_logprobs("0.9.99"), Some(false));
+        assert_eq!(ollama_supports_logprobs("garbage"), None);
+    }
 
     #[test]
     fn test_parse_model_names() {

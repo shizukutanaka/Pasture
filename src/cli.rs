@@ -24,7 +24,7 @@ COMMANDS:
     route <text> [--json]    Dry-run: show where a prompt would be routed (--json for scripting)
     chat  <text>             Send one prompt through the router (needs Ollama)
     serve                    Start the OpenAI-compatible proxy server
-    eval [--external <file>] Measure routing quality + token-threshold sweep (--json for machine output)
+    eval [--external <file>] Routing accuracy: regression + held-out sets; exits 1 on regression (--json)
     stats [--json]           Summarize the cost log (routes, tokens, spend)
     improvements [path]      Show the self-improvement ledger (verified change history)
     improvements --review    Show only entries the machine gate cannot auto-approve
@@ -34,10 +34,9 @@ COMMANDS:
     calibrate --logprob       Recommend PASTURE_CASCADE_LOGPROB from logged cascade confidence
     calibrate --error --labels <f.jsonl> [--target E]
     calibrate --auroc --labels <f.jsonl>     Self-test: does the confidence signal actually predict correctness?
+    label --prompts <f> [--out <f>]          Build that labels file: answer prompts locally and mark each right/wrong
                              Recommend PASTURE_CASCADE_LOGPROB for a target error rate E
                              (default 0.1) from labelled answers: {\"logprob\": -0.4, \"correct\": true}
-    donate                   Show how to support development ($1/month)
-    refer [provider]         Show configurable cloud-provider referral links
     version                  Print the version
     help                     Show this help
 
@@ -388,10 +387,12 @@ pub fn hardware_text(p: &HardwareProfile) -> String {
         },
         None => "none".to_string(),
     };
-    format!(
-        "RAM: {} MB\nCPU threads: {}\nGPU: {}",
-        p.ram_mb, p.cpu_count, gpu
-    )
+    // ADR-261: "unknown" is a real state, not 0 MB.
+    let ram = match p.ram_mb {
+        Some(mb) => format!("{mb} MB"),
+        None => "unknown (detection unavailable on this OS)".to_string(),
+    };
+    format!("RAM: {ram}\nCPU threads: {}\nGPU: {gpu}", p.cpu_count)
 }
 
 /// Entry point. Returns a process exit code.
@@ -404,7 +405,12 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let rest = &args[2..];
-    let config = Config::default().with_env();
+    let config = Config::default().with_config_file().with_env();
+    // ADR-266: a misspelled or malformed PASTURE_* setting is otherwise silently
+    // ignored forever. Warn once, to stderr, so normal stdout output is clean.
+    for w in crate::config::env_warnings() {
+        eprintln!("pasture: {w}");
+    }
 
     match command {
         "version" => {
@@ -448,19 +454,12 @@ pub fn run(args: &[String]) -> i32 {
         "eval" => run_eval(rest),
         "stats" => run_stats(&config, rest),
         "calibrate" => run_calibrate(&config, rest),
+        "label" => run_label(&config, rest),
         "improvements" => {
             let review = rest.iter().any(|a| a == "--review");
             run_improvements(positional(rest).first().copied(), review)
         }
         "config" => run_config(&config),
-        "donate" => {
-            println!(
-                "{}",
-                crate::monetize::donation_text(config.donate_url.as_deref())
-            );
-            0
-        }
-        "refer" => run_refer(rest),
         other => {
             eprintln!("unknown command: {other}\n");
             print!("{USAGE}");
@@ -554,10 +553,25 @@ fn print_eval_report(report: &crate::eval::EvalReport) {
         "  missed escalations (cloud->local): {}",
         report.missed_escalations
     );
+    println!(
+        "  sensitive escalations (I2 breach): {}",
+        report.sensitive_escalations
+    );
 }
 
-/// `pasture eval`: run the routing eval (built-in cases, or `--external
-/// <file>` JSONL cases) and print accuracy / escalation stats.
+/// `pasture eval`: run the routing eval and GATE on it (ADR-271).
+///
+/// Two corpora, two jobs:
+/// - the built-in set (`default_cases`) restates the router's own markers, so
+///   it is a **regression check**: anything under 100% means a detector broke;
+/// - the held-out set (`holdout_cases`) shares no trigger string with the
+///   router, so it **measures generalisation**; it is gated by the recorded
+///   floor, not by 100%.
+///
+/// Exit is non-zero when the built-in set drops below 100%, when held-out
+/// accuracy falls below `HOLDOUT_ACCURACY_FLOOR`, or — unconditionally — when
+/// any sensitive prompt escalates to cloud (an I2 breach). Before this, every
+/// path returned 0 and CI Gate 4 could not fail.
 fn run_eval(rest: &[String]) -> i32 {
     let profile = HardwareProfile::detect();
     let engine = RoutingEngine::for_hardware(&profile, true, true);
@@ -585,23 +599,98 @@ fn run_eval(rest: &[String]) -> i32 {
         }
         return 0;
     }
-    let report = crate::eval::run_eval(&engine, &crate::eval::default_cases());
-    if rest.iter().any(|a| a == "--json") {
-        println!("{}", report.to_json(engine.threshold()));
-        return 0;
+    let builtin = crate::eval::run_eval(&engine, &crate::eval::default_cases());
+    let holdout = crate::eval::run_eval(&engine, &crate::eval::holdout_cases());
+    let cascade = crate::eval::run_cascade_eval(&crate::eval::cascade_holdout_cases());
+    let floor = crate::eval::HOLDOUT_ACCURACY_FLOOR;
+    let cascade_floor = crate::eval::CASCADE_HOLDOUT_FLOOR;
+
+    let mut failed = false;
+    if cascade.accuracy() < cascade_floor {
+        failed = true;
     }
+    if builtin.correct < builtin.total {
+        failed = true;
+    }
+    if holdout.accuracy() < floor {
+        failed = true;
+    }
+    let i2_breach = builtin.sensitive_escalations + holdout.sensitive_escalations;
+    if i2_breach > 0 {
+        failed = true;
+    }
+
+    if rest.iter().any(|a| a == "--json") {
+        println!(
+            "{{\"builtin\":{},\"holdout\":{},\"holdout_floor\":{floor},\"cascade\":{},\"cascade_floor\":{cascade_floor},\"pass\":{}}}",
+            builtin.to_json(engine.threshold()),
+            holdout.to_json(engine.threshold()),
+            cascade.to_json(engine.threshold()),
+            !failed
+        );
+        return i32::from(failed);
+    }
+
     println!(
-        "Routing eval ({} cases, threshold {}):",
-        report.total,
+        "Built-in regression set ({} cases, threshold {}) — restates the marker lists; any miss is a broken detector:",
+        builtin.total,
         engine.threshold()
     );
-    print_eval_report(&report);
-    println!("\nThreshold sweep (plain prompts, cloud rate):");
-    for (t, rate) in crate::eval::sweep(&crate::eval::length_samples(), &[50, 100, 300, 800, 2000])
-    {
-        println!("  thr {t:>5}: {:.0}%", rate * 100.0);
+    print_eval_report(&builtin);
+    println!(
+        "\nHeld-out generalisation set ({} cases) — no prompt contains a trigger string; measures how the rules generalise:",
+        holdout.total
+    );
+    print_eval_report(&holdout);
+    println!(
+        "  floor: {:.1}% (recorded baseline; the gate fails below it)",
+        floor * 100.0
+    );
+    println!(
+        "  NOTE: the two sets above score the PRE-REQUEST router only. With\n        PASTURE_CASCADE=1 the effective route also depends on the local\n        answer, which this offline harness cannot simulate."
+    );
+    println!(
+        "\nCascade answer classifier, held-out ({} answers) — only active with PASTURE_CASCADE=1:",
+        cascade.total
+    );
+    println!(
+        "  accuracy: {:.1}% ({}/{})   floor: {:.1}%",
+        cascade.accuracy() * 100.0,
+        cascade.correct,
+        cascade.total,
+        cascade_floor * 100.0
+    );
+    println!(
+        "  escalated a good answer (waste): {}   kept a weak answer (quality risk): {}",
+        cascade.false_escalations, cascade.missed_escalations
+    );
+    if cascade.missed_escalations == cascade.total - cascade.correct {
+        println!(
+            "  NOTE: every miss is in one direction — on answers that avoid its own\n        marker strings this heuristic is indistinguishable from \"never\n        escalate\". Logprobs (PASTURE_CASCADE_LOGPROB, needs a backend that\n        reports them) are the signal that does generalise."
+        );
     }
-    0
+    println!("\nthreshold tuning: `pasture calibrate` fits the threshold to your own cost log");
+    if i2_breach > 0 {
+        eprintln!("FAIL: {i2_breach} sensitive prompt(s) escalated to cloud — I2 breach");
+    }
+    if builtin.correct < builtin.total {
+        eprintln!("FAIL: built-in regression set below 100% — a detector changed behaviour");
+    }
+    if holdout.accuracy() < floor {
+        eprintln!(
+            "FAIL: held-out accuracy {:.1}% fell below the recorded floor {:.1}%",
+            holdout.accuracy() * 100.0,
+            floor * 100.0
+        );
+    }
+    if cascade.accuracy() < cascade_floor {
+        eprintln!(
+            "FAIL: cascade held-out accuracy {:.1}% fell below the recorded floor {:.1}%",
+            cascade.accuracy() * 100.0,
+            cascade_floor * 100.0
+        );
+    }
+    i32::from(failed)
 }
 
 /// `pasture stats`: summarize the PII-free cost log (`--json` for scripting).
@@ -615,11 +704,23 @@ fn run_stats(config: &Config, rest: &[String]) -> i32 {
                 return 0;
             }
             if s.total == 0 {
-                println!(
-                    "no cost log yet at {} (run some requests first)",
-                    config.cost_log_path
-                );
-                return 0;
+                // ADR-265: an unwritable path also reads as "no records", so
+                // saying "run some requests first" would be false — the log will
+                // never appear no matter how many run.
+                match crate::doctor::cost_log_problem(&config.cost_log_path) {
+                    Some(why) => {
+                        eprintln!("cost log cannot be written: {why}");
+                        eprintln!("set PASTURE_COST_LOG=<path> to a writable location.");
+                        return 1;
+                    }
+                    None => {
+                        println!(
+                            "no cost log yet at {} (run some requests first)",
+                            config.cost_log_path
+                        );
+                        return 0;
+                    }
+                }
             }
             println!("Cost log: {} ({} records)", config.cost_log_path, s.total);
             println!(
@@ -652,37 +753,6 @@ fn run_stats(config: &Config, rest: &[String]) -> i32 {
             eprintln!("cannot read cost log: {e}");
             1
         }
-    }
-}
-
-/// `pasture refer [provider]`: print referral links (or the configured list).
-fn run_refer(rest: &[String]) -> i32 {
-    let pos = positional(rest);
-    if let Some(key) = pos.first() {
-        match crate::monetize::provider(key) {
-            Some(p) => {
-                match crate::monetize::referral_url(p.key, env_referral_resolver) {
-                    Some(u) => println!("{}: {u}", p.display),
-                    None => println!(
-                        "{}: not configured. Set PASTURE_REF_{}=<your affiliate url>\n({})",
-                        p.display,
-                        p.key.to_uppercase(),
-                        p.homepage
-                    ),
-                }
-                0
-            }
-            None => {
-                eprintln!("unknown provider: {key}");
-                2
-            }
-        }
-    } else {
-        println!(
-            "{}",
-            crate::monetize::referral_list_text(env_referral_resolver)
-        );
-        0
     }
 }
 
@@ -736,7 +806,6 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
                     } else {
                         println!("{}", lr.content);
                     }
-                    maybe_nudge(config);
                     return 0;
                 }
                 Err(e) => {
@@ -754,14 +823,12 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
                 "build with `--features cloud` and set {}.",
                 cloud_key_hint(config)
             );
-            eprintln!("to compare cloud providers: pasture refer");
             return 1;
         };
         let req = chat_request(&config.cloud_model, text);
         return match backend.complete(&req) {
             Ok(resp) => {
                 println!("{}", resp.content);
-                maybe_nudge(config);
                 0
             }
             Err(e) => {
@@ -786,7 +853,6 @@ fn run_chat(config: &Config, text: &str, forced: Option<Route>) -> i32 {
     match result {
         Ok(_) => {
             let _ = out.write_all(b"\n");
-            maybe_nudge(config);
             0
         }
         Err(e) => {
@@ -922,6 +988,38 @@ fn run_doctor(config: &Config) -> i32 {
                 )
             );
             print_doctor_models(lang, &s.models);
+            // ADR-274: since ADR-273 the difference between a cascade that
+            // scores confidence and one that falls back to a text heuristic
+            // is the Ollama build. Say which side the user is on, from
+            // Ollama's own /api/version, against a verified threshold.
+            if let Some(v) =
+                crate::doctor::probe_ollama_version(&config.ollama_host, config.ollama_port)
+            {
+                match crate::doctor::ollama_supports_logprobs(&v) {
+                    Some(true) => println!(
+                        "{}",
+                        tf(lang, "doctor.ollama.version.ok", &[("version", &v)])
+                    ),
+                    Some(false) => {
+                        // Only a problem when something actually consumes the
+                        // signal; otherwise it is information. The marker must
+                        // match: `doctor.problems` tells the user to look for
+                        // [!!], and every other counted line uses it, while
+                        // [--] lines (cloud.off, hw.unknown) are never counted.
+                        // Counting a [--] line sent the user hunting for a
+                        // marker that was not on screen.
+                        let key = if config.cascade {
+                            problems += 1;
+                            "doctor.ollama.version.stale"
+                        } else {
+                            "doctor.ollama.version.old"
+                        };
+                        println!("{}", tf(lang, key, &[("version", &v)]));
+                        println!("{}", t(lang, "doctor.ollama.version.old.fix"));
+                    }
+                    None => {}
+                }
+            }
         } else {
             problems += 1;
             println!(
@@ -932,12 +1030,39 @@ fn run_doctor(config: &Config) -> i32 {
                     &[("host", &config.ollama_host), ("port", &port)]
                 )
             );
-            println!("{}", t(lang, "doctor.ollama.fix"));
+            // ADR-265: distinguish "not installed" from "installed but stopped"
+            // instead of printing both fixes and making the user guess.
+            let key = if crate::doctor::on_path("ollama") {
+                "doctor.ollama.fix.notrunning"
+            } else {
+                "doctor.ollama.fix.notinstalled"
+            };
+            println!("{}", t(lang, key));
         }
         s
     };
 
     // 2. Is the configured local model available?
+    // ADR-265: when Ollama is down this step used to be SKIPPED, so a bare
+    // machine reported "1 item needs attention" when it had two, and the user
+    // only learned about the missing model on a second run. Always report it.
+    if !st.reachable {
+        problems += 1;
+        println!(
+            "{}",
+            tf(
+                lang,
+                "doctor.model.unknown",
+                &[("model", &config.local_model)]
+            )
+        );
+        if !local_is_openai(config) {
+            println!(
+                "{}",
+                tf(lang, "doctor.model.fix", &[("model", &config.local_model)])
+            );
+        }
+    }
     if st.reachable {
         if crate::doctor::has_model(&st.models, &config.local_model) {
             println!(
@@ -1009,6 +1134,62 @@ fn run_doctor(config: &Config) -> i32 {
         println!("{}", t(lang, "doctor.cloud.localonly"));
     }
 
+    // 5. Can we actually record cost? (ADR-265) Accounting is one of the four
+    //    jobs, and it used to fail silently — one stderr line per request.
+    match crate::doctor::cost_log_problem(&config.cost_log_path) {
+        None => println!(
+            "{}",
+            tf(
+                lang,
+                "doctor.costlog.ok",
+                &[("path", &config.cost_log_path)]
+            )
+        ),
+        Some(why) => {
+            problems += 1;
+            println!(
+                "{}",
+                tf(
+                    lang,
+                    "doctor.costlog.bad",
+                    &[("path", &config.cost_log_path), ("why", &why)]
+                )
+            );
+            println!("{}", t(lang, "doctor.costlog.fix"));
+        }
+    }
+
+    // 6. Hardware & the routing threshold it drives (ADR-261). This is the
+    //    product's differentiator; doctor never used to print it.
+    let hw = HardwareProfile::detect();
+    let threshold = RoutingEngine::for_hardware(&hw, true, false).threshold();
+    match hw.ram_mb {
+        Some(mb) => println!(
+            "{}",
+            tf(
+                lang,
+                "doctor.hw.ok",
+                &[
+                    ("ram", &mb.to_string()),
+                    ("threshold", &threshold.to_string())
+                ]
+            )
+        ),
+        None => {
+            // Detection unavailable → routing is running on a best-effort default
+            // (lean-local). Tell the user how to make it exact.
+            println!(
+                "{}",
+                tf(
+                    lang,
+                    "doctor.hw.unknown",
+                    &[("threshold", &threshold.to_string())]
+                )
+            );
+            println!("{}", t(lang, "doctor.hw.unknown.fix"));
+        }
+    }
+
     println!();
     if problems == 0 {
         println!("{}", t(lang, "doctor.allgood"));
@@ -1019,6 +1200,21 @@ fn run_doctor(config: &Config) -> i32 {
             tf(lang, "doctor.problems", &[("n", &problems.to_string())])
         );
         1
+    }
+}
+
+/// Which message `pasture up` should print when Ollama is not answering
+/// (ADR-267). Kept pure so both branches are testable without a process.
+///
+/// `on_path` is whether the `ollama` command exists. The distinction matters:
+/// "not installed" and "installed but did not start" have different fixes, and
+/// the old code printed the install advice for both — after spawning nothing
+/// and waiting 3 s.
+fn ollama_unreachable_key(on_path: bool) -> &'static str {
+    if on_path {
+        "up.ollama_required"
+    } else {
+        "up.ollama_notinstalled"
     }
 }
 
@@ -1045,12 +1241,26 @@ fn run_up(config: &Config, addr: &str) -> i32 {
     // Ollama must be reachable to pull or serve through. Try to start it.
     let mut st = crate::doctor::probe_ollama(&config.ollama_host, config.ollama_port);
     if !st.reachable {
+        // A command that is not on PATH can never be spawned, so say so now
+        // instead of spawning nothing, sleeping 3 s and blaming "not running"
+        // (ADR-267).
+        if !crate::doctor::on_path("ollama") {
+            eprintln!("{}", t(lang, ollama_unreachable_key(false)));
+            return 1;
+        }
         println!("{}", t(lang, "up.starting_ollama"));
-        let _ = std::process::Command::new("ollama")
+        if let Err(e) = std::process::Command::new("ollama")
             .arg("serve")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .spawn()
+        {
+            eprintln!(
+                "{}",
+                tf(lang, "up.ollama_spawn_failed", &[("error", &e.to_string())])
+            );
+            return 1;
+        }
         for _ in 0..15 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             st = crate::doctor::probe_ollama(&config.ollama_host, config.ollama_port);
@@ -1059,7 +1269,7 @@ fn run_up(config: &Config, addr: &str) -> i32 {
             }
         }
         if !st.reachable {
-            eprintln!("{}", t(lang, "up.ollama_required"));
+            eprintln!("{}", t(lang, ollama_unreachable_key(true)));
             return 1;
         }
         println!("{}", t(lang, "up.ollama_started"));
@@ -1142,22 +1352,26 @@ fn run_models(_config: &Config) -> i32 {
     use crate::i18n::{detect, t, tf};
     let lang = detect();
     let hw = HardwareProfile::detect();
-    let ram = hw.ram_mb;
     let no_gpu = hw.gpu.is_none();
-    let (tier, show_ultra) = if no_gpu && ram < 8_000 {
-        ("4 GB (CPU-only)", true)
-    } else if ram < 12_000 {
-        ("8 GB", false)
-    } else {
-        ("16 GB", false)
+    // ADR-261: when RAM is undetected, do NOT steer the user to the CPU-only
+    // tier (a 64 GB Mac would otherwise be told to run tinyllama). Assume a mid
+    // machine and say the detection failed.
+    let (tier, show_ultra, ram_label) = match hw.ram_mb {
+        None => ("16 GB", false, "unknown".to_string()),
+        Some(ram) if no_gpu && ram < 8_000 => ("4 GB (CPU-only)", true, ram.to_string()),
+        Some(ram) if ram < 12_000 => ("8 GB", false, ram.to_string()),
+        Some(ram) => ("16 GB", false, ram.to_string()),
     };
     print!("{}", t(lang, "models.title"));
+    if hw.ram_mb.is_none() {
+        println!("{}", t(lang, "models.hw_unknown"));
+    }
     println!(
         "{}",
         tf(
             lang,
             "models.your_machine",
-            &[("ram", &ram.to_string()), ("tier", tier)]
+            &[("ram", &ram_label), ("tier", tier)]
         )
     );
     if show_ultra {
@@ -1480,6 +1694,110 @@ fn run_calibrate_sweep(config: &Config, lang: crate::i18n::Lang, logprob_mode: b
 /// Published per-model AUROCs for confidence signals span roughly 0.58 (barely
 /// above chance) to 0.84 (genuinely useful) on the same task, so this is
 /// model-specific and must be measured, not assumed.
+/// `pasture label --prompts <file> [--out <file>]` (ADR-257): build the labelled
+/// confidence file that `calibrate --auroc` and `calibrate --error` require.
+///
+/// Those commands consume `{"logprob":…,"correct":…}` JSONL, but nothing in
+/// Pasture produced it — a workflow dead end shipped with ADR-246. It cannot be
+/// recovered after the fact either: the cost log records `logprob` but, by
+/// design, no prompt or answer text (I3), so there is nothing to review. Labels
+/// therefore have to be captured at request time, which is what this does —
+/// run each prompt locally, show the answer, record the operator's verdict.
+///
+/// The output keeps I3: only the score and the verdict are written, never the
+/// prompt or the answer.
+fn run_label(config: &Config, rest: &[String]) -> i32 {
+    use std::io::{BufRead, Write};
+    let Some(prompts_path) = option_value(rest, "--prompts") else {
+        eprintln!("label needs --prompts <file> (one prompt per line, # comments allowed)");
+        return 1;
+    };
+    let out_path = option_value(rest, "--out").unwrap_or("pasture-labels.jsonl");
+    let prompts = match crate::difficulty::load_hard_prompts(prompts_path) {
+        Ok(p) if !p.is_empty() => p,
+        Ok(_) => {
+            eprintln!("{prompts_path} has no prompts");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let backend = make_local_backend(config);
+    let mut out = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("cannot open {out_path}: {e}");
+            return 1;
+        }
+    };
+    println!(
+        "Labelling {} prompt(s) with the local backend; appending to {out_path}.",
+        prompts.len()
+    );
+    println!("For each answer: y = correct, n = incorrect, s = skip, q = quit.\n");
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let (mut written, mut unscored) = (0usize, 0usize);
+    for (i, prompt) in prompts.iter().enumerate() {
+        let req = chat_request(&config.local_model, prompt);
+        let (resp, logprob) = match backend.complete_scored(&req) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("[{}/{}] backend error: {e}", i + 1, prompts.len());
+                continue;
+            }
+        };
+        let Some(lp) = logprob else {
+            // Without a score the row is useless to --auroc/--error, so say so
+            // rather than writing a row that silently degrades the analysis.
+            unscored += 1;
+            continue;
+        };
+        println!("[{}/{}] {}", i + 1, prompts.len(), prompt);
+        println!("  -> {}", resp.content.trim());
+        print!("  correct? [y/n/s/q] ");
+        let _ = std::io::stdout().flush();
+        let Some(Ok(answer)) = lines.next() else {
+            break;
+        };
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" => {
+                let _ = writeln!(out, "{{\"logprob\":{lp},\"correct\":true}}");
+                written += 1;
+            }
+            "n" => {
+                let _ = writeln!(out, "{{\"logprob\":{lp},\"correct\":false}}");
+                written += 1;
+            }
+            "q" => break,
+            _ => {}
+        }
+    }
+    println!("\nWrote {written} label(s) to {out_path}.");
+    if unscored > 0 {
+        // ADR-273: Ollama reports logprobs from v0.12.11 (2025-11-12, PR #12899) and
+        // Pasture now asks for them, so the common cause of "no logprob" is an
+        // older Ollama, not the backend choice. Name the upgrade before
+        // suggesting a switch.
+        eprintln!(
+            "{unscored} answer(s) had no logprob and were skipped. `calibrate --auroc`/`--error` \
+score confidence, so they need a backend that returns logprobs. Ollama does from \
+v0.12.11 (2025-11-12) — check `ollama --version` and upgrade — or set PASTURE_LOCAL_BACKEND \
+to an OpenAI-compatible server that reports them (LM Studio, llama.cpp, vLLM)."
+        );
+    }
+    if written > 0 {
+        println!("Next: pasture calibrate --auroc --labels {out_path}");
+    }
+    0
+}
+
 fn run_calibrate_auroc(lang: crate::i18n::Lang, rest: &[String]) -> i32 {
     use crate::calibrate::SignalVerdict;
     use crate::i18n::{t, tf};
@@ -1645,8 +1963,10 @@ fn run_config(config: &Config) -> i32 {
 
     let profile = HardwareProfile::detect();
     let hw_default = RoutingEngine::for_hardware(&profile, true, true).threshold();
+    // ADR-264: an explicit threshold can now come from the config file as well
+    // as PASTURE_THRESHOLD, so don't attribute it to the env var specifically.
     let (threshold, thr_src) = match config.threshold {
-        Some(t) => (t, "PASTURE_THRESHOLD"),
+        Some(t) => (t, "configured"),
         None => (hw_default, "hardware default"),
     };
 
@@ -1737,7 +2057,6 @@ fn run_config(config: &Config) -> i32 {
         );
     }
     println!("  cost_log:          {}", config.cost_log_path);
-    println!("  donate_url:        {}", yn(config.donate_url.is_some()));
     println!("  lang:              {}", lang.code());
     0
 }
@@ -1767,7 +2086,8 @@ fn make_engine(profile: &HardwareProfile, config: &Config, cloud_available: bool
             .collect();
         engine = engine.with_skills(skills);
     }
-    engine
+    // ADR-256: applies regardless of whether skill overrides are configured.
+    engine.with_structured_local(config.structured_local)
 }
 
 /// True when the configured local engine is an OpenAI-compatible server.
@@ -1816,28 +2136,8 @@ fn chat_request(model: &str, text: &str) -> CompletionRequest {
     }
 }
 
-/// Resolve a referral URL from `PASTURE_REF_<KEY>` (key uppercased).
-fn env_referral_resolver(key: &str) -> Option<String> {
-    std::env::var(format!("PASTURE_REF_{}", key.to_uppercase())).ok()
-}
-
 /// Emit a gentle donation nudge to stderr when due (stdout stays clean for
 /// scripting). No-op when disabled or when no donation URL is configured.
-fn maybe_nudge(config: &Config) {
-    if config.no_nudge {
-        return;
-    }
-    let Some(url) = config.donate_url.as_deref() else {
-        return;
-    };
-    let count = crate::monetize::bump_count(&config.state_path);
-    if crate::monetize::should_nudge(count, crate::monetize::NUDGE_EVERY) {
-        if let Some(msg) = crate::monetize::nudge_text(Some(url)) {
-            eprintln!("{msg}");
-        }
-    }
-}
-
 /// True when a listen address binds only the loopback interface, so the proxy is
 /// reachable only from the same machine (ADR-152). Used to decide whether to warn
 /// about an exposed bind without auth. Uses the std parser rather than string
@@ -2003,9 +2303,23 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
         })
         .with_cloud_system(&config.cloud_provider)
         .with_cloud_fallback(make_fallback_cloud_backend(config));
+    // ADR-262: check the port BEFORE printing "you're connected". Previously the
+    // success banner was printed unconditionally and `serve` then died with a raw
+    // `os error 98`, so a user with 8645 occupied saw a happy connect message
+    // followed by a cryptic failure. `doctor` already had an actionable fix
+    // string for exactly this case; `serve`/`up` never reached it.
+    let lang = crate::i18n::detect();
+    if !crate::doctor::port_available(addr) {
+        eprintln!(
+            "{}",
+            crate::i18n::tf(lang, "doctor.port.inuse", &[("addr", addr)])
+        );
+        eprintln!("{}", crate::i18n::t(lang, "doctor.port.fix"));
+        return 1;
+    }
     print!(
         "{}",
-        crate::i18n::tf(crate::i18n::detect(), "connect.help", &[("addr", addr)])
+        crate::i18n::tf(lang, "connect.help", &[("addr", addr)])
     );
     match proxy.serve(addr) {
         Ok(()) => 0,
@@ -2018,6 +2332,205 @@ fn run_serve(config: &Config, addr: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::i18n::{t, Lang};
+
+    /// ADR-267: `up` must distinguish "no `ollama` command" from "it did not
+    /// start". Before this, both printed the install advice, so a user whose
+    /// Ollama was installed-but-wedged was told to install it again.
+    /// Every `doctor` line that counts as a problem must carry the `[!!]`
+    /// marker (ADR-274).
+    ///
+    /// `doctor.problems` ends the report with "N item(s) need attention (see
+    /// [!!] above)", and the catalog splits markers by meaning: `[!!]` is a
+    /// defect, `[--]` is information that is never counted (`cloud.off`,
+    /// `local_only`, `hw.unknown`). ADR-274 broke that by incrementing
+    /// `problems` while printing a `[--]` line, so `pasture doctor` reported
+    /// "1 item(s) need attention" with no `[!!]` anywhere on screen — the user
+    /// was sent hunting for a marker that was not there.
+    ///
+    /// Derives both halves from the source: the `problems += 1` sites in this
+    /// file and the message bodies in the catalog. A new counted line with the
+    /// wrong marker fails here without anyone remembering to check.
+    #[test]
+    fn test_counted_doctor_lines_use_the_bang_marker() {
+        let src = include_str!("cli.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut checked = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim().starts_with("problems += 1") {
+                continue;
+            }
+            // Keys can be printed just before or just after the increment.
+            let lo = i.saturating_sub(12);
+            let hi = (i + 20).min(lines.len());
+            let window = lines[lo..hi].join("\n");
+            let keys: Vec<&str> = window
+                .match_indices("\"doctor.")
+                .filter_map(|(at, _)| {
+                    let rest = &window[at + 1..];
+                    rest.find('"').map(|end| &rest[..end])
+                })
+                .filter(|k| !k.ends_with(".fix") && !k.ends_with(".ok"))
+                .collect();
+            assert!(
+                !keys.is_empty(),
+                "cli.rs:{}: a `problems += 1` with no doctor.* message nearby — \
+the scraper window may need widening, or the line prints nothing",
+                i + 1
+            );
+            let has_bang = keys
+                .iter()
+                .any(|k| crate::i18n::t(crate::i18n::Lang::En, k).starts_with("[!!]"));
+            assert!(
+                has_bang,
+                "cli.rs:{}: this line counts a problem but none of its messages {keys:?} \
+start with [!!]; `doctor.problems` tells the user to look for [!!]",
+                i + 1
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 7,
+            "expected 7 problem-counting sites; the scraper or the code changed"
+        );
+    }
+
+    /// Every command USAGE advertises must actually dispatch (ADR-272).
+    ///
+    /// ADR-271 deleted the token-threshold sweep and updated README.md and
+    /// SPEC.md — but not this binary's own USAGE string, which went on
+    /// advertising it. The binary is the one surface a user cannot check
+    /// against a doc, and it was stale for a whole commit whose subject was
+    /// making claims true. Same drift as ADR-262's dangling `pasture refer`.
+    ///
+    /// Truth is derived from the `match command` arms in this file's own
+    /// source, so a deleted command fails here without anyone remembering to
+    /// look — the source-scanning trick `env_vars_read_by_config` uses.
+    #[test]
+    fn test_usage_advertises_only_real_commands() {
+        let src = include_str!("cli.rs");
+        let mut dispatched: Vec<String> = Vec::new();
+        for line in src.lines() {
+            let t = line.trim();
+            if !t.starts_with('"') || !t.contains("=>") {
+                continue;
+            }
+            let arm = &t[..t.find("=>").unwrap()];
+            for piece in arm.split('|') {
+                let piece = piece.trim().trim_end_matches(',').trim();
+                if let Some(name) = piece.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                    if !name.is_empty() && !name.starts_with('-') {
+                        dispatched.push(name.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            dispatched.contains(&"eval".to_string()),
+            "dispatcher scan found nothing — the scraper broke, not the USAGE"
+        );
+
+        let commands_block = src
+            .split("COMMANDS:\n")
+            .nth(1)
+            .and_then(|r| r.split("\nOPTIONS:").next())
+            .expect("USAGE must have a COMMANDS block");
+        for line in commands_block.lines() {
+            let t = line.trim();
+            let Some(first) = t.split_whitespace().next() else {
+                continue;
+            };
+            if !first.chars().all(|c| c.is_ascii_lowercase()) || first.is_empty() {
+                continue;
+            }
+            assert!(
+                dispatched.contains(&first.to_string()),
+                "USAGE advertises `{first}`, which the dispatcher does not accept"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ollama_unreachable_key_splits_by_path_presence() {
+        assert_eq!(ollama_unreachable_key(false), "up.ollama_notinstalled");
+        assert_eq!(ollama_unreachable_key(true), "up.ollama_required");
+        for lang in [Lang::En, Lang::Ja] {
+            let missing = t(lang, ollama_unreachable_key(false));
+            let wedged = t(lang, ollama_unreachable_key(true));
+            assert_ne!(missing, wedged, "the two cases must read differently");
+            // The actionable half of each: install vs. start.
+            assert!(missing.contains("https://ollama.com"), "{missing}");
+            assert!(wedged.contains("ollama serve"), "{wedged}");
+        }
+    }
+
+    /// The messages `up` reaches for must all exist in both catalogs; `t()`
+    /// falls back to the key itself when one is missing, which would ship the
+    /// raw key to the user.
+    #[test]
+    fn test_up_ollama_messages_are_translated() {
+        for key in [
+            "up.ollama_required",
+            "up.ollama_notinstalled",
+            "up.ollama_spawn_failed",
+        ] {
+            for lang in [Lang::En, Lang::Ja] {
+                assert_ne!(t(lang, key), key, "{key} missing from a catalog");
+            }
+        }
+    }
+
+    #[test]
+    fn test_serve_refuses_occupied_port_without_success_banner() {
+        // ADR-262: `serve` used to print the "you're connected" banner and only
+        // then fail with a raw `os error 98`. Binding the port first proves the
+        // pre-check fires and returns non-zero before any success output.
+        use std::net::TcpListener;
+        let held = TcpListener::bind("127.0.0.1:0").expect("bind probe port");
+        let addr = held.local_addr().unwrap().to_string();
+        // Port is held by `held` for the duration of this call.
+        assert!(
+            !crate::doctor::port_available(&addr),
+            "held port must read as unavailable"
+        );
+        let cfg = Config::default();
+        assert_eq!(
+            run_serve(&cfg, &addr),
+            1,
+            "serve must refuse an occupied port rather than claiming success"
+        );
+    }
+
+    #[test]
+    fn test_label_requires_prompts_flag() {
+        // ADR-257: without --prompts there is nothing to label; fail loudly
+        // rather than silently producing an empty labels file.
+        let cfg = Config::default();
+        assert_eq!(run_label(&cfg, &[]), 1);
+    }
+
+    #[test]
+    fn test_label_rejects_missing_or_empty_prompt_file() {
+        let cfg = Config::default();
+        assert_eq!(
+            run_label(
+                &cfg,
+                &["--prompts".to_string(), "/no/such/file".to_string()]
+            ),
+            1
+        );
+        // A file of only comments/blank lines has no prompts.
+        let path = std::env::temp_dir().join("pasture_label_empty_test.txt");
+        std::fs::write(&path, "# just a comment\n\n").unwrap();
+        assert_eq!(
+            run_label(
+                &cfg,
+                &["--prompts".to_string(), path.to_string_lossy().to_string()]
+            ),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
     use super::*;
     use crate::hardware::GpuInfo;
 
@@ -2093,7 +2606,7 @@ mod tests {
     #[test]
     fn test_hardware_text_with_gpu() {
         let p = HardwareProfile {
-            ram_mb: 16000,
+            ram_mb: Some(16000),
             cpu_count: 8,
             gpu: Some(GpuInfo {
                 vendor: "nvidia".into(),
@@ -2106,9 +2619,26 @@ mod tests {
     }
 
     #[test]
+    fn test_hardware_text_unknown_ram_says_unknown() {
+        // ADR-261: `pasture hw` used to print "RAM: 0 MB" on macOS/Windows,
+        // which reads as a real (tiny) machine rather than a failed probe.
+        let p = HardwareProfile {
+            ram_mb: None,
+            cpu_count: 10,
+            gpu: None,
+        };
+        let out = hardware_text(&p);
+        assert!(out.contains("unknown"), "must say unknown: {out}");
+        assert!(
+            !out.contains("0 MB"),
+            "must not imply a 0 MB machine: {out}"
+        );
+    }
+
+    #[test]
     fn test_hardware_text_without_gpu() {
         let p = HardwareProfile {
-            ram_mb: 8000,
+            ram_mb: Some(8000),
             cpu_count: 4,
             gpu: None,
         };

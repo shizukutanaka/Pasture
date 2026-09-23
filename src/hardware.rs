@@ -14,16 +14,20 @@ pub struct GpuInfo {
 /// A snapshot of the host's relevant hardware capacity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareProfile {
-    pub ram_mb: u64,
+    /// Total RAM in MB, or `None` when detection is unavailable on this OS
+    /// (ADR-261). `None` must NOT collapse to 0: a 0 was previously read as
+    /// "tiniest possible machine" and forced the CPU-only routing tier, so an
+    /// undetected 64 GB Mac silently shipped everything to the paid cloud.
+    pub ram_mb: Option<u64>,
     pub cpu_count: usize,
     pub gpu: Option<GpuInfo>,
 }
 
 impl HardwareProfile {
-    /// Detect the current host profile. Best-effort: any probe that fails
-    /// degrades to a conservative value rather than panicking (US-1).
+    /// Detect the current host profile. Best-effort: any probe that fails leaves
+    /// the field `None` rather than panicking or inventing a value (US-1).
     pub fn detect() -> Self {
-        let ram_mb = detect_ram_mb().unwrap_or(0);
+        let ram_mb = detect_ram_mb();
         let cpu_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
@@ -68,9 +72,64 @@ pub fn parse_nvidia_vram(output: &str) -> Option<u64> {
         .and_then(|t| t.parse().ok())
 }
 
+/// Parse `sysctl -n hw.memsize` output (macOS): total RAM **in bytes** on a
+/// single line, e.g. `"68719476736\n"`. Returns MB. Non-numeric → `None`.
+pub fn parse_sysctl_memsize(output: &str) -> Option<u64> {
+    let bytes: u64 = output.split_whitespace().next()?.parse().ok()?;
+    Some(bytes / 1024 / 1024)
+}
+
+/// Parse `wmic ComputerSystem get TotalPhysicalMemory` output (Windows): a header
+/// line `TotalPhysicalMemory` followed by the value **in bytes**, plus trailing
+/// blank lines (`\r\n`), e.g. `"TotalPhysicalMemory\n17179869184\n\n"`. Returns
+/// MB from the first all-digit token found; anything else → `None`.
+pub fn parse_wmic_meminfo(output: &str) -> Option<u64> {
+    for line in output.lines() {
+        let t = line.trim();
+        if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+            let bytes: u64 = t.parse().ok()?;
+            return Some(bytes / 1024 / 1024);
+        }
+    }
+    None
+}
+
+/// Detect total RAM in MB across OSes (ADR-261), first hit wins:
+/// 1. `PASTURE_RAM_MB` override (mirrors `PASTURE_GPU_VRAM_MB`) — lets a user on
+///    an exotic platform set it by hand, and makes the path testable anywhere;
+/// 2. Linux `/proc/meminfo`;
+/// 3. macOS `sysctl -n hw.memsize`;
+/// 4. Windows `wmic ComputerSystem get TotalPhysicalMemory` (on Windows builds
+///    that dropped `wmic`, `PASTURE_RAM_MB` or PowerShell
+///    `Get-CimInstance Win32_ComputerSystem` is the documented fallback).
+///
+/// Returns `None` only when every probe fails — a real, representable "unknown".
 fn detect_ram_mb() -> Option<u64> {
-    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-    parse_meminfo(&contents)
+    if let Ok(v) = std::env::var("PASTURE_RAM_MB") {
+        if let Ok(mb) = v.trim().parse::<u64>() {
+            return Some(mb);
+        }
+    }
+    if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(mb) = parse_meminfo(&contents) {
+            return Some(mb);
+        }
+    }
+    if let Some(mb) = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| parse_sysctl_memsize(&String::from_utf8_lossy(&o.stdout)))
+    {
+        return Some(mb);
+    }
+    Command::new("wmic")
+        .args(["ComputerSystem", "get", "TotalPhysicalMemory"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| parse_wmic_meminfo(&String::from_utf8_lossy(&o.stdout)))
 }
 
 fn detect_gpu() -> Option<GpuInfo> {
@@ -135,7 +194,7 @@ mod tests {
     #[test]
     fn test_has_capable_gpu_threshold() {
         let p = HardwareProfile {
-            ram_mb: 16000,
+            ram_mb: Some(16000),
             cpu_count: 8,
             gpu: Some(GpuInfo {
                 vendor: "nvidia".into(),
@@ -149,10 +208,34 @@ mod tests {
     #[test]
     fn test_has_capable_gpu_none() {
         let p = HardwareProfile {
-            ram_mb: 8000,
+            ram_mb: Some(8000),
             cpu_count: 4,
             gpu: None,
         };
         assert!(!p.has_capable_gpu(1));
+    }
+
+    #[test]
+    fn test_parse_sysctl_memsize() {
+        // macOS reports total RAM in bytes. 64 GiB → 65536 MB.
+        assert_eq!(parse_sysctl_memsize("68719476736\n"), Some(65536));
+        assert_eq!(parse_sysctl_memsize("17179869184"), Some(16384));
+        assert_eq!(parse_sysctl_memsize(""), None);
+        assert_eq!(parse_sysctl_memsize("not a number"), None);
+    }
+
+    #[test]
+    fn test_parse_wmic_meminfo() {
+        // Windows `wmic` prints a header then the value, with trailing CRLF blanks.
+        assert_eq!(
+            parse_wmic_meminfo("TotalPhysicalMemory\r\n17179869184\r\n\r\n"),
+            Some(16384)
+        );
+        assert_eq!(
+            parse_wmic_meminfo("TotalPhysicalMemory\n68719476736\n"),
+            Some(65536)
+        );
+        assert_eq!(parse_wmic_meminfo("TotalPhysicalMemory\n\n"), None);
+        assert_eq!(parse_wmic_meminfo(""), None);
     }
 }

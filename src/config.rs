@@ -13,9 +13,6 @@ pub struct Config {
     pub cloud_provider: String,
     pub cloud_model: String,
     pub cost_log_path: String,
-    pub donate_url: Option<String>,
-    pub no_nudge: bool,
-    pub state_path: String,
     pub allow_sensitive_cloud: bool,
     pub cascade: bool,
     pub cache_size: usize,
@@ -115,6 +112,10 @@ pub struct Config {
     /// `cache_control: {"type": "ephemeral"}` to enable provider-side KV caching.
     /// For OpenAI this is a no-op. Set via `PASTURE_CACHE_CONTROL=1`.
     pub cache_control: bool,
+    /// ADR-256: when true, pure structured-output markers ("as json", "csv
+    /// format", …) no longer force a cloud escalation. Code generation still
+    /// does. Off by default. Set via `PASTURE_STRUCTURED_LOCAL=1`.
+    pub structured_local: bool,
     /// Pseudonymize PII before sending cloud requests and restore in responses
     /// (IMP-19). Replaces emails, IPs, phone numbers, and API keys with opaque
     /// tokens (`<EMAIL_1>`, etc.) that are reversed after the cloud response.
@@ -168,9 +169,6 @@ impl Default for Config {
             cloud_provider: "openai".to_string(),
             cloud_model: "gpt-4o-mini".to_string(),
             cost_log_path: "pasture-cost.jsonl".to_string(),
-            donate_url: None,
-            no_nudge: false,
-            state_path: "pasture-state.txt".to_string(),
             allow_sensitive_cloud: false,
             cascade: false,
             cache_size: 0,
@@ -202,6 +200,7 @@ impl Default for Config {
             cloud_price_per_1m: (0.0, 0.0),
             max_body_bytes: 16 * 1024 * 1024,
             cache_control: false,
+            structured_local: false,
             pseudonymize: false,
             output_pii_scan: false,
             input_pii_scan: false,
@@ -212,6 +211,125 @@ impl Default for Config {
             cloud_fallback_model: String::new(),
         }
     }
+}
+
+/// Every `PASTURE_*` variable the binary honours (ADR-266).
+///
+/// Used to spot typos: a misspelled name is otherwise invisible and permanent —
+/// `PASTURE_LOCAL_BAKEND=lmstudio` silently does nothing forever. A test asserts
+/// this list covers everything the source actually reads, so it cannot drift.
+pub const KNOWN_ENV: &[&str] = &[
+    "PASTURE_ACCESS_LOG",
+    "PASTURE_ALLOW_SENSITIVE_CLOUD",
+    "PASTURE_ANTHROPIC_API_KEY",
+    "PASTURE_AUTH_TOKEN",
+    "PASTURE_BUDGET_ACTION",
+    "PASTURE_BUDGET_DAILY_TOKENS",
+    "PASTURE_CACHE",
+    "PASTURE_CACHE_CONTROL",
+    "PASTURE_CACHE_TTL",
+    "PASTURE_CASCADE",
+    "PASTURE_CASCADE_LOGPROB",
+    "PASTURE_CLOUD_FALLBACK_MODEL",
+    "PASTURE_CLOUD_FALLBACK_PROVIDER",
+    "PASTURE_CLOUD_MODEL",
+    "PASTURE_CLOUD_PRICE_PER_1M",
+    "PASTURE_CLOUD_PROVIDER",
+    "PASTURE_CLOUD_RETRY",
+    "PASTURE_CONFIG",
+    "PASTURE_CORS_ORIGINS",
+    "PASTURE_COST_LOG",
+    "PASTURE_DECISION_LOG",
+    "PASTURE_FAST_THRESHOLD",
+    "PASTURE_GPU_VRAM_MB",
+    "PASTURE_HARD_PROMPTS",
+    "PASTURE_HARD_THRESHOLD",
+    "PASTURE_HEALTH_COOLDOWN_SECS",
+    "PASTURE_INJECTION_GUARD",
+    "PASTURE_INJECT_CONTEXT",
+    "PASTURE_INPUT_PII_SCAN",
+    "PASTURE_LANG",
+    "PASTURE_LISTEN_ADDR",
+    "PASTURE_LOCAL_BACKEND",
+    "PASTURE_LOCAL_FAST_MODEL",
+    "PASTURE_LOCAL_MODEL",
+    "PASTURE_LOCAL_ONLY",
+    "PASTURE_LOCAL_OPENAI_URL",
+    "PASTURE_LOCAL_TIMEOUT",
+    "PASTURE_MAX_BODY_BYTES",
+    "PASTURE_OLLAMA_HOST",
+    "PASTURE_OLLAMA_PORT",
+    "PASTURE_OPENAI_API_KEY",
+    "PASTURE_OTEL_LOG",
+    "PASTURE_OUTPUT_PII_SCAN",
+    "PASTURE_PSEUDONYMIZE",
+    "PASTURE_RAM_MB",
+    "PASTURE_RATE_LIMIT",
+    "PASTURE_REQUEST_TIMEOUT",
+    "PASTURE_SEMANTIC_CACHE",
+    "PASTURE_SEMANTIC_MIN_LEXICAL",
+    "PASTURE_SEMANTIC_THRESHOLD",
+    "PASTURE_SKILLS",
+    "PASTURE_SPIKE_FACTOR",
+    "PASTURE_STRUCTURED_LOCAL",
+    "PASTURE_SYSTEM_PROMPT",
+    "PASTURE_THRESHOLD",
+];
+
+/// Variables whose value must parse as a number. A non-numeric value is silently
+/// discarded by `with_env`'s `if let Ok(..)` parses, so the user's setting simply
+/// never applies — worth saying out loud. (`PASTURE_CLOUD_PRICE_PER_1M` is
+/// deliberately absent: it is a comma-separated pair, not a bare number.)
+const NUMERIC_ENV: &[&str] = &[
+    "PASTURE_BUDGET_DAILY_TOKENS",
+    "PASTURE_CACHE",
+    "PASTURE_CACHE_TTL",
+    "PASTURE_CASCADE_LOGPROB",
+    "PASTURE_CLOUD_RETRY",
+    "PASTURE_FAST_THRESHOLD",
+    "PASTURE_GPU_VRAM_MB",
+    "PASTURE_HARD_THRESHOLD",
+    "PASTURE_HEALTH_COOLDOWN_SECS",
+    "PASTURE_LOCAL_TIMEOUT",
+    "PASTURE_MAX_BODY_BYTES",
+    "PASTURE_OLLAMA_PORT",
+    "PASTURE_RAM_MB",
+    "PASTURE_RATE_LIMIT",
+    "PASTURE_REQUEST_TIMEOUT",
+    "PASTURE_SEMANTIC_CACHE",
+    "PASTURE_SEMANTIC_MIN_LEXICAL",
+    "PASTURE_SEMANTIC_THRESHOLD",
+    "PASTURE_SPIKE_FACTOR",
+    "PASTURE_THRESHOLD",
+];
+
+/// Warn about `PASTURE_*` settings that will not take effect (ADR-266).
+///
+/// `with_env` parses with `if let Ok(..)` and no `else`, so a malformed value is
+/// dropped in silence; and a misspelled variable name matches nothing at all.
+/// Either way the user believes they configured something that was ignored.
+/// Returns the warnings rather than printing, so it is testable.
+pub fn env_warnings() -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, v) in std::env::vars() {
+        if !k.starts_with("PASTURE_") {
+            continue;
+        }
+        if !KNOWN_ENV.contains(&k.as_str()) {
+            out.push(format!("unknown setting {k} (typo? it is being ignored)"));
+            continue;
+        }
+        if NUMERIC_ENV.contains(&k.as_str())
+            && !v.trim().is_empty()
+            && v.trim().parse::<f64>().is_err()
+        {
+            out.push(format!(
+                "{k}={v:?} is not a number - ignoring it and using the default"
+            ));
+        }
+    }
+    out.sort();
+    out
 }
 
 impl Config {
@@ -230,6 +348,58 @@ impl Config {
             cfg.apply(key.trim(), val.trim());
         }
         cfg
+    }
+
+    /// Default config-file locations, in order (ADR-264).
+    /// `PASTURE_CONFIG` overrides both when set.
+    fn config_file_path() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("PASTURE_CONFIG") {
+            let p = p.trim();
+            if !p.is_empty() {
+                return Some(std::path::PathBuf::from(p));
+            }
+        }
+        // XDG-ish home location; falls back to the Windows profile var.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()?;
+        Some(std::path::Path::new(&home).join(".config/pasture/config"))
+    }
+
+    /// Overlay a `key = value` config file onto the current values (ADR-264).
+    ///
+    /// SPEC §8 documents the precedence *defaults → config file → env vars*, and
+    /// the parsing for it (`from_str_with_defaults` / `apply`) has existed and
+    /// been tested since ADR-190 — but nothing in the binary ever read a file,
+    /// so a user following the spec got silence. This is the missing call.
+    ///
+    /// A missing or unreadable file is not an error: the file is optional, and
+    /// env vars alone remain a complete configuration. Call this BEFORE
+    /// `with_env` so environment variables win, as documented.
+    pub fn with_config_file(self) -> Self {
+        let path = Self::config_file_path();
+        self.with_config_file_at(path.as_deref())
+    }
+
+    /// `with_config_file` with the path supplied explicitly, so the parsing and
+    /// precedence can be tested without touching `HOME`/`PASTURE_CONFIG`.
+    pub fn with_config_file_at(mut self, path: Option<&std::path::Path>) -> Self {
+        let Some(path) = path else {
+            return self;
+        };
+        let Ok(body) = std::fs::read_to_string(path) else {
+            return self;
+        };
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, val)) = line.split_once('=') {
+                self.apply(key.trim(), val.trim());
+            }
+        }
+        self
     }
 
     /// Overlay environment variables (`PASTURE_LISTEN_ADDR`, etc.).
@@ -262,21 +432,6 @@ impl Config {
         }
         if let Ok(v) = std::env::var("PASTURE_COST_LOG") {
             self.cost_log_path = v;
-        }
-        if let Ok(v) = std::env::var("PASTURE_DONATE_URL") {
-            let trimmed = v.trim().to_string();
-            if !trimmed.is_empty() {
-                self.donate_url = Some(trimmed);
-            }
-        }
-        if let Ok(v) = std::env::var("PASTURE_NO_NUDGE") {
-            match v.to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "" => self.no_nudge = true,
-                _ => {}
-            }
-        }
-        if let Ok(v) = std::env::var("PASTURE_STATE") {
-            self.state_path = v;
         }
         if let Ok(v) = std::env::var("PASTURE_ALLOW_SENSITIVE_CLOUD") {
             match v.to_ascii_lowercase().as_str() {
@@ -424,6 +579,12 @@ impl Config {
                 self.max_body_bytes = n;
             }
         }
+        if let Ok(v) = std::env::var("PASTURE_STRUCTURED_LOCAL") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "" => self.structured_local = true,
+                _ => {}
+            }
+        }
         if let Ok(v) = std::env::var("PASTURE_CACHE_CONTROL") {
             match v.to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" | "" => self.cache_control = true,
@@ -483,8 +644,6 @@ impl Config {
             "cloud_provider" => self.cloud_provider = val.to_string(),
             "cloud_model" => self.cloud_model = val.to_string(),
             "cost_log_path" => self.cost_log_path = val.to_string(),
-            "donate_url" => self.donate_url = Some(val.to_string()),
-            "state_path" => self.state_path = val.to_string(),
             "cascade" => self.cascade = matches!(val, "1" | "true" | "yes"),
             "cache_size" => {
                 if let Ok(n) = val.parse::<usize>() {
@@ -532,7 +691,6 @@ impl Config {
             }
             "system_prompt" => self.system_prompt = val.to_string(),
             "access_log" => self.access_log = val.to_string(),
-            "no_nudge" => self.no_nudge = matches!(val, "1" | "true" | "yes"),
             "allow_sensitive_cloud" => {
                 self.allow_sensitive_cloud = matches!(val, "1" | "true" | "yes")
             }
@@ -687,31 +845,36 @@ mod tests {
         let spec = std::fs::read_to_string(path).expect("SPEC.md must be readable");
         let mut found = std::collections::BTreeSet::new();
         for line in spec.lines() {
-            if !line.trim_start().starts_with('|') {
-                continue;
+            if line.trim_start().starts_with('|') {
+                found.extend(env_names_in(line));
             }
-            let bytes = line.as_bytes();
-            let mut i = 0;
-            while i + 8 <= bytes.len() {
-                if &bytes[i..i + 8] == b"PASTURE_" {
-                    let start = i;
-                    let mut j = i + 8;
-                    while j < bytes.len()
-                        && (bytes[j].is_ascii_uppercase()
-                            || bytes[j].is_ascii_digit()
-                            || bytes[j] == b'_')
-                    {
-                        j += 1;
-                    }
-                    // Require a non-empty suffix so the bare `PASTURE_*` glob in prose
-                    // never registers as a variable name.
-                    if j > start + 8 {
-                        found.insert(line[start..j].to_string());
-                    }
-                    i = j;
-                } else {
-                    i += 1;
+        }
+        found
+    }
+
+    /// Every `PASTURE_*` name appearing in `text`. A non-empty suffix is required
+    /// so the bare prefix that prose uses never registers as a variable name.
+    fn env_names_in(text: &str) -> std::collections::BTreeSet<String> {
+        let bytes = text.as_bytes();
+        let mut found = std::collections::BTreeSet::new();
+        let mut i = 0;
+        while i + 8 <= bytes.len() {
+            if &bytes[i..i + 8] == b"PASTURE_" {
+                let start = i;
+                let mut j = i + 8;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_uppercase()
+                        || bytes[j].is_ascii_digit()
+                        || bytes[j] == b'_')
+                {
+                    j += 1;
                 }
+                if j > start + 8 {
+                    found.insert(text[start..j].to_string());
+                }
+                i = j;
+            } else {
+                i += 1;
             }
         }
         found
@@ -733,27 +896,181 @@ mod tests {
     }
 
     #[test]
-    fn test_spec_has_no_phantom_pasture_env_vars() {
-        // ADR-190 (reverse direction): SPEC.md must not document a PASTURE_* env var
-        // that the config layer never reads — that is how `PASTURE_PROXY_TOKEN` crept
-        // in. A handful of non-config vars are read elsewhere (proxy/cli/cost) or are
-        // documented prefixes; allow-list those so the test targets real drift.
-        let documented = env_vars_documented_in_spec();
+    fn test_config_file_is_actually_read_and_env_wins() {
+        // ADR-264: SPEC §8 documented "defaults -> config file -> env" but
+        // nothing in the binary ever read a file, so `from_str_with_defaults` /
+        // `apply` were reachable only from tests. Pin the real chain.
+        let dir = std::env::temp_dir().join("pasture_cfgfile_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config");
+        std::fs::write(&path, "# comment\nlocal_model = from-file\n\n").unwrap();
+
+        // The file is applied on top of the defaults.
+        let cfg = Config::default().with_config_file_at(Some(path.as_path()));
+        assert_eq!(cfg.local_model, "from-file");
+
+        // A missing file is not an error — defaults survive untouched.
+        let missing = Config::default()
+            .with_config_file_at(Some(std::path::Path::new("/no/such/pasture/config")));
+        assert_eq!(missing.local_model, Config::default().local_model);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_spec_version_header_matches_cargo_toml() {
+        // ADR-260: SPEC.md's header claims to track Cargo.toml's version. It had
+        // silently drifted to "0.26.0 ... current through ADR-189" while the crate
+        // was at 0.28.0 and ADR-259 — 70 ADRs stale, in the file that is supposed
+        // to be the contract. Docs that assert a fact should be checked like any
+        // other assertion, which is this project's whole premise.
+        let spec = include_str!("../SPEC.md");
+        let version = env!("CARGO_PKG_VERSION");
+        let header: String = spec.lines().take(12).collect::<Vec<_>>().join("\n");
+        assert!(
+            header.contains(version),
+            "SPEC.md's header must state the current crate version ({version}); \
+update the `Version:` line. Header was:\n{header}"
+        );
+    }
+
+    #[test]
+    fn test_readme_documents_every_setting() {
+        // ADR-270: the README documented settings TWICE — a 430-word prose
+        // paragraph and a partial table — and between the two, 15 real settings
+        // appeared in neither, including PASTURE_ALLOW_SENSITIVE_CLOUD, the switch
+        // that turns off the privacy invariant. Two partial lists of one thing is
+        // a guarantee of drift, so there is now one list and this test keeps it
+        // whole.
+        //
+        // Biconditional on purpose, as in test_ci_badge_and_workflow_agree: a
+        // setting missing from the README is undiscoverable, and a README entry
+        // that is not a real setting is advice that silently does nothing.
+        let readme = include_str!("../README.md");
+        let missing: Vec<&str> = KNOWN_ENV
+            .iter()
+            .copied()
+            .filter(|v| !readme.contains(v))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "README.md must document every setting; missing: {missing:?}"
+        );
+
+        let invented: Vec<String> = env_names_in(readme)
+            .into_iter()
+            .filter(|v| !KNOWN_ENV.contains(&v.as_str()))
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "README.md documents settings that do not exist: {invented:?}"
+        );
+    }
+
+    #[test]
+    fn test_spec_documents_every_setting() {
+        // Same guarantee for the contract document. SPEC.md was missing
+        // PASTURE_GPU_VRAM_MB, which the older drift guard could not see because
+        // that variable is read in hardware.rs, not config.rs.
+        let spec = include_str!("../SPEC.md");
+        let missing: Vec<&str> = KNOWN_ENV
+            .iter()
+            .copied()
+            .filter(|v| !spec.contains(v))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "SPEC.md must document every setting; missing: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_ci_badge_and_workflow_agree() {
+        // ADR-269: the README carried a CI badge pointing at
+        // `.github/workflows/ci.yml`, a file that does not exist — so it served
+        // a 404 while implying "the gates run on every push". Same shape as
+        // ADR-260 above: a document asserting a fact nothing checks.
+        //
+        // The check is a biconditional on purpose. Badge without workflow is a
+        // lie; workflow without badge means someone activated CI and the README
+        // still hides it. Either direction should fail here, and the fix is
+        // whichever side is missing.
+        let readme = include_str!("../README.md");
+        let has_badge = readme.contains("actions/workflows/ci.yml/badge.svg");
+        let workflow =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
+        assert_eq!(
+            has_badge,
+            workflow.exists(),
+            "README's CI badge and .github/workflows/ci.yml must agree \
+(badge present: {has_badge}, workflow present: {}). See .github/CI-SETUP.md.",
+            workflow.exists()
+        );
+    }
+
+    #[test]
+    fn test_known_env_covers_everything_config_reads() {
+        // ADR-266: KNOWN_ENV drives the typo warning, so a variable the code
+        // reads but the list omits would be reported as "unknown" — actively
+        // misleading. Derive the truth from the source and require coverage.
+        // `PASTURE_PROXY_TOKEN` appears only inside a test comment documenting a
+        // historical drift bug, so it is not a real read.
         let read = env_vars_read_by_config();
-        // Vars surfaced in SPEC.md but resolved outside config.rs (BYOK keys read by
-        // the cloud layer; referral keys read by the CLI; the i18n language var).
-        let allow_external: &[&str] = &[
-            "PASTURE_OPENAI_API_KEY",
-            "PASTURE_ANTHROPIC_API_KEY",
-            "PASTURE_LANG",
-        ];
+        let missing: Vec<&String> = read
+            .iter()
+            .filter(|v| v.as_str() != "PASTURE_PROXY_TOKEN")
+            .filter(|v| !KNOWN_ENV.contains(&v.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "KNOWN_ENV is missing variables that config.rs reads: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_env_warnings_flag_typos_and_bad_numbers() {
+        // Uses real process env, so pick names no other test touches.
+        std::env::set_var("PASTURE_TOTALLY_BOGUS_NAME", "x");
+        std::env::set_var("PASTURE_OLLAMA_PORT", "not-a-port");
+        let w = env_warnings();
+        assert!(
+            w.iter()
+                .any(|m| m.contains("PASTURE_TOTALLY_BOGUS_NAME") && m.contains("unknown")),
+            "typo must be reported: {w:?}"
+        );
+        assert!(
+            w.iter()
+                .any(|m| m.contains("PASTURE_OLLAMA_PORT") && m.contains("not a number")),
+            "malformed number must be reported: {w:?}"
+        );
+        std::env::remove_var("PASTURE_TOTALLY_BOGUS_NAME");
+        std::env::remove_var("PASTURE_OLLAMA_PORT");
+        // A clean environment produces no warnings about these.
+        let w2 = env_warnings();
+        assert!(!w2.iter().any(|m| m.contains("PASTURE_TOTALLY_BOGUS_NAME")));
+    }
+
+    #[test]
+    fn test_spec_has_no_phantom_pasture_env_vars() {
+        // ADR-190 (reverse direction): SPEC.md must not document a PASTURE_* env
+        // var that nothing honours — that is how `PASTURE_PROXY_TOKEN` crept in.
+        //
+        // ADR-270: this used to compare against `env_vars_read_by_config()` plus a
+        // hand-maintained allow-list of vars resolved outside config.rs (BYOK keys,
+        // the i18n language var, hardware overrides). That allow-list was itself a
+        // second list of the same thing, and it drifted the moment a new hardware
+        // override was documented. KNOWN_ENV is already the authoritative set of
+        // honoured names — and is itself pinned by
+        // `test_known_env_covers_everything_config_reads` — so compare against
+        // that and delete the allow-list.
+        let documented = env_vars_documented_in_spec();
         let phantom: Vec<&String> = documented
             .iter()
-            .filter(|v| !read.contains(*v) && !allow_external.contains(&v.as_str()))
+            .filter(|v| !KNOWN_ENV.contains(&v.as_str()))
             .collect();
         assert!(
             phantom.is_empty(),
-            "SPEC.md documents PASTURE_* vars that config.rs never reads (drift or typo): {phantom:?}"
+            "SPEC.md documents PASTURE_* vars that nothing honours (drift or typo): {phantom:?}"
         );
     }
 
@@ -822,14 +1139,15 @@ mod tests {
 
     #[test]
     fn test_config_file_boolean_parity_with_env() {
-        // These flags were env-only (PASTURE_NO_NUDGE / PASTURE_ALLOW_SENSITIVE_CLOUD)
-        // and silently ignored in config files before; now they have file parity.
-        let cfg = Config::from_str_with_defaults("no_nudge = true\nallow_sensitive_cloud = yes");
-        assert!(cfg.no_nudge);
+        // These flags were once env-only and silently ignored in config files;
+        // they now have file parity. (The original example used no_nudge, which
+        // ADR-258 deleted along with the nudge; local_only covers the same path.)
+        let cfg = Config::from_str_with_defaults("local_only = true\nallow_sensitive_cloud = yes");
+        assert!(cfg.local_only);
         assert!(cfg.allow_sensitive_cloud);
         // Defaults remain false when unset / falsey.
-        let off = Config::from_str_with_defaults("no_nudge = false");
-        assert!(!off.no_nudge);
+        let off = Config::from_str_with_defaults("local_only = false");
+        assert!(!off.local_only);
         assert!(!off.allow_sensitive_cloud);
     }
 
@@ -863,7 +1181,7 @@ mod tests {
         assert!(!disabled2.allow_sensitive_cloud, "\"0\" must NOT enable");
         let disabled3 = Config::from_str_with_defaults("allow_sensitive_cloud = no");
         assert!(!disabled3.allow_sensitive_cloud, "\"no\" must NOT enable");
-        // Same for local_only, no_nudge, cascade, inject_context
+        // Same for local_only, cascade, inject_context
         let lo = Config::from_str_with_defaults("local_only = 1");
         assert!(lo.local_only);
         let lo_off = Config::from_str_with_defaults("local_only = 0");

@@ -20,15 +20,16 @@ pub mod eval;
 pub mod guard;
 pub mod hardware;
 pub mod health;
+pub mod http;
 pub mod i18n;
 pub mod improve;
 pub mod json;
-pub mod monetize;
 pub mod output_scan;
 pub mod privacy;
 pub mod proxy;
 pub mod pseudonymize;
 pub mod ratelimit;
+pub mod response;
 pub mod routing;
 pub mod telemetry;
 

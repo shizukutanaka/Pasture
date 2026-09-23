@@ -155,6 +155,7 @@ pub(crate) fn fold_char_for_detection(c: char) -> char {
 ///     credit card / My Number with dash separators is detected);
 ///   - the ideographic space (`　`, U+3000) → ASCII space (so full-width-spaced
 ///     groups tokenize correctly).
+///
 /// All other characters are unchanged. This is the "Layer 1 normalization" step
 /// common to Japanese-PII pipelines; it is std-only and deliberately targeted
 /// (not a full NFKC, which would require an external crate) — it covers exactly

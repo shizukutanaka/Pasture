@@ -484,15 +484,25 @@ impl OllamaBackend {
 
     /// Build the Ollama `/api/chat` request body (non-streaming).
     pub fn build_body(req: &CompletionRequest) -> String {
-        Self::build_body_inner(req, false)
+        Self::build_body_inner(req, false, false)
     }
 
     /// Build the Ollama `/api/chat` request body with streaming enabled.
     pub fn build_body_streaming(req: &CompletionRequest) -> String {
-        Self::build_body_inner(req, true)
+        Self::build_body_inner(req, true, false)
     }
 
-    fn build_body_inner(req: &CompletionRequest, stream: bool) -> String {
+    /// Build the `/api/chat` body asking Ollama to return per-token log
+    /// probabilities (ADR-273). Ollama has honoured `"logprobs": true` since
+    /// v0.12.11 (2025-11-12, PR #12899); older builds ignore the unknown field and simply
+    /// omit `logprobs` from the response, which `parse_mean_logprob` reads as
+    /// `None` — the pre-existing text-heuristic fallback. Only `complete_scored`
+    /// sends it; plain and streaming bodies are byte-identical to before.
+    pub fn build_body_scored(req: &CompletionRequest) -> String {
+        Self::build_body_inner(req, false, true)
+    }
+
+    fn build_body_inner(req: &CompletionRequest, stream: bool, logprobs: bool) -> String {
         let msgs: Vec<String> = req
             .messages
             .iter()
@@ -521,14 +531,61 @@ impl OllamaBackend {
                 }
             })
             .collect();
+        let logprobs_field = if logprobs { ",\"logprobs\":true" } else { "" };
         format!(
-            "{{\"model\":\"{}\",\"stream\":{stream},\"messages\":[{}]{}{}{}}}",
+            "{{\"model\":\"{}\",\"stream\":{stream},\"messages\":[{}]{}{}{}{logprobs_field}}}",
             escape_string(&req.model),
             msgs.join(","),
             req.sampling.ollama_format_field(),
             req.sampling.ollama_tools_field(),
             req.sampling.ollama_options()
         )
+    }
+
+    /// Mean per-token log probability from an Ollama `/api/chat` response
+    /// (ADR-273). Ollama's wire shape (api/types.go `ChatResponse.Logprobs`)
+    /// is a top-level array: `"logprobs":[{"token":"Par","logprob":-0.05,
+    /// "bytes":[80,97,114],"top_logprobs":[…]},…]`. Returns `None` when the
+    /// field is absent (Ollama older than v0.12.11, or a runner that omits it)
+    /// or carries no finite values, so callers fall back to the text heuristic
+    /// exactly as before. Mirrors `cloud::mean_logprob_from_openai`, which
+    /// reads the same signal in OpenAI shape.
+    pub fn parse_mean_logprob(body: &str) -> Option<f64> {
+        let v = parse(body).ok()?;
+        let lps: Vec<f64> = v
+            .get("logprobs")
+            .and_then(JsonValue::as_array)?
+            .iter()
+            .filter_map(|t| t.get("logprob").and_then(|x| x.as_f64()))
+            .filter(|x| x.is_finite())
+            .collect();
+        if lps.is_empty() {
+            return None;
+        }
+        Some(lps.iter().sum::<f64>() / lps.len() as f64)
+    }
+
+    /// Read Ollama's authoritative token counts from a response or final stream
+    /// frame (ADR-255): `prompt_eval_count` / `eval_count`. Returns `None` per
+    /// field when absent, so callers fall back to the length estimate.
+    ///
+    /// Ollama reports what it actually processed. Estimating from the reply text
+    /// instead is not merely imprecise — it is wrong by orders of magnitude for a
+    /// **thinking model**, whose reasoning trace arrives in `message.thinking`
+    /// and never appears in `content`. A response that generated 250 tokens to
+    /// answer "42" estimates as 1, so `/v1/stats`, the cost log and the
+    /// local-savings figure (IMP-37) all understate the work done ~250x.
+    pub fn parse_usage(body: &str) -> (Option<u64>, Option<u64>) {
+        let Ok(v) = parse(body) else {
+            return (None, None);
+        };
+        let get = |k: &str| {
+            v.get(k).and_then(|n| match n {
+                JsonValue::Number(f) if *f >= 0.0 => Some(*f as u64),
+                _ => None,
+            })
+        };
+        (get("prompt_eval_count"), get("eval_count"))
     }
 
     /// Extract the assistant content from an Ollama `/api/chat` response body.
@@ -551,8 +608,12 @@ impl Backend for OllamaBackend {
         let body = Self::build_body(req);
         let response = http_post(&self.host, self.port, "/api/chat", &body, self.timeout)?;
         let content = Self::parse_response(&response)?;
-        let prompt_tokens = crate::routing::estimate_tokens(&req.estimation_text()) as u64;
-        let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
+        // ADR-255: prefer Ollama's own counts; estimate only when it omits them.
+        let (rp, rc) = Self::parse_usage(&response);
+        let prompt_tokens =
+            rp.unwrap_or_else(|| crate::routing::estimate_tokens(&req.estimation_text()) as u64);
+        let completion_tokens =
+            rc.unwrap_or_else(|| crate::routing::estimate_tokens(&content) as u64);
         Ok(CompletionResponse {
             content,
             model: self.model.clone(),
@@ -562,6 +623,37 @@ impl Backend for OllamaBackend {
         })
     }
 
+    /// ADR-273: ask Ollama for logprobs and return the mean as the confidence
+    /// signal. Until this existed, the default backend used the trait default
+    /// (`None`), so the cascade fell back to a text heuristic that ADR-272
+    /// measured as no better than a constant `false`, and `pasture label`
+    /// skipped every answer as unscored — while Ollama had been reporting the
+    /// signal since v0.12.11 (2025-11-12). Same shape as `complete`; only the body differs.
+    fn complete_scored(
+        &self,
+        req: &CompletionRequest,
+    ) -> Result<(CompletionResponse, Option<f64>), BackendError> {
+        let body = Self::build_body_scored(req);
+        let response = http_post(&self.host, self.port, "/api/chat", &body, self.timeout)?;
+        let content = Self::parse_response(&response)?;
+        let (rp, rc) = Self::parse_usage(&response);
+        let prompt_tokens =
+            rp.unwrap_or_else(|| crate::routing::estimate_tokens(&req.estimation_text()) as u64);
+        let completion_tokens =
+            rc.unwrap_or_else(|| crate::routing::estimate_tokens(&content) as u64);
+        let confidence = Self::parse_mean_logprob(&response);
+        Ok((
+            CompletionResponse {
+                content,
+                model: self.model.clone(),
+                prompt_tokens,
+                completion_tokens,
+                tool_calls: None,
+            },
+            confidence,
+        ))
+    }
+
     fn stream_complete(
         &self,
         req: &CompletionRequest,
@@ -569,6 +661,7 @@ impl Backend for OllamaBackend {
     ) -> Result<CompletionResponse, BackendError> {
         let body = Self::build_body_streaming(req);
         let mut content = String::new();
+        let mut reported: (Option<u64>, Option<u64>) = (None, None);
         http_post_streaming(
             &self.host,
             self.port,
@@ -580,13 +673,22 @@ impl Backend for OllamaBackend {
                     content.push_str(&d);
                     on_delta(&d);
                 }
+                // ADR-255: the final frame (done:true) carries the real counts.
+                let (p, c) = Self::parse_usage(line);
+                if p.is_some() || c.is_some() {
+                    reported = (p.or(reported.0), c.or(reported.1));
+                }
             },
         )?;
         if content.is_empty() {
             return Err(BackendError::Protocol("empty stream".to_string()));
         }
-        let prompt_tokens = crate::routing::estimate_tokens(&req.estimation_text()) as u64;
-        let completion_tokens = crate::routing::estimate_tokens(&content) as u64;
+        let prompt_tokens = reported
+            .0
+            .unwrap_or_else(|| crate::routing::estimate_tokens(&req.estimation_text()) as u64);
+        let completion_tokens = reported
+            .1
+            .unwrap_or_else(|| crate::routing::estimate_tokens(&content) as u64);
         Ok(CompletionResponse {
             content,
             model: self.model.clone(),
@@ -950,6 +1052,41 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_ollama_parse_usage_reads_reported_counts() {
+        // ADR-255: Ollama reports what it actually processed.
+        let body = r#"{"message":{"role":"assistant","content":"42"},"done":true,
+                       "prompt_eval_count":10,"eval_count":250}"#;
+        assert_eq!(OllamaBackend::parse_usage(body), (Some(10), Some(250)));
+        // Absent fields fall back to None so the caller estimates.
+        let bare = r#"{"message":{"role":"assistant","content":"42"},"done":true}"#;
+        assert_eq!(OllamaBackend::parse_usage(bare), (None, None));
+        // Malformed / negative values are ignored rather than trusted.
+        let bad = r#"{"prompt_eval_count":"ten","eval_count":-5}"#;
+        assert_eq!(OllamaBackend::parse_usage(bad), (None, None));
+        assert_eq!(OllamaBackend::parse_usage("not json"), (None, None));
+    }
+
+    #[test]
+    fn test_thinking_model_usage_is_not_estimated_from_content() {
+        // A thinking model puts its reasoning in message.thinking, so `content`
+        // is just the short answer. Estimating from content counted 1 token for
+        // a response that really generated 250 — a ~250x undercount that flowed
+        // into /v1/stats, the cost log and the local-savings figure (IMP-37).
+        let body = r#"{"message":{"role":"assistant",
+            "thinking":"Let me work through this carefully.","content":"42"},
+            "done":true,"prompt_eval_count":10,"eval_count":250}"#;
+        // Content parsing is unaffected: the reasoning trace is correctly excluded.
+        assert_eq!(OllamaBackend::parse_response(body).unwrap(), "42");
+        let (p, c) = OllamaBackend::parse_usage(body);
+        assert_eq!(c, Some(250), "must use the reported count, not estimate 1");
+        assert_eq!(p, Some(10));
+        assert!(
+            crate::routing::estimate_tokens("42") < 5,
+            "estimate really is tiny"
+        );
+    }
     use super::*;
 
     fn req() -> CompletionRequest {
@@ -1079,6 +1216,61 @@ mod tests {
         r.messages[1].content = "quote \" and \\ slash".to_string();
         let body = OllamaBackend::build_body(&r);
         assert!(body.contains("quote \\\" and \\\\ slash"));
+    }
+
+    #[test]
+    fn test_ollama_build_body_scored_sets_logprobs_flag() {
+        // ADR-273: only the scored body asks for logprobs.
+        let scored = OllamaBackend::build_body_scored(&req());
+        assert!(scored.ends_with(",\"logprobs\":true}"), "{scored}");
+        assert!(crate::json::parse(&scored).is_ok(), "must stay valid JSON");
+    }
+
+    #[test]
+    fn test_ollama_build_body_unchanged_without_scoring() {
+        // Plain and streaming requests must be byte-identical to before: the
+        // flag is harmless on old Ollama, but there is no reason to send it on
+        // every request, and a diff here would mean a silent wire change.
+        assert!(!OllamaBackend::build_body(&req()).contains("logprobs"));
+        assert!(!OllamaBackend::build_body_streaming(&req()).contains("logprobs"));
+    }
+
+    #[test]
+    fn test_ollama_parse_mean_logprob_wire_shape() {
+        // The exact shape from ollama/api/types.go (ChatResponse.Logprobs:
+        // []Logprob, Logprob embeds TokenLogprob{token, logprob, bytes} and
+        // adds top_logprobs). Pinned verbatim because real Ollama cannot run
+        // in this sandbox; the first live run is the integration test.
+        let body = r#"{"model":"llama3.2","message":{"role":"assistant","content":"Paris"},
+            "logprobs":[
+              {"token":"Par","logprob":-0.1,"bytes":[80,97,114],"top_logprobs":[{"token":"Par","logprob":-0.1,"bytes":[80,97,114]}]},
+              {"token":"is","logprob":-0.3,"bytes":[105,115],"top_logprobs":[]}
+            ],
+            "done":true,"prompt_eval_count":7,"eval_count":2}"#;
+        let m = OllamaBackend::parse_mean_logprob(body).unwrap();
+        assert!((m - (-0.2)).abs() < 1e-9, "mean of -0.1 and -0.3, got {m}");
+    }
+
+    #[test]
+    fn test_ollama_parse_mean_logprob_absent_is_none() {
+        // Ollama older than v0.12.11 ignores the request flag and omits the
+        // field entirely; that must read as "no signal", not as an error.
+        let body = r#"{"message":{"role":"assistant","content":"Paris"},"done":true}"#;
+        assert_eq!(OllamaBackend::parse_mean_logprob(body), None);
+        let empty = r#"{"message":{"role":"assistant","content":"x"},"logprobs":[],"done":true}"#;
+        assert_eq!(OllamaBackend::parse_mean_logprob(empty), None);
+    }
+
+    #[test]
+    fn test_ollama_parse_mean_logprob_ignores_non_finite() {
+        // A NaN/inf token would poison the mean and make the cascade compare
+        // garbage against its threshold; skip such tokens, and treat an
+        // all-garbage array as no signal.
+        let body = r#"{"message":{"content":"x"},"logprobs":[{"logprob":-0.5},{"logprob":null},{"token":"?"}],"done":true}"#;
+        let m = OllamaBackend::parse_mean_logprob(body).unwrap();
+        assert!((m + 0.5).abs() < 1e-9);
+        let none = r#"{"message":{"content":"x"},"logprobs":[{"logprob":null}],"done":true}"#;
+        assert_eq!(OllamaBackend::parse_mean_logprob(none), None);
     }
 
     #[test]

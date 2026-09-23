@@ -29,6 +29,15 @@ const UNCERTAINTY_MARKERS: &[&str] = &[
     "お答えでき",
 ];
 
+/// The uncertainty markers `is_low_confidence` matches, for the held-out
+/// cascade corpus guard (ADR-272). Test-only, and derived from the const itself
+/// so adding a marker automatically re-screens the corpus — the same discipline
+/// `routing::all_markers` applies to the routing corpus.
+#[cfg(test)]
+pub(crate) fn uncertainty_markers() -> &'static [&'static str] {
+    UNCERTAINTY_MARKERS
+}
+
 /// True when the local answer looks low-confidence and should escalate.
 /// Conservative: only empty/near-empty answers or explicit uncertainty markers
 /// trigger escalation, to avoid wasting cloud calls on good short answers.
@@ -44,8 +53,9 @@ pub fn is_low_confidence(answer: &str) -> bool {
 /// Decide whether to escalate a local answer to the cloud. Prefers the
 /// research-backed mean token log-probability signal when the backend provides
 /// it (arXiv 2605.02241: average log-prob matches or beats supervised routers
-/// for local->cloud routing, with no training data). When unavailable (e.g.
-/// Ollama without logprobs), falls back to the text heuristic.
+/// for local->cloud routing, with no training data). When unavailable (a
+/// backend that does not report logprobs, or an Ollama older than v0.12.11
+/// — see ADR-273), falls back to the text heuristic.
 ///
 /// `mean_logprob` is <= 0; escalate when it drops below `logprob_threshold`.
 ///

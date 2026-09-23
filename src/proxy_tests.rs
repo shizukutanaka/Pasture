@@ -3,7 +3,7 @@
 //! `proxy`, so `use super::*` and private-item access work unchanged).
 
 use super::*;
-use crate::backend::MockBackend;
+use crate::backend::{EmbeddingsResponse, MockBackend};
 
 fn proxy_with(local: bool, cloud: bool, threshold: usize, log: &str) -> Proxy {
     let engine = RoutingEngine::new(threshold, local, cloud);
@@ -647,6 +647,241 @@ fn test_roundtrip_bad_json_is_400_envelope() {
     );
 }
 
+fn tmp_access_log(tag: &str) -> String {
+    let p = std::env::temp_dir().join(format!("pasture_access_{tag}_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p.to_string_lossy().into_owned()
+}
+
+#[test]
+fn test_413_is_traceable_cors_readable_and_access_logged() {
+    // ADR-277: the 413 was written from an early return in handle_connection,
+    // before the request id, CORS and Server headers or the access-log macro
+    // existed. The headers were already parsed (http.rs rejects on
+    // Content-Length after reading them), so method, path, origin and the
+    // caller's X-Request-ID were known and discarded. A browser client got an
+    // unreadable opaque error; an operator got no log line and no trace id.
+    let access = tmp_access_log("413");
+    let p = proxy_with(true, false, 100, "unused")
+        .with_max_body_bytes(100)
+        .with_cors(CorsPolicy::parse("https://ok.com"))
+        .with_access_log(Some(access.clone()));
+    let resp = roundtrip_raw(
+        p,
+        "POST /v1/chat/completions?x=1 HTTP/1.1\r\nHost: x\r\nOrigin: https://ok.com\r\n\
+X-Request-ID: trace-413\r\nContent-Type: application/json\r\nContent-Length: 101\r\n\r\n"
+            .to_string(),
+    );
+    assert!(resp.starts_with("HTTP/1.1 413 "), "{resp}");
+    assert!(resp.contains("X-Request-ID: trace-413\r\n"), "{resp}");
+    assert!(
+        resp.contains("Access-Control-Allow-Origin: https://ok.com\r\n"),
+        "{resp}"
+    );
+    assert!(resp.contains("Server: pasture/"), "{resp}");
+    let log = std::fs::read_to_string(&access).unwrap_or_default();
+    assert!(
+        log.contains("\"method\":\"POST\"")
+            && log.contains("\"path\":\"/v1/chat/completions\"")
+            && log.contains("\"status\":413")
+            && log.contains("\"request_id\":\"trace-413\""),
+        "413 must be access-logged with its method, path and trace id: {log:?}"
+    );
+    let _ = std::fs::remove_file(&access);
+}
+
+#[test]
+fn test_408_mid_body_is_traceable_and_access_logged() {
+    // Headers complete, body never arrives: method/path/trace id are known.
+    let access = tmp_access_log("408body");
+    let p = proxy_with(true, false, 100, "unused")
+        .with_request_timeout(Some(std::time::Duration::from_millis(50)))
+        .with_access_log(Some(access.clone()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(addr).unwrap();
+        c.write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nX-Request-ID: trace-408\r\n\
+Content-Type: application/json\r\nContent-Length: 50\r\n\r\n{\"partial\":",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut resp = String::new();
+        let _ = c.read_to_string(&mut resp);
+        resp
+    });
+    let (mut s, _) = listener.accept().unwrap();
+    p.handle_connection(&mut s).unwrap();
+    drop(s);
+    let resp = client.join().unwrap();
+    assert!(resp.starts_with("HTTP/1.1 408 "), "{resp}");
+    assert!(resp.contains("X-Request-ID: trace-408\r\n"), "{resp}");
+    assert!(resp.contains("Server: pasture/"), "{resp}");
+    let log = std::fs::read_to_string(&access).unwrap_or_default();
+    assert!(
+        log.contains("\"path\":\"/v1/chat/completions\"")
+            && log.contains("\"status\":408")
+            && log.contains("\"request_id\":\"trace-408\""),
+        "{log:?}"
+    );
+    let _ = std::fs::remove_file(&access);
+}
+
+#[test]
+fn test_408_before_headers_still_gets_a_trace_id_and_log_line() {
+    // Headers never terminate, so nothing about the request is known. The
+    // response must still carry a minted X-Request-ID and the Server header,
+    // and the log line uses "-" for the unknown method/path (the common-log
+    // convention) rather than being skipped.
+    let access = tmp_access_log("408head");
+    let p = proxy_with(true, false, 100, "unused")
+        .with_request_timeout(Some(std::time::Duration::from_millis(50)))
+        .with_access_log(Some(access.clone()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(addr).unwrap();
+        c.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut resp = String::new();
+        let _ = c.read_to_string(&mut resp);
+        resp
+    });
+    let (mut s, _) = listener.accept().unwrap();
+    p.handle_connection(&mut s).unwrap();
+    drop(s);
+    let resp = client.join().unwrap();
+    assert!(resp.starts_with("HTTP/1.1 408 "), "{resp}");
+    assert!(resp.contains("X-Request-ID: req_"), "{resp}");
+    assert!(resp.contains("Server: pasture/"), "{resp}");
+    let log = std::fs::read_to_string(&access).unwrap_or_default();
+    assert!(
+        log.contains("\"method\":\"-\"")
+            && log.contains("\"path\":\"-\"")
+            && log.contains("\"status\":408"),
+        "{log:?}"
+    );
+    let _ = std::fs::remove_file(&access);
+}
+
+#[test]
+fn test_too_many_headers_is_431_traceable_and_logged() {
+    // ADR-278: the 1000-header DoS guard returned ReadOutcome::Closed - the same
+    // variant as a clean EOF - so the client's connection was dropped with no
+    // status at all and nothing was logged. RFC 6585 §5 names the response:
+    // 431 Request Header Fields Too Large. The request line and the headers
+    // before the cutoff are already parsed, so the trace id and path survive.
+    let access = tmp_access_log("431n");
+    let p = proxy_with(true, false, 100, "unused").with_access_log(Some(access.clone()));
+    let mut req = String::from("GET /v1/models HTTP/1.1\r\nHost: x\r\nX-Request-ID: trace-431\r\n");
+    for i in 0..1200 {
+        req.push_str(&format!("X-H{i}: v\r\n"));
+    }
+    req.push_str("\r\n");
+    let resp = roundtrip_raw(p, req);
+    assert!(
+        resp.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+        "{}",
+        &resp[..resp.len().min(200)]
+    );
+    assert!(resp.contains("X-Request-ID: trace-431\r\n"), "{resp}");
+    assert!(
+        resp.contains("\"type\":\"invalid_request_error\""),
+        "{resp}"
+    );
+    let log = std::fs::read_to_string(&access).unwrap_or_default();
+    assert!(
+        log.contains("\"path\":\"/v1/models\"")
+            && log.contains("\"status\":431")
+            && log.contains("\"request_id\":\"trace-431\""),
+        "{log:?}"
+    );
+    let _ = std::fs::remove_file(&access);
+}
+
+#[test]
+fn test_oversized_header_block_is_431_and_logged() {
+    // The 1 MiB guard fires before the header terminator is seen, so nothing
+    // is known about the request: method/path log as "-". The client may be
+    // reset while still sending (the server stops reading), so this pins the
+    // server side - a log line, and handle_connection not panicking - rather
+    // than the client's ability to read the 431.
+    let access = tmp_access_log("431b");
+    let p = proxy_with(true, false, 100, "unused").with_access_log(Some(access.clone()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(addr).unwrap();
+        let mut req = b"GET /v1/models HTTP/1.1\r\nHost: x\r\nCookie: ".to_vec();
+        req.extend(std::iter::repeat(b'a').take(1_100_000));
+        let _ = c.write_all(&req);
+        let mut resp = Vec::new();
+        let _ = c.read_to_end(&mut resp);
+        String::from_utf8_lossy(&resp).into_owned()
+    });
+    let (mut s, _) = listener.accept().unwrap();
+    let _ = p.handle_connection(&mut s);
+    drop(s);
+    let resp = client.join().unwrap();
+    if !resp.is_empty() {
+        assert!(
+            resp.starts_with("HTTP/1.1 431 "),
+            "{}",
+            &resp[..resp.len().min(200)]
+        );
+    }
+    let log = std::fs::read_to_string(&access).unwrap_or_default();
+    assert!(
+        log.contains("\"method\":\"-\"") && log.contains("\"status\":431"),
+        "{log:?}"
+    );
+    let _ = std::fs::remove_file(&access);
+}
+
+#[test]
+fn test_header_terminator_split_across_reads_is_found() {
+    // ADR-279 made the header-terminator search incremental: it resumes three
+    // bytes before the end of what was already searched. Get that overlap
+    // wrong and a "\r\n\r\n" straddling two socket reads is never found and
+    // the request hangs until the read timeout. Split the terminator at each
+    // of its three internal boundaries, pausing so the server sees two reads.
+    for split in 1..4 {
+        let p = proxy_with(true, false, 100, "unused")
+            .with_request_timeout(Some(std::time::Duration::from_secs(3)));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let head = b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close";
+            let term = b"\r\n\r\n";
+            let mut first = head.to_vec();
+            first.extend_from_slice(&term[..split]);
+            c.write_all(&first).unwrap();
+            c.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            c.write_all(&term[split..]).unwrap();
+            let mut resp = String::new();
+            let _ = c.read_to_string(&mut resp);
+            resp
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        let started = std::time::Instant::now();
+        p.handle_connection(&mut s).unwrap();
+        drop(s);
+        let resp = client.join().unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200 "),
+            "split at {split}: terminator not found across reads: {resp:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "split at {split}: request only completed via timeout"
+        );
+    }
+}
+
 #[test]
 fn test_roundtrip_oversized_body_is_413() {
     let p = proxy_with(true, true, 100, "unused");
@@ -799,7 +1034,10 @@ fn test_spec_documents_every_stats_response_field() {
     // format string and asserts each one appears as a `` `field_name` ``
     // markdown code span somewhere in SPEC.md, so a future field addition
     // that forgets the doc update fails CI instead of silently drifting.
-    let src = include_str!("proxy.rs");
+    //
+    // ADR-275 moved build_stats_response into response.rs; the scan target
+    // moved with it.
+    let src = include_str!("response.rs");
     let start = src
         .find("pub fn build_stats_response(")
         .expect("build_stats_response must exist");
@@ -4874,10 +5112,12 @@ fn test_fast_model_used_for_simple_prompt() {
 // ── Header line count DoS guard (ADR-097) ─────────────────────────────────
 
 #[test]
-fn test_excessive_header_count_closes_connection() {
-    // A request with > 1000 header fields must be silently closed (DoS guard,
-    // ADR-097). read_request returns ReadOutcome::Closed; the client receives
-    // no response bytes.
+fn test_excessive_header_count_is_rejected_not_served() {
+    // A request with > 1000 header fields must be rejected, not served (DoS
+    // guard, ADR-097, whose rationale is bounding the parse loop's CPU cost).
+    // ADR-097 did that by silently closing the connection; ADR-278 keeps the
+    // bound but answers 431 (RFC 6585 §5) so the client and the access log can
+    // see why. What must never happen is the flood being served as /health.
     let p = proxy_with(true, false, 100, "unused");
     let mut headers = String::new();
     for i in 0..1001usize {
@@ -4886,8 +5126,12 @@ fn test_excessive_header_count_closes_connection() {
     let raw = format!("GET /health HTTP/1.1\r\n{headers}\r\n");
     let resp = roundtrip_raw(p, raw);
     assert!(
-        resp.is_empty(),
-        "expected empty response (connection closed on excess headers), got: {resp}"
+        resp.starts_with("HTTP/1.1 431 "),
+        "expected 431 on excess headers, got: {resp}"
+    );
+    assert!(
+        !resp.contains("\"status\":\"ok\""),
+        "flood must not be served: {resp}"
     );
 }
 

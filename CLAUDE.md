@@ -29,9 +29,9 @@ If a change would weaken one of these, stop and reconsider the approach.
 - **Build/test with `rustup run stable cargo …`.** `rust-toolchain.toml` pins
   1.75.0, which cannot be downloaded here — plain `cargo` fails. `stable` is the
   installed fallback; the code stays MSRV-1.75 compatible regardless.
-- **Known clippy noise:** 9 pre-existing `doc list item` warnings in `guard.rs`
-  (2) and `privacy.rs` (7). They are not from your change — ignore them; only
-  act on warnings in files you touched.
+- **Clippy is clean (ADR-259).** The 9 long-standing `doc list item` warnings in
+  `guard.rs`/`privacy.rs` were fixed, and CI now runs `clippy --all-targets
+  -D warnings` on stable. Any warning you see is yours; fix it.
 - **Git proxy allows pushing the working branch only.** Tag pushes 403; there is
   no `create_release`/`create_tag` MCP tool. Publishing = pushing to the branch.
 - **End-to-end HTTP testing** without a real Ollama: run a fake NDJSON backend in
@@ -67,7 +67,7 @@ One improvement = one commit. For each:
 6. **Gate + commit + push:**
    ```
    rustup run stable cargo fmt
-   rustup run stable cargo test          # 867+ pass, 0 fail
+   rustup run stable cargo test          # 939+ pass, 0 fail
    rustup run stable cargo clippy --all-targets   # no NEW warnings
    git add -A && git commit && git push -u origin <branch>
    ```
@@ -101,8 +101,10 @@ Take items where an existing pattern is copied and the test net is large.
 **Mimic, don't invent.** Current Sonnet-scale items:
 - **IMP-46** semantic-cache lexical second-gate (contained in `cache.rs`).
 - **IMP-48** daily-counter history file for the dashboard (append-only JSONL).
-- **IMP-49** split `proxy.rs` into modules — pure mechanical extraction, zero
-  behaviour change, guarded by 867 tests.
+- **IMP-49** split `proxy.rs` into modules — two slices done (ADR-275
+  `response.rs`, ADR-276 `http.rs`); what remains is `impl Proxy` itself.
+  Pure mechanical extraction, zero behaviour change, guarded by 939 tests plus
+  a before/after wire byte-diff.
 - New PII value recognizers, new i18n keys, doc sync, test-coverage backfill,
   ledger hygiene — all copy an established ADR pattern.
 
@@ -112,7 +114,9 @@ it's Sonnet.
 
 ## Map of the repo
 
-- `src/proxy.rs` — HTTP server, request dispatch, routing glue, response builders (large).
+- `src/proxy.rs` — HTTP server, request dispatch, routing glue (large).
+- `src/response.rs` — pure OpenAI/SSE/Prometheus response body builders (no I/O).
+- `src/http.rs` — HTTP/1.1 wire layer: request parsing + DoS guards, auth, response writers.
 - `src/routing.rs` — the decision engine + hard-signal detectors (`hard_signals`, `is_multi_step`, `is_time_sensitive`).
 - `src/privacy.rs` — sensitivity classifier + PII value `*_spans` detectors + checksums.
 - `src/pseudonymize.rs` — reversible `<TOKEN_n>` masking + `StreamRestorer` (SSE-boundary safe).

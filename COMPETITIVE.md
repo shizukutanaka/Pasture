@@ -342,7 +342,7 @@ zero-dep/single-user/privacy wedge):**
 **Strengths (the moat — do not erode):**
 - **Zero-dependency single binary, std-only default.** No peer gateway ships
   this. It is the whole wedge; every change is judged against invariant I1.
-- **Verification culture.** 867 tests + `eval` harness + a SPEC drift-guard test
+- **Verification culture.** 926 tests + `eval` harness + a SPEC drift-guard test
   (`test_spec_documents_every_stats_response_field`) + i18n catalog-parity test.
   Features are routinely verified end-to-end against a fake NDJSON Ollama, not
   just unit-tested.
@@ -364,6 +364,9 @@ zero-dep/single-user/privacy wedge):**
   there is no time-series, so no trend/sparkline is possible without one.
 - **(W5) `proxy.rs` is ~4k lines.** The single-file HTTP/routing/dispatch module
   is large enough that finding call sites is slow; a module split would help.
+  *Narrowed, not closed (ADR-275/276):* response builders now live in
+  `src/response.rs` and the HTTP wire layer in `src/http.rs`; `proxy.rs` is
+  3,874 lines, nearly all of it `impl Proxy`.
 - **(W6) No live-model quality eval.** Tests use MockBackend / fake Ollama; there
   is no harness measuring real local-vs-cloud answer quality on a task set.
 
@@ -375,8 +378,110 @@ zero-dep/single-user/privacy wedge):**
 | **IMP-46** | Semantic-cache lexical second-gate | ✅ **SHIPPED (ADR-243)** — opt-in `PASTURE_SEMANTIC_MIN_LEXICAL` (default 0 = off): a cosine hit must also clear a Jaccard token-set overlap floor, rejecting embedding false-positives that would serve a wrong cached answer while preserving genuine paraphrase hits. std-only, in `cache.rs`; each entry stores a sorted token-hash fingerprint. |
 | **IMP-47** | Confidence-signal AUROC self-test | ✅ **SHIPPED (ADR-246)** — `calibrate --auroc --labels <f>` measures whether the cascade's confidence signal separates correct from incorrect answers *on this machine's model*, and says plainly when it does not. Grounded in the published per-model AUROC spread (~0.58 near-chance → ~0.84 useful) and the known collapse of verbalized confidence onto saturated values (average-rank ties ⇒ a constant signal scores exactly 0.5, not 1.0). **First mechanism in Pasture that validates a routing signal instead of just consuming it** — a partial answer to F4. The *verbalized-confidence extraction* half remains unshipped: the self-test is the load-bearing part and works on any (score, correct) pairs. |
 | **IMP-48** | Lightweight daily-counter history for the dashboard | ✅ **SHIPPED (ADR-245)** — closes W4. Simpler than the original sketch: **no new history file**. `cost::daily_summaries` rolls the existing PII-free cost log up per UTC day, `GET /v1/history` serves the last 30 days (routes/tokens/spend/savings), and the dashboard draws a stacked bar per day in pure flexbox. One source of truth ⇒ nothing to drift. |
-| **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | Closes W5: mechanical module extraction, no behaviour change — ideal Sonnet task with a large test net. |
-| **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | Research (Anthropic 5-min-TTL change): inject `cache_control`, price `cache_creation`/`cache_read` tokens correctly in the budget guard. Behind the `cloud` flag. |
+| **IMP-49** | Split `proxy.rs` into dispatch / handlers / response-builders | ◐ **FIRST SLICE SHIPPED (ADR-275)** — the 22 pure body builders (chat/legacy/Responses JSON, SSE chunks, `/v1/models`, `/v1/stats`, `/metrics`, moderation stub, error envelope, id/fingerprint helpers) moved verbatim to `src/response.rs`: `proxy.rs` 4,724 → 4,198 lines. Zero behaviour change, verified two ways: the test count is unchanged (939) and 11 endpoints return byte-identical wire responses before/after, with a one-character mutation proving the diff has teeth. **Second slice (ADR-276):** the HTTP/1.1 wire layer — `read_request`/`ReadOutcome` (keep-alive pipelining, body-size and header-count guards), constant-time `auth_ok`, the four `write_*` writers, `append_access_log` — moved to `src/http.rs`; `proxy.rs` now 3,874 lines. Same checks, harder cases: 939 tests unchanged, and 13 wire captures byte-identical including 401/405/413/415/204, CORS preflight, HEAD, and two pipelined requests on one connection. **Remaining, not claimed:** the ~3.4k-line `impl Proxy` itself. |
+| **IMP-50** | Anthropic prompt-cache params + cache-token pricing (cloud feature) | ◐ **PARTIALLY SHIPPED (ADR-254)** — injecting `cache_control` was already done (IMP-18), but the *accounting* half was not, and was **proven broken**: cached prompt tokens land in `cache_creation_input_tokens`/`cache_read_input_tokens` and were dropped entirely, undercounting a realistic cached request **1025×** and silently defeating `PASTURE_BUDGET_DAILY_TOKENS`. Both the buffered and streaming paths now sum all prompt-side fields. **Still open:** cached tokens are counted at face value, so their differing *prices* (cache writes cost more than base input, reads far less) are not modelled by the flat per-1M rate — that needs a richer price config. |
+
+### 4e-9. The quality gate could not fail (2026-09)
+
+> Socratic pass over the one thing that certifies Pasture's headline claim.
+> *What measures that routing is correct?* `pasture eval`. *What would it say if
+> routing were broken?* — the answer turned out to be "100%, and exit 0".
+
+| Finding | Verdict |
+|---|---|
+| **E1. The eval corpus was a tautology** | ✅ **FIXED (ADR-271)** — all 18 `default_cases` labels restate the router's own marker lists: `"…prove that…step by step"` is two `REASONING_MARKERS`, `"write a function…"` is a `FORMAT_MARKER`, `"return the result as JSON"` is a `STRUCTURED_MARKER`. The suite asserted that detectors detect themselves, so 100% was guaranteed by construction and would stay 100% however badly the rules generalised. A 30-case **held-out** set now carries no trigger string at all — enforced by a test that reads the marker lists out of `routing.rs`, so adding a marker automatically re-screens the corpus. |
+| **E2. The gate could not fail** | ✅ **FIXED (ADR-271)** — `run_eval` returned `0` on every path. CI Gate 4 (`cargo run --release -- eval`) passes on exit code, so accuracy could have been 0% and the gate would still be green: a print statement wearing a gate's name. It now exits 1 when the regression set drops below 100%, when held-out accuracy falls below the recorded floor, or — unconditionally — when any sensitive prompt escalates (I2). All four failure modes were mutation-verified. |
+| **E3. The "threshold sweep" measured arithmetic** | ✅ **DELETED (ADR-271)** — it swept over `length_samples()`: one sentence repeated 1/10/60/200 times. Four samples, no routing content; the published `75/50/50/25/0%` was just "does a longer string exceed a bigger integer". Deleted rather than decorated — `pasture calibrate` already fits the threshold to the user's *real* cost log, which is the honest version of the same idea. |
+| **E4. The measurement it was hiding** | ⚠️ **OPEN, now quantified.** With a genuinely held-out set the router scores **66.7% (20/30)** — and every one of the ten misses is the same failure: a hard, plainly-phrased prompt kept local ("Which costs less over ten years, a heat pump or a gas furnace…", "この契約書の条項が借り手に不利かどうか判断して"). Zero false escalations and zero I2 breaches — the failure is one-directional, in the quality-risk direction. The honest ceiling on a purely lexical **pre-request** router. |
+| **E5. …and my statement of E4 was itself overstated** | ✅ **CORRECTED (ADR-272).** ADR-271 concluded "absent a trigger string or sheer length, hardness is invisible to the router." That is false as written. `cascade.rs:59` `should_escalate` falls back to the text heuristic when no logprob is available — i.e. **on Ollama, today** — so Pasture *can* catch a hard-but-plainly-phrased prompt by answering locally and escalating a visibly weak answer. The accurate claim is narrower: *the pre-request lexical router cannot see hardness; the post-request mechanism that can (`PASTURE_CASCADE`) is off by default.* Superseded in the ledger rather than edited there. |
+| **E6. The new eval measured only half the system** | ✅ **FIXED (ADR-272)** — the held-out prompt corpora score `engine.decide_*` and cannot exercise cascade, yet the output said "measures how the rules generalise": a milder replay of the E1 sin. `eval` now states the scope limit and adds a **third held-out corpus for the answer classifier** — 23 answers a small model plausibly gives, containing none of `UNCERTAINTY_MARKERS`. |
+| **E7. The cascade text heuristic adds no signal on held-out answers** | ⚠️ **OPEN, measured.** `is_low_confidence` scores **47.8% (11/23)**, catching **0 of 12** held-out weak answers ("That depends on a lot of factors…", "一概には言えません…") with 0 false escalations. A classifier returning a constant `false` scores the identical 11/23 — the corpus is 11 keep / 12 escalate. Outside its own marker strings it is indistinguishable from "never escalate". **This also makes its own floor near-vacuous, which is stated in the code rather than hidden:** mutation-testing confirmed that forcing the classifier to always return `false` does *not* trip the floor. The assertions with teeth are `false_escalations == 0` and the marker guard. Logprobs are the signal that generalises — and per ADR-273 the default backend *does* report them; Pasture had not been asking (V2). |
+| **E8. V2 was a stale memory, and a docs check would have re-confirmed it** | ✅ **FIXED (ADR-273).** "The default backend does not report logprobs" was recorded from memory and never re-verified. Ollama's `docs/api.md` on GitHub *still* does not mention logprobs, so a docs-only check would have agreed. The source (`api/types.go`) did not: the fields landed in v0.12.11 (2025-11-12), whose release notes say "Ollama's API and OpenAI-compatible API now support log probabilities." Lesson recorded: for a fast-moving peer, verify against source, not docs — and the fix was one request flag plus a 15-line parser, with every consumer (cascade, `label`, `calibrate --auroc/--error`) already built and waiting. |
+| **E9. A silent fallback the user could not see, and a marker that lied** | ✅ **FIXED (ADR-274).** ADR-273 left a user on an older Ollama getting a silent downgrade to the text heuristic, with `doctor` having no version awareness at all. `doctor` now reads Ollama's own `/api/version` (`routes.go`: `r.GET("/api/version", …)`) and names the side of **v0.12.11** (2025-11-12, *"Ollama's API and OpenAI-compatible API now support log probabilities"*) the machine is on — counted as a defect only when `PASTURE_CASCADE` is on, since nothing else consumes the signal. **Second, self-inflicted finding:** the first cut incremented the problem counter while printing a `[--]` line, so `doctor` said *"1 item(s) need attention (see [!!] above)"* with no `[!!]` on screen. The catalog's convention is that `[!!]` is counted and `[--]` never is (`cloud.off`, `hw.unknown`). A source-scanning guard for this **passed the very mutation it existed to catch** — a neighbouring `[!!]` message sat inside its window — so it was deleted and replaced by an assertion on the real binary's real output, with a std-only in-test Ollama stub. |
+| **E10. The two responses most likely to mean abuse were the two nobody could see** | ✅ **FIXED (ADR-277).** Found by ADR-276's wire capture: a `413` was written from an early return in `handle_connection` before the header block or access-log macro existed. The headers had already been parsed — `http.rs` rejects on `Content-Length` after reading them — so method, path, Origin and the caller's `X-Request-ID` were known and dropped. A browser client got an unreadable opaque error (no CORS); an operator got no trace id and no log line. `408` had the same gap. Both now go through `reject_early`, which shares one `response_extra` header builder with the served path. Three socket-level tests written first and seen failing; E2E shows the 413 now logged and CORS-readable while the other 11 captures stay byte-identical. |
+| **E11. Two DoS guards answered with silence** | ✅ **FIXED (ADR-278).** The 1 MiB header cap and ADR-097's 1000-field cap both returned `ReadOutcome::Closed` — the variant for a clean EOF — so a client with, say, an oversized cookie had its request vanish (zero bytes, or a reset) and nothing was logged. ADR-097's rationale was bounding the parse loop's CPU, not silence; `Closed` was simply the variant that existed. Both now answer `431 Request Header Fields Too Large` (RFC 6585 §5) through ADR-277's `reject_early`: logged, traceable, with the request line kept when it was parsed. |
+| **E12. A quadratic scan in front of the auth check** | ✅ **FIXED (ADR-279).** Measured while fixing E11: `read_request` searched the *whole* buffer for `\r\n\r\n` after every 1 KiB read — quadratic up to the 1 MiB cap. On the release build one oversized-header connection cost **~457 ms of CPU**, and header parsing runs before `PASTURE_AUTH_TOKEN` is checked, so an unauthenticated client could pin a core with a few cheap connections. ADR-097 capped the parse *loop* for exactly this class of cost and missed the scan that cost far more. The search now resumes 3 bytes before where it stopped: 10 such connections went from **4,570 ms to 20 ms** of server CPU. The 3-byte overlap is guarded by a test that splits the terminator at each internal boundary; overlaps of 0 and 2 were each caught at exactly the split they break. |
+
+**Strength worth stating plainly:** the privacy layer generalises where the
+routing layer does not. All seven obliquely-phrased PII prompts — casual
+phrasings the value detectors were never written against — were correctly
+classified sensitive and kept local. I2 holds outside its own test fixtures.
+
+### 4e-8. Deletion audit: applying step 2 to the shipped surface (2026-08)
+
+> Musk's algorithm puts *delete* before *simplify* and *automate*, and names the
+> failure mode as optimising something that should have been removed. A standing
+> "PART B" list proposed deleting ~4,300 lines of default-off surface. This tick
+> measured that list instead of acting on it. **Most of it does not survive
+> contact with the evidence — and saying so is the point of step 1.**
+
+| Candidate | Verdict |
+|---|---|
+| `guard.rs` (580 code) · `pseudonymize.rs` (582) | ⛔ **KEEP.** Both are wired (11 call sites each in `proxy.rs`), default-off, documented, and `guard::is_invisible` is a dependency of `privacy.rs`'s I2 classifier. The honest criticism — that the injection guard is heuristic and evadable (S8) — is answered by documentation, which it already carries; deleting a hardened, research-grounded defence because it is not perfect would be the opposite of the audit's own standard. |
+| `ratelimit.rs` (86 code) | ⛔ **KEEP — the requirement survives questioning.** The obvious argument ("a single-user localhost proxy rate-limiting *you* is theatre") fails on evidence: `PASTURE_AUTH_TOKEN` exists, so an exposed deployment is a *supported* mode, and a limiter is a coherent part of it rather than a half-measure in front of an open proxy. |
+| `telemetry.rs` (163 code) | ⛔ **KEEP.** Questioned as "spans for a collector Pasture doesn't have", but the format is the OTel Collector's JSON file receiver — a real, standards-based consumer path needing no dependency on Pasture's side. |
+| `decision_log.rs` (170) · `difficulty.rs` (43) · `dashboard.rs` (17) | ⛔ **KEEP.** Each serves one of the four irreducible jobs (route / account) and each is cheap. `difficulty.rs` is the *only* signal that catches hard prompts reading as plain prose — the W6 gap — for 43 lines. |
+| `RESEARCH.md` (594 lines), claimed "already absorbed into COMPETITIVE.md" | ⛔ **KEEP — the claim was false.** `COMPETITIVE.md` §4b cites it as the *source* for a whole backlog section, and `SPEC.md` / `ARCHITECTURE.md` / `SELF_IMPROVEMENT.md` all link it. Deleting it would have orphaned four documents on the strength of an unverified memory. |
+| Three hand-rolled JSONL appenders (`cost`/`decision_log`/`telemetry`) | ⛔ **KEEP as-is.** Measured before collapsing: each is a 2–3 line `OpenOptions` idiom. A shared helper would save ~6 lines and add an indirection — the premature-abstraction trap. |
+| **README documented every setting twice** | ✅ **DELETED (ADR-270).** The one thing that failed. A 430-word prose paragraph listed ~15 settings; a table below listed 27; **15 real settings appeared in neither**, including `PASTURE_ALLOW_SENSITIVE_CLOUD` — the switch that turns off the privacy invariant. Two partial lists of one thing guarantee drift. One grouped table now covers all 55, pinned biconditionally by `test_readme_documents_every_setting`. |
+| **A hand-maintained allow-list inside the SPEC drift guard** | ✅ **DELETED (ADR-270).** Same shape, found while fixing the above: `test_spec_has_no_phantom_pasture_env_vars` excused four vars "read outside config.rs" by name, and had already drifted — it rejected `PASTURE_GPU_VRAM_MB` the moment SPEC documented it. `KNOWN_ENV` was already the authoritative set, so the list is gone. |
+
+**Net:** ~430 words of duplicated prose and one allow-list deleted; ~1,640 lines of
+default-off code kept, each with a written reason. Recorded here so the PART B
+list is not re-proposed from memory a fourth time.
+
+### 4e-7. Onboarding audit: the differentiator was Linux-only (2026-08)
+
+> A read-only first-run audit asked what a *new user* hits. Most findings were
+> bad messages in front of correct behaviour. One was the inverse.
+
+| Finding | Verdict |
+|---|---|
+| **A7. Hardware detection was Linux-only and failed OPEN into "weakest machine"** | ✅ **FIXED (ADR-261)** — `detect_ram_mb` read only `/proc/meminfo`, and `detect()` collapsed failure to `ram_mb: 0` via `.unwrap_or(0)`. That 0 fell into the 300 (CPU-only) tier, so an M3 Max / 64 GB Windows box **silently escalated nearly everything to the paid cloud** — the exact inverse of *"GPU PC → keep more work local"*, on the product's only real differentiator. RAM is now detected on macOS (`sysctl`) and Windows (`wmic`), `ram_mb` is `Option<u64>` so "unknown" is representable, unknown leans **local** (800), and `hw`/`models`/`doctor` say so instead of printing `0 MB`. |
+| **A1/A2. doctor guessed, and skipped a check** | ✅ **FIXED (ADR-265)** — one TCP probe emitted a single message carrying *both* the install and the start fix, so the user guessed; and the model check sat behind `if st.reachable`, so a bare machine reported **1** problem when it had **2** and only learned about the missing model on a second run. `on_path` now selects the right fix, and the model step always reports. Verified: bare machine now reads "2 item(s) need attention". |
+| **A3. Accounting failed silently, and `stats` mislabelled it** | ✅ **FIXED (ADR-265)** — `read_log` maps NotFound to "no records" and a missing *directory* is also NotFound, so an unwritable cost log was indistinguishable from "no data yet": `stats` said "run some requests first" and would say it forever. Doctor now checks writability as a real step; `stats` reports the cause and exits 1. |
+| **A4. Bad `PASTURE_*` settings vanished silently** | ✅ **FIXED (ADR-266)** — `with_env` parses with `if let Ok(..)` and no `else`, so malformed values were dropped in silence, and a misspelled name matched nothing at all. The audit's reproduction (bad port, bad threshold, `PASTURE_LOCAL_BAKEND`) produced **zero** warnings; all three are now reported on stderr. A completeness test ties the known-name list to the source scanner so it cannot drift. |
+| **A6. `up`/`serve` claimed success, then died on a busy port** | ✅ **FIXED (ADR-262)** — the connect banner printed unconditionally and `serve` then failed with a raw `os error 98`; the actionable fix string already existed and only `doctor` reached it. `run_serve` now pre-checks via `doctor::port_available` and prints it, so `up` inherits the check too. |
+| **A9. `up`'s Ollama auto-start swallowed "not installed"** | ✅ **FIXED (ADR-267)** — `let _ = Command::new("ollama").spawn()` discarded the error, so a machine with no `ollama` on PATH spawned nothing, slept **3 s** polling a port nobody was listening on, then printed the same message a wedged-but-installed Ollama gets. Two different problems, one fix string. `up` now pre-checks `doctor::on_path` and fails in **2 ms** naming the real cause; a spawn error is reported with its OS message instead of discarded; the "did not come up" text now says *start it*, not *install it*. Verified E2E on all three branches (absent / present-but-not-serving / non-executable) in EN and JA. |
+| **A8. Dangling `pasture refer` reference** | ✅ **FIXED (ADR-262)** — residue from this session's own ADR-258 deletion; the binary advertised a command that answers `unknown command`. |
+| **A12. Two dead CI dirs + two docs for one excuse** | ✅ **FIXED (ADR-263)** — self-inflicted: `ci/ci.yml` predated this session (ADR-134 hit the same permission wall), and my ADR-259 added a second without noticing. Consolidated into one workflow, keeping the older file's unique `cargo deny` supply-chain job. **CI is still inactive** — it needs the documented one-command `git mv` from someone whose token has `workflows` permission, so the badge still 404s until then. **Follow-up (ADR-269): the badge is no longer in the README.** Activating CI from here was retried through the GitHub contents API and refused the same way (`403 Resource not accessible by integration`), so the badge was a permanent 404 asserting that the gates run. It is removed, `test_ci_badge_and_workflow_agree` enforces the biconditional both ways, and `CI-SETUP.md` carries the (verified) one-liner that restores it. |
+| **A5. Config-file layer was test-only** | ✅ **FIXED (ADR-264)** — SPEC §8 promised *defaults → file → env* and the parser had existed since ADR-190, but nothing ever read a file: zero non-test callers. Questioned rather than deleted — 53 env vars make a persistent file genuinely useful, and wiring it up cost ~15 lines vs deleting ~150 tested ones. `PASTURE_CONFIG` (else `~/.config/pasture/config`) is now read before env, so the document is true. |
+| **A11. Nothing pinned any of it** | ✅ **FIXED (ADR-268)** — every fix above was verified once, by hand, against a release build; `run_doctor`/`run_up`/`run_stats`/`run_models` print and spawn, so no unit test reached them and all seven were regressions waiting to happen. `tests/cli_onboarding.rs` runs the real binary in a **cleared environment** (empty `PATH`, throwaway `HOME`, no inherited `PASTURE_*`, Ollama port pointed at a closed one) and asserts on exit code and output. Each of the 7 tests was **mutation-checked**: the corresponding fix was reverted in turn and the intended test — and only it — failed. |
+
+### 4e-6. Closing the loop on routing validation (2026-08)
+
+> F4/W6 — "routing decisions are never validated" — keeps blocking other work
+> (it is why ADR-256 shipped opt-in). This tick attacked the workflow gap rather
+> than the (unaffordable) quality-oracle gap.
+
+| Finding | Verdict |
+|---|---|
+| **V1. The AUROC self-test had no way to get labels** | ✅ **FIXED (ADR-257)** — ADR-246 shipped `calibrate --auroc --labels <f>` and ADR-124 `--error --labels <f>`, both consuming `{"logprob","correct"}` JSONL that **nothing in Pasture produced**; the user had to hand-write it. Worse, it could not be reconstructed afterwards: the cost log keeps `logprob` but deliberately no prompt/answer text (I3), so there is nothing to review. `pasture label` captures verdicts at request time and writes only score+verdict, preserving I3. |
+| **V2. The default backend cannot score confidence** | ✅ **FIXED (ADR-273) — and the premise was stale.** `complete_scored` returned no logprob on the trait default, so Ollama yielded none and `--auroc`/`--error` were unusable there. But Ollama has reported logprobs on `/api/chat` since v0.12.11 (2025-11-12, PR #12899): `ChatRequest.Logprobs bool json:"logprobs"`, `ChatResponse.Logprobs []Logprob` in `api/types.go`. Pasture simply never asked. `OllamaBackend::complete_scored` now sends `"logprobs":true` and averages the reply; older builds ignore the flag and fall back exactly as before. The advice to switch backends was sending users away from the one that already worked. |
+
+### 4e-5. Task-shape routing revisited (2026-08)
+
+> 2026 SLM reporting draws a sharper line than Pasture's `format` signal does:
+> *"classification, routing, structured extraction, reformatting and
+> short-context QA almost always work on small models; multi-step reasoning,
+> long-context synthesis and open-ended writing usually need a bigger one."*
+
+| Finding | Verdict |
+|---|---|
+| **T1. `format` conflated reformatting with code generation** | ◐ **ADDRESSED, opt-in (ADR-256)** — one marker list held both `as json` / `csv format` / `markdown table` (reformatting, which small models handle reliably) and `write a function` / `dockerfile` / `sql query` (synthesis, which they don't). A bare "give me that as JSON" was escalated to cloud — Pasture spending money on the class it exists to keep local. The lists are now split, and `PASTURE_STRUCTURED_LOCAL=1` stops the structured half escalating. **Deliberately opt-in, not the default:** the evidence is external benchmark reporting and Pasture has no live-model quality harness (W6) to confirm the trade-off locally, so it does not silently re-route existing deployments. Flipping the default should wait on W6. |
+
+### 4e-4. Peer-software compatibility pass (2026-08)
+
+> Angle: what do the tools Pasture actually sits between — Ollama locally,
+> Anthropic/OpenAI upstream — now do that Pasture does not keep up with?
+> Both findings are **accounting** bugs: the functional paths were correct, but
+> the numbers Pasture reports about them were not.
+
+| Finding | Verdict |
+|---|---|
+| **P1. Anthropic cached prompt tokens dropped** | ✅ **FIXED (ADR-254)** — with `PASTURE_CACHE_CONTROL=1` (Pasture's own IMP-18 feature) Anthropic bills most of the prompt under `cache_creation_input_tokens`/`cache_read_input_tokens`; Pasture read `input_tokens` alone. Proven **1025×** undercount, silently defeating the token-denominated `PASTURE_BUDGET_DAILY_TOKENS`. Enabling the cost-*saving* feature disabled the cost-*control* feature. |
+| **P2. Ollama's real token counts ignored** | ✅ **FIXED (ADR-255)** — Ollama returns `prompt_eval_count`/`eval_count` on every response and Pasture used neither, always estimating from text length. Harmless-ish for plain models; **~250× wrong for a thinking model**, whose reasoning goes to `message.thinking` and never appears in `content`. Now uses the reported counts, estimating only as fallback. |
+| **P3. Thinking-model content handling** | ✅ **Verified correct, no change needed.** Tested against a fake Ollama emitting `message.thinking`: the reasoning trace is correctly excluded from the answer on *both* the buffered and streaming paths. Recorded so the question is not re-opened. |
 
 ### 4e-3. Security pass: prompt-injection surface (2026-08)
 
@@ -391,7 +496,9 @@ zero-dep/single-user/privacy wedge):**
 | **S1. Guard skipped tool-call arguments** | ✅ **FIXED (ADR-247)** — ADR-187 had already extended the *privacy* scan to `tool_calls_json` ("PII can live solely there"); the injection guard never got the same treatment and scanned content-only `routing_text()`. Since ADR-183 round-trips prior `tool_calls` every turn, a payload could ride in the arguments untouched — exactly the indirect-injection path. `guard_text()` now covers the same surface as `privacy_text()`. |
 | **S2. Literal patterns defeated by one inserted word** | ✅ **FIXED (ADR-248)** — probing found **1 of 6** canonical phrasings detected: `"ignore previous instructions"` matched, but `"ignore all previous instructions"` — the most recognisable form of the attack — did not. Replaced with structural verb→scope→target matching: recall 1/6 → **9/9**, false positives **0/7**. |
 | **S3. Invisible-character / homoglyph evasion** | ✅ **FIXED (ADR-249)** — probing found **5 of 8** obfuscations bypassed the guard: one zero-width space inside a keyword (or a soft hyphen, full-width letters, Cyrillic lookalikes) reduced it to `Allow` for text the model reads normally. Research reports this class defeating commercial guardrails outright, with "normalize before filtering" as the stated mitigation. `normalize_for_guard()` now strips invisible/bidi/tag/variation-selector characters and folds full-width + homoglyphs: **11/11** obfuscated variants caught, benign and CJK unaffected. |
-| **S4. Encoded payloads still undetected** | ⏸️ **Open, named honestly.** base64 / ROT13 / leetspeak / fictional ciphers that the model decodes but a std-only scanner cannot are still out of reach, as are multi-turn staged attacks and novel phrasing. `guard.rs`'s "Known limitations" now says exactly this instead of the stale claim that homoglyphs are unhandled. |
+| **S4. Encoded payloads** | ✅ **MOSTLY FIXED (ADR-252)** — the literature's prescribed defence is *decode-and-rescreen*: canonicalise/decode before filtering and judge intent on the decoded text. base64 (both alphabets, padded or not), hex, and ROT13 runs are now decoded and re-screened with the existing matchers under a new `encoded_payload` label. Probe: **5/5** encoded attacks caught, **6/6** benign encodings (prose, JSON, SHA-256 hex, UUID, tokens) still Allow — a flag requires the *decoded* text to match, so looking encoded is never enough and the false-positive rate cannot rise. Work is bounded (256 KiB budget / 64 KiB per run). |
+| **S7. Nested / compositional encodings** | ✅ **FIXED (ADR-253)** — the one-level limit named when ADR-252 shipped was **exploitable and proven so**: `base64(base64(x))`, `base64(base64(base64(x)))`, `hex(base64(x))` and `base64(rot13(x))` all returned `Allow`. Decoding is now iterative (breadth-first, each decoded string fed back through the extractors), bounded on three axes — depth (3), node count (64) and bytes (256 KiB). Probe: 5/5 nested/mixed variants caught, benign nested content still Allow, a 292 KiB six-level decode bomb terminates in ~8 ms. |
+| **S8. Remaining evasions** | ⏸️ **Open, named honestly.** Leetspeak and in-word substitutions; encodings with no decoder here (Morse, base32, fictional ciphers the model learned but this scanner has not); layerings deeper than `MAX_DECODE_DEPTH`; mixed-language payloads; multi-turn staged attacks; novel phrasing. `guard.rs`'s "Known limitations" enumerates exactly this. |
 | **S5. Privacy detection had the same blind spot** | ✅ **FIXED (ADR-250)** — confirmed and worse than predicted: a card number with a soft hyphen classified as `[]` (undetected → escapes to cloud) and with a zero-width space as `['my_number']` — actively **wrong**, the invisible char split the digit run into a 12-digit chunk that passed the My Number checksum. Email and IBAN likewise. **Not primarily adversarial**: PDFs insert soft hyphens at line breaks, so pasting your own card number could defeat **I2** with no attacker. Fixed by stripping invisibles in `normalize_for_detection` *and* running every detector on normalized text (only the numeric ones did before). |
 | **S6. Pseudonymizer spans read raw text** | ✅ **FIXED (ADR-251)** — `spans_via_normalized()` runs each `*_spans` detector over the normalized form and maps results back to original byte offsets (with a no-op fast path). Obfuscated cards/IBANs are now masked and round-trip byte-for-byte. Also fixed a silent regression of ADR-213/214: **full-width** card numbers were classified sensitive but never masked, same root cause. |
 
@@ -427,12 +534,30 @@ Keeping the wedge means saying no to several common peer features:
 
 ---
 
-## 6. Monetization surfaces (referenced by ADR-006)
+## 6. Monetization surfaces — REMOVED (ADR-258, supersedes ADR-006)
 
-The proxy layer is the natural place to surface **cloud-provider referral links**
-(the operator's own affiliate URLs from config) and a donation link — never handling
-cards or secrets itself (hosted Stripe Checkout via `worker/`). No user PII is
-collected. This is surface-only and orthogonal to the routing IP above.
+Deleted in the first-principles pass: `monetize.rs`, the `donate` / `refer`
+commands, the periodic donation nudge, the `worker/` Stripe Cloudflare Worker,
+and their config knobs (`PASTURE_DONATE_URL`, `PASTURE_NO_NUDGE`,
+`PASTURE_STATE`).
+
+Three reasons, in order of weight:
+
+1. **Misaligned incentive.** Referral revenue is earned when a user signs up
+   for a *cloud* provider. Pasture's entire job is to send *less* work to the
+   cloud. The monetization paid out precisely when the product failed at its
+   purpose — an incentive pointing the wrong way, in a tool asking to be trusted
+   with the user's prompts.
+2. **Not a requirement from anyone.** It served none of the four irreducible
+   jobs (accept, route, execute, account). It was a speculative revenue plan for
+   a product with no users yet.
+3. **It cost real complexity.** The nudge existed only to interrupt the user
+   asking for money, and was the *sole* reason Pasture wrote a state file to
+   disk. The Worker put 137 lines of JavaScript and a Stripe dependency inside a
+   "zero-dependency, single-binary, std-only" project.
+
+Reversible if wanted — it is one `git revert` away — but it should come back, if
+at all, as something that does not pay more when the user routes to the cloud.
 
 ---
 

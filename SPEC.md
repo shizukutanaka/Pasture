@@ -1,6 +1,6 @@
 # Pasture — Specification (SPEC.md)
 
-Version: tracks `Cargo.toml` (0.26.0 + Unreleased, current through ADR-189). Status:
+Version: tracks `Cargo.toml` (**0.28.0**, current through ADR-259). Status:
 normative for the HTTP API and routing engine; descriptive for the CLI. Keywords
 **MUST**, **SHOULD**, **MAY** per RFC 2119.
 
@@ -48,13 +48,13 @@ library only; the cloud (HTTPS/TLS) path is gated behind the optional `cloud` fe
 | `setup` | beginner welcome + `doctor` check |
 | `connect <app>` | print client setup (Cursor / Open WebUI / Continue / SDK / lmstudio) |
 | `calibrate [--target R \| --sweep \| --logprob \| --error --labels <f> \| --auroc --labels <f>]` | recommend `PASTURE_THRESHOLD` / cascade threshold from the cost log; `--auroc` self-tests whether the confidence signal predicts correctness at all (IMP-47) |
+| `label --prompts <f> [--out <f>]` | answer each prompt locally and record right/wrong, producing the `{"logprob","correct"}` JSONL that `calibrate --auroc`/`--error` consume (ADR-257). Writes only the score and verdict — never prompt or answer text (I3) |
 | `models` | recommend local models for this machine |
 | `doctor` | diagnose setup and print fixes |
-| `eval [--external <file>] [--json]` | routing accuracy + threshold sweep |
+| `eval [--external <file>] [--json]` | routing accuracy on two corpora; **exits 1** on regression or I2 breach |
 | `stats [--json]` | summarize the cost log |
 | `improvements [path] [--review]` | print the self-improvement ledger (verified change history) |
 | `config` | print effective configuration |
-| `donate` / `refer` | monetization surfaces (links only) |
 | `version` / `help` | version / usage |
 
 Global flags: `--local` / `--cloud` force a route; `--addr host:port` sets the listen
@@ -282,6 +282,7 @@ All error responses MUST use the OpenAI envelope:
 | missing/invalid bearer token when auth is enabled (§7) | `401` | `invalid_request_error` |
 | a socket read times out before the request completes (§7) | `408` | `invalid_request_error` |
 | request body exceeds the size cap (§7) | `413` | `invalid_request_error` |
+| request header block exceeds 1 MiB or 1000 fields (§7) | `431` | `invalid_request_error` |
 | rate limit exceeded when a limit is set (§7) | `429` | `rate_limit_error` |
 | unknown route/path or method | `404` | `invalid_request_error` |
 | no backend available / sensitive-but-no-local / forced-route-unavailable | `503` | `routing_error` |
@@ -314,7 +315,7 @@ returns at the first match (I4):
    markers (EN/JA); `≥3` clause-terminating question marks (ADR-209 — a URL query
    `?` followed by alphanumeric does not count; full-width `？` always counts);
    `≥3` **distinct** math symbol types (ADR-208 — e.g. `^`, `+`, `=` together;
-   single-char repetition like `/` in a URL does not trigger); **multi-step**
+   single-char repetition like `/` in a URL does not trigger); strict-format markers split into **code-generation** (always escalate) and pure **structured-output** ones (`as json`, `csv format`, … — also escalate unless `PASTURE_STRUCTURED_LOCAL=1`, ADR-256); **multi-step**
    (ADR-242 — `≥3` distinct sequencing cues such as *first/then/finally* or
    まず/次に/最後に, matched whole-word so "then" inside "strengthen" does not
    count, **or** a numbered list of `≥3` items; catches short multi-step plans
@@ -382,6 +383,9 @@ false negative = data leak (unacceptable).
   escalate to cloud only when the local mean-logprob `< PASTURE_CASCADE_LOGPROB`
   (else a text heuristic). Never for sensitive content; never for streaming; on cloud
   failure (after retries, §6) it keeps the local answer.
+  Ollama reports per-token logprobs on `/api/chat` from v0.12.11 (2025-11-12, PR #12899) and
+  Pasture requests them on scored calls (ADR-273); an older Ollama ignores the flag and
+  the text heuristic in `cascade::is_low_confidence` applies instead.
 - **Cache** (`PASTURE_CACHE=<n>`, opt-in): exact-match on hash(model + messages),
   bounded FIFO. Hits skip the backend (`x_pasture_route:"cache"`, cost 0). Never
   caches sensitive prompts (I2). Applies to both buffered and `stream:true` requests
@@ -413,12 +417,19 @@ false negative = data leak (unacceptable).
 
 - The proxy MUST cap the request **header** block (1 MiB) and the request **body**
   (`MAX_BODY_BYTES`, 16 MiB). A `Content-Length` over the cap, or a body that grows
-  past it, MUST yield `413` (not unbounded reads) — DoS hardening (IMP-21).
+  past it, MUST yield `413` (not unbounded reads) — DoS hardening (IMP-21). A header
+  block over 1 MiB or over 1000 fields MUST yield `431 Request Header Fields Too Large`
+  (RFC 6585 §5) rather than a silent close (ADR-278).
 - The JSON parser MUST bound recursion depth (128) (ADR-026).
 - **Connection timeout (IMP-timeout).** Each connection SHOULD have a read/write
   timeout (`PASTURE_REQUEST_TIMEOUT`, default 30s; 0 disables) so a slow/dead client
   cannot pin a worker (slow-loris). A read that times out before the request completes
   yields `408`.
+- **Rejections are ordinary responses (ADR-277).** A `413`, `408` or `431` MUST carry the
+  same header block as any served response — `X-Request-ID` (the caller's, or a minted
+  one), CORS headers for an allowed `Origin`, `Server`, `X-Response-Time` — and MUST
+  be written to `PASTURE_ACCESS_LOG` like any other request. When a timeout fires
+  before the header block is complete, method and path are logged as `-`.
 - **Auth (opt-in, IMP-15).** When `PASTURE_AUTH_TOKEN` is set, every `/v1/*` request
   MUST carry `Authorization: Bearer <token>` (compared in constant time); a missing or
   wrong token yields `401`. `/health` is exempt. Default (unset) = no auth, matching the
@@ -454,23 +465,38 @@ system-override phrases (`role_switch`) and data-exfiltration phrases (`exfil_at
 `block` returns `400`. Only the matched **label** is ever recorded — never prompt
 content (I3).
 
+Matching runs over normalized text (ADR-249: invisible/bidi/tag characters
+stripped; full-width letters and Cyrillic/Greek homoglyphs folded) and covers
+tool-call arguments as well as message content (ADR-247). A third label,
+**`encoded_payload`**, is emitted when an injection phrase is recovered by
+decoding a base64 / hex / ROT13 run and re-screening the **decoded** text
+(decode-and-rescreen, ADR-252). Decoding is iterative (ADR-253), so nested and
+mixed layerings (`base64(base64(x))`, `hex(base64(x))`, `base64(rot13(x))`) are
+peeled; the traversal is bounded by depth, node-count and byte budgets — a flag always requires a real phrase, so
+merely looking encoded is never sufficient. The plaintext pass runs first, so
+`encoded_payload` is reserved for phrases that were genuinely hidden.
+
 ---
 
 ## 8. Configuration
 
-Precedence: built-in defaults → key=value config file → `PASTURE_*` env vars (env
+Precedence: built-in defaults → key=value config file (`PASTURE_CONFIG`, else
+`~/.config/pasture/config`; optional — a missing file is not an error) → `PASTURE_*` env vars (env
 wins). Variables:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
+| `PASTURE_CONFIG` | `~/.config/pasture/config` | path to the optional `key = value` config file (§8, ADR-264); missing file is not an error |
 | `PASTURE_LISTEN_ADDR` | `127.0.0.1:8645` | proxy listen address |
 | `PASTURE_OLLAMA_HOST` / `PASTURE_OLLAMA_PORT` | `127.0.0.1` / `11434` | local Ollama endpoint |
-| `PASTURE_LOCAL_MODEL` | `llama3` | local model id |
+| `PASTURE_LOCAL_MODEL` | `llama3.2` | local model id |
 | `PASTURE_LOCAL_BACKEND` | `ollama` | `ollama` \| `lmstudio`/`openai` |
 | `PASTURE_LOCAL_OPENAI_URL` | `http://127.0.0.1:1234/v1` | OpenAI-compat local URL |
 | `PASTURE_CLOUD_PROVIDER` / `PASTURE_CLOUD_MODEL` | — / `gpt-4o-mini` | cloud provider / model |
 | `PASTURE_CLOUD_FALLBACK_PROVIDER` / `PASTURE_CLOUD_FALLBACK_MODEL` | _(off)_ | secondary cloud provider/model tried when the primary fails all retries (IMP-9) |
 | `PASTURE_OPENAI_API_KEY` / `PASTURE_ANTHROPIC_API_KEY` | — | BYOK (never logged) |
+| `PASTURE_RAM_MB` | _(auto)_ | override detected total RAM in MB; use when auto-detection is unavailable on your OS (§4, ADR-261) |
+| `PASTURE_GPU_VRAM_MB` | _(auto)_ | override detected GPU VRAM in MB; discrete-GPU detection is NVIDIA-only, so Apple Silicon / AMD machines tier by RAM unless this is set (§4) |
 | `PASTURE_THRESHOLD` | hardware | token length threshold override |
 | `PASTURE_CASCADE` | off | enable cascade |
 | `PASTURE_CASCADE_LOGPROB` | `-1.0` | cascade escalation threshold |
@@ -506,15 +532,13 @@ wins). Variables:
 | `PASTURE_SEMANTIC_MIN_LEXICAL` | `0.0` | lexical second-gate floor (Jaccard token overlap) a cosine hit must also clear; `0` disables (§6, IMP-46) |
 | `PASTURE_CACHE_TTL` | `0` | cached-entry TTL in seconds; 0 = no TTL (FIFO only) |
 | `PASTURE_CACHE_CONTROL` | off | inject Anthropic `cache_control` prompt-caching hint (no-op for OpenAI) |
+| `PASTURE_STRUCTURED_LOCAL` | _(off)_ | when set, pure structured-output markers (`as json`, `csv format`, `markdown table`, `yaml`, …) no longer force a cloud escalation and route on length/other signals; code-generation markers still escalate (§4, ADR-256) |
 | `PASTURE_HARD_PROMPTS` | _(off)_ | path to known-hard-prompts file; near-matches escalate to cloud (IMP-14) |
 | `PASTURE_HARD_THRESHOLD` | `0.85` | cosine similarity at which a prompt counts as "near a known-hard prompt" |
 | `PASTURE_SKILLS` | _(off)_ | skill→route overrides, e.g. `code:local,math:cloud` (IMP-25) |
 | `PASTURE_SYSTEM_PROMPT` | _(off)_ | system prompt prepended to every proxied request |
 | `PASTURE_ACCESS_LOG` | _(off)_ | path for a per-request JSONL access log (PII-free, I3) |
 | `PASTURE_OTEL_LOG` | _(off)_ | path for an OpenTelemetry GenAI trace log (§9.1, IMP-23) |
-| `PASTURE_STATE` | `pasture-state.txt` | small state file (donation-nudge counter) |
-| `PASTURE_DONATE_URL` | _(off)_ | donation URL surfaced by `donate` and the nudge |
-| `PASTURE_NO_NUDGE` | off | disable the periodic stderr donation nudge |
 
 > **Spec-drift note (this round):** earlier spec text referenced `PASTURE_PROXY_TOKEN`;
 > the implemented variable is **`PASTURE_AUTH_TOKEN`** (the only name recognised). The
@@ -543,9 +567,27 @@ ids are time+counter derived (not crypto-random). No PII (I3).
 
 ## 10. Evaluation
 
-`eval` runs a built-in labelled set (plain→local, hard→cloud, sensitive→local) and a
-threshold sweep, reporting accuracy, cloud rate, false/missed escalations. Fully
-offline (I1).
+`eval` runs **two** labelled corpora, fully offline (I1), and is a real gate: it
+**exits 1** on failure (ADR-271; before that it returned 0 on every path, so CI
+Gate 4 could not fail).
+
+1. **Built-in regression set** (`default_cases`, 18 cases) — plain→local,
+   hard→cloud, sensitive→local. Its labels restate the router's own marker
+   lists, so it scores 100% by construction and is a *regression check*, not a
+   measurement: anything below 100% means a detector changed behaviour.
+2. **Held-out generalisation set** (`holdout_cases`, 30 cases) — labelled by the
+   §4 routing policy but containing **no trigger string from any marker list**,
+   a property enforced by a test that reads the marker lists from the router
+   itself. This is what actually measures generalisation. Recorded baseline:
+   **66.7% (20/30)**, all ten misses being hard-but-plainly-phrased prompts kept
+   local (§4's known limitation: absent a marker or length, hardness is
+   invisible to the router). `HOLDOUT_ACCURACY_FLOOR` ratchets against that
+   baseline.
+
+Both report accuracy, cloud rate, false/missed escalations and
+`sensitive_escalations`. A non-zero `sensitive_escalations` is an **I2 breach**
+and fails the gate unconditionally, regardless of accuracy. Threshold tuning
+lives in `calibrate`, which fits the threshold to the user's own cost log.
 
 ---
 
