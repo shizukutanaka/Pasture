@@ -101,8 +101,8 @@ Take items where an existing pattern is copied and the test net is large.
 **Mimic, don't invent.** Current Sonnet-scale items:
 - **IMP-46** semantic-cache lexical second-gate (contained in `cache.rs`).
 - **IMP-48** daily-counter history file for the dashboard (append-only JSONL).
-- **IMP-49** split `proxy.rs` into modules — first slice done (ADR-275:
-  `response.rs`); next candidates are the socket I/O layer and `impl Proxy`.
+- **IMP-49** split `proxy.rs` into modules — two slices done (ADR-275
+  `response.rs`, ADR-276 `http.rs`); what remains is `impl Proxy` itself.
   Pure mechanical extraction, zero behaviour change, guarded by 939 tests plus
   a before/after wire byte-diff.
 - New PII value recognizers, new i18n keys, doc sync, test-coverage backfill,
@@ -116,6 +116,7 @@ it's Sonnet.
 
 - `src/proxy.rs` — HTTP server, request dispatch, routing glue (large).
 - `src/response.rs` — pure OpenAI/SSE/Prometheus response body builders (no I/O).
+- `src/http.rs` — HTTP/1.1 wire layer: request parsing + DoS guards, auth, response writers.
 - `src/routing.rs` — the decision engine + hard-signal detectors (`hard_signals`, `is_multi_step`, `is_time_sensitive`).
 - `src/privacy.rs` — sensitivity classifier + PII value `*_spans` detectors + checksums.
 - `src/pseudonymize.rs` — reversible `<TOKEN_n>` masking + `StreamRestorer` (SSE-boundary safe).

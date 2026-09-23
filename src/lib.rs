@@ -20,6 +20,7 @@ pub mod eval;
 pub mod guard;
 pub mod hardware;
 pub mod health;
+pub mod http;
 pub mod i18n;
 pub mod improve;
 pub mod json;
