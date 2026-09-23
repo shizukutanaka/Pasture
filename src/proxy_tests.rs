@@ -3,7 +3,7 @@
 //! `proxy`, so `use super::*` and private-item access work unchanged).
 
 use super::*;
-use crate::backend::MockBackend;
+use crate::backend::{EmbeddingsResponse, MockBackend};
 
 fn proxy_with(local: bool, cloud: bool, threshold: usize, log: &str) -> Proxy {
     let engine = RoutingEngine::new(threshold, local, cloud);
@@ -799,7 +799,10 @@ fn test_spec_documents_every_stats_response_field() {
     // format string and asserts each one appears as a `` `field_name` ``
     // markdown code span somewhere in SPEC.md, so a future field addition
     // that forgets the doc update fails CI instead of silently drifting.
-    let src = include_str!("proxy.rs");
+    //
+    // ADR-275 moved build_stats_response into response.rs; the scan target
+    // moved with it.
+    let src = include_str!("response.rs");
     let start = src
         .find("pub fn build_stats_response(")
         .expect("build_stats_response must exist");

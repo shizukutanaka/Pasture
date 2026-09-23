@@ -28,6 +28,7 @@ pub mod privacy;
 pub mod proxy;
 pub mod pseudonymize;
 pub mod ratelimit;
+pub mod response;
 pub mod routing;
 pub mod telemetry;
 
