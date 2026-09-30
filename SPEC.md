@@ -430,6 +430,10 @@ false negative = data leak (unacceptable).
   one), CORS headers for an allowed `Origin`, `Server`, `X-Response-Time` — and MUST
   be written to `PASTURE_ACCESS_LOG` like any other request. When a timeout fires
   before the header block is complete, method and path are logged as `-`.
+- **HEAD (ADR-280).** Every route that accepts `GET` MUST accept `HEAD` (RFC 9110 §9.1)
+  and answer with GET's status and header fields — `Content-Length` being the length of
+  the body GET would send — and **no content** (§9.3.2), including on error responses.
+  An `Allow` header lists `HEAD` wherever it lists `GET`. The access log records `HEAD`.
 - **Auth (opt-in, IMP-15).** When `PASTURE_AUTH_TOKEN` is set, every `/v1/*` request
   MUST carry `Authorization: Bearer <token>` (compared in constant time); a missing or
   wrong token yields `401`. `/health` is exempt. Default (unset) = no auth, matching the

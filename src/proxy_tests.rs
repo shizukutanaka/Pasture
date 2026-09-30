@@ -2603,6 +2603,128 @@ fn test_dashboard_root_path_serves_same_html() {
     );
 }
 
+/// Split a raw HTTP response into (status, header-map-lowercased, body).
+fn split_response(raw: &str) -> (u16, Vec<(String, String)>, String) {
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (status, headers, body.to_string())
+}
+
+fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    h.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+#[test]
+fn test_head_mirrors_get_without_body_on_every_get_route() {
+    // ADR-280, RFC 9110 §9.1: a general-purpose server MUST support HEAD
+    // wherever it supports GET, and §9.3.2: HEAD returns GET's header fields
+    // (Content-Length included) with no content. Only /health did this; the
+    // other GET routes answered 405 with a body.
+    for path in [
+        "/v1/models",
+        "/v1/stats",
+        "/v1/history",
+        "/metrics",
+        "/dashboard",
+        "/health",
+    ] {
+        let get = roundtrip_raw(
+            proxy_with(true, false, 100, "unused"),
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+        );
+        let head = roundtrip_raw(
+            proxy_with(true, false, 100, "unused"),
+            format!("HEAD {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+        );
+        let (gs, gh, gb) = split_response(&get);
+        let (hs, hh, hb) = split_response(&head);
+        assert_eq!(gs, 200, "{path}: GET should be 200: {get:.80}");
+        assert_eq!(hs, gs, "{path}: HEAD status must equal GET's: {head:.80}");
+        assert_eq!(
+            header(&hh, "content-type"),
+            header(&gh, "content-type"),
+            "{path}"
+        );
+        assert_eq!(
+            header(&hh, "content-length"),
+            Some(gb.len().to_string().as_str()),
+            "{path}: HEAD Content-Length must be the GET body length"
+        );
+        assert!(
+            hb.is_empty(),
+            "{path}: HEAD must carry no content, got {} bytes",
+            hb.len()
+        );
+    }
+}
+
+#[test]
+fn test_head_then_get_on_one_connection_stays_framed() {
+    // A body on a HEAD response desynchronises keep-alive framing: the client
+    // reads no content after HEAD, so stray body bytes become the "next"
+    // response. Pipeline HEAD then GET and require exactly two clean replies.
+    let raw = "HEAD /v1/models HTTP/1.1\r\nHost: x\r\n\r\n\
+GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        .to_string();
+    let resp = roundtrip_raw(proxy_with(true, false, 100, "unused"), raw);
+    let first_end = resp.find("\r\n\r\n").expect("first header block") + 4;
+    assert!(resp.starts_with("HTTP/1.1 200 "), "{resp}");
+    assert!(
+        resp[first_end..].starts_with("HTTP/1.1 200 "),
+        "second response must start right after HEAD's header block: {resp:?}"
+    );
+    assert_eq!(resp.matches("HTTP/1.1 ").count(), 2, "{resp:?}");
+}
+
+#[test]
+fn test_head_on_post_route_is_405_without_body() {
+    let resp = roundtrip_raw(
+        proxy_with(true, false, 100, "unused"),
+        "HEAD /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+    );
+    let (s, h, b) = split_response(&resp);
+    assert_eq!(s, 405, "{resp}");
+    assert_eq!(header(&h, "allow"), Some("POST, OPTIONS"), "{resp}");
+    assert!(b.is_empty(), "405 to HEAD must carry no content: {b:?}");
+}
+
+#[test]
+fn test_allow_advertises_head_where_get_is_allowed() {
+    let resp = roundtrip_raw(
+        proxy_with(true, false, 100, "unused"),
+        http_post("/v1/models", "{}"),
+    );
+    let (s, h, _) = split_response(&resp);
+    assert_eq!(s, 405, "{resp}");
+    assert_eq!(header(&h, "allow"), Some("GET, HEAD, OPTIONS"), "{resp}");
+}
+
+#[test]
+fn test_head_is_access_logged_as_head() {
+    // HEAD is dispatched as GET internally; the log must still say HEAD.
+    let access = tmp_access_log("head");
+    let p = proxy_with(true, false, 100, "unused").with_access_log(Some(access.clone()));
+    let _ = roundtrip_raw(
+        p,
+        "HEAD /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_string(),
+    );
+    let log = std::fs::read_to_string(&access).unwrap_or_default();
+    assert!(
+        log.contains("\"method\":\"HEAD\"") && log.contains("\"status\":200"),
+        "{log:?}"
+    );
+    let _ = std::fs::remove_file(&access);
+}
+
 #[test]
 fn test_dashboard_post_returns_405() {
     let p = proxy_with(true, false, 100, "unused");

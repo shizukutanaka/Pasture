@@ -254,33 +254,9 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Write a HEAD-only response (headers identical to the GET equivalent, no body).
-/// `content_length` is the body size the equivalent GET would return (RFC 7231 §4.3.2).
-pub(crate) fn write_head_response(
-    stream: &mut std::net::TcpStream,
-    status: u16,
-    content_length: usize,
-    extra: &str,
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    let conn = if keep_alive { "keep-alive" } else { "close" };
-    let response = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: {conn}\r\n{extra}\r\n"
-    );
-    stream.write_all(response.as_bytes())
-}
-
-/// Write an HTTP/1.1 response. `extra` is a block of additional header lines
-/// (each already terminated with `\r\n`, e.g. CORS headers) or empty.
-/// `keep_alive` controls the `Connection:` header value.
-pub(crate) fn write_response(
-    stream: &mut std::net::TcpStream,
-    status: u16,
-    body: &str,
-    extra: &str,
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    let reason = match status {
+/// Reason phrase for the status codes Pasture emits.
+pub(crate) fn reason_phrase(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
@@ -290,53 +266,62 @@ pub(crate) fn write_response(
         408 => "Request Timeout",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
-        431 => "Request Header Fields Too Large",
         429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
         501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Error",
-    };
+    }
+}
+
+/// The one HTTP/1.1 response writer (ADR-280). `extra` is a block of
+/// additional header lines (each already terminated with `\r\n`) or empty.
+///
+/// `head_only` answers a HEAD request (RFC 9110 §9.3.2): the same status line
+/// and header fields GET would send — `Content-Length` included, as the length
+/// of the body GET *would* carry — and no content. Sending the body anyway
+/// desynchronises a keep-alive client, which correctly reads nothing after a
+/// HEAD reply and then parses the stray bytes as the next response.
+///
+/// Header and body go out in a single `write_all`, as before: two writes would
+/// change segmentation and invite Nagle/delayed-ACK stalls.
+pub(crate) fn write_typed(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    extra: &str,
+    keep_alive: bool,
+    head_only: bool,
+) -> std::io::Result<()> {
     let conn = if keep_alive { "keep-alive" } else { "close" };
+    let content = if head_only { "" } else { body };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {conn}\r\n{extra}\r\n{body}",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {conn}\r\n{extra}\r\n{content}",
+        reason_phrase(status),
         body.len()
     );
     stream.write_all(response.as_bytes())
 }
 
-/// Write an HTTP/1.1 response with `Content-Type: text/plain` (for `/metrics`).
-pub(crate) fn write_plain_response(
+/// JSON response (`Content-Type: application/json`).
+pub(crate) fn write_response(
     stream: &mut std::net::TcpStream,
+    status: u16,
     body: &str,
     extra: &str,
     keep_alive: bool,
 ) -> std::io::Result<()> {
-    let conn = if keep_alive { "keep-alive" } else { "close" };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: {conn}\r\n{extra}\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes())
-}
-
-/// Write an HTTP/1.1 `200 OK` with `Content-Type: text/html` (for the embedded
-/// dashboard at `GET /dashboard`). Kept separate from `write_response` (which
-/// hardcodes `application/json`) and `write_plain_response` (Prometheus text)
-/// so each endpoint family advertises the correct media type. The body is
-/// compile-time constant HTML, so `body.len()` is the exact byte length.
-pub(crate) fn write_html_response(
-    stream: &mut std::net::TcpStream,
-    body: &str,
-    extra: &str,
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    let conn = if keep_alive { "keep-alive" } else { "close" };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: {conn}\r\n{extra}\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes())
+    write_typed(
+        stream,
+        status,
+        "application/json",
+        body,
+        extra,
+        keep_alive,
+        false,
+    )
 }
 
 /// Append one access-log record (JSONL, no PII) to the configured file.
