@@ -1,0 +1,107 @@
+name: Release
+
+# Tag-triggered binary distribution. RELEASE_CHECKLIST.md has claimed this
+# file exists ("release.yml (tag-triggered binaries) — present; runs on tag
+# push") since before it did; this makes the claim true. Merging this file
+# publishes nothing: binaries are built only when a v* tag is pushed, or when
+# a maintainer dispatches the workflow against an existing tag (which is how
+# already-tagged releases such as v0.28.0 get their binaries retroactively).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (e.g. v0.28.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: binary (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: linux-x86_64
+          - os: windows-latest
+            asset: windows-x86_64
+          # macos-14 is the Apple Silicon runner; Intel macOS is not built.
+          - os: macos-14
+            asset: macos-aarch64
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      # Same approach as ci.yml's MSRV leg: the default (zero-dependency)
+      # build promises to compile on the rust-toolchain.toml pin (1.75.0),
+      # so the release binaries are built with exactly that toolchain. The
+      # cloud feature is deliberately not built here — it needs a newer
+      # rustc and pulls a TLS stack; the downloadable binary is the default
+      # zero-dependency one, same as ci.yml's gates job verifies.
+      - name: Install Rust 1.75.0
+        run: |
+          rustup toolchain install 1.75.0 --profile minimal
+          rustup default 1.75.0
+          rustc --version && cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: cargo build --release (default features)
+        run: cargo build --release
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="pasture-${{ steps.tag.outputs.tag }}-${{ matrix.asset }}"
+          mkdir -p "dist/$name"
+          cp target/release/pasture "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "pasture-${{ steps.tag.outputs.tag }}-${{ matrix.asset }}"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item target/release/pasture.exe "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+
+      # gh CLI rather than a marketplace release action, mirroring the
+      # supply-chain stance ci.yml's cargo-deny job takes: this workflow
+      # adds no third-party actions beyond the checkout/cache pair CI
+      # already uses.
+      - name: Upload to the GitHub Release for the tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          # Create the Release page if this tag does not have one yet;
+          # if it already exists (e.g. v0.28.0), assets are added to it.
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "$tag" --generate-notes
+          gh release upload "$tag" dist/pasture-"$tag"-${{ matrix.asset }}.* --clobber
