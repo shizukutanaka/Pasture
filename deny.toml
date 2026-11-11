@@ -19,10 +19,18 @@ allow = [
     "OpenSSL",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Unicode-3.0: unicode-ident (build-time dep of proc-macro2/syn, pulled
+    # in by openssl-macros in the `cloud` graph) is licensed
+    # "(MIT OR Apache-2.0) AND Unicode-3.0" — the Unicode License v3 is an
+    # OSI-approved permissive licence covering the Unicode data tables.
+    # Only surfaces under `cargo deny check --all-features`.
+    "Unicode-3.0",
 ]
-unlicensed = "deny"
-copyleft = "deny"
-default = "deny"
+# cargo-deny >= 0.19 removed the `unlicensed` / `copyleft` / `default`
+# keys: deny-by-default is now the built-in semantics — every licence is
+# denied unless it appears in `allow` above (an unlicensed crate fails
+# the check, as does any copyleft licence not listed). Deleting the keys
+# preserves the old `= "deny"` behaviour exactly.
 
 [bans]
 # Warn rather than deny multiple versions of the same crate (build-dep
@@ -36,8 +44,14 @@ deny = []
 [advisories]
 # Deny crates with known security vulnerabilities (RUSTSEC advisories).
 ignore = []
-unmaintained = "warn"
-unsound = "deny"
+# cargo-deny >= 0.19 changed `unmaintained`/`unsound` from severities to
+# scopes ("all" | "workspace" | "transitive" | "none"); in-scope matches
+# are errors. `unsound = "all"` is the old `unsound = "deny"` verbatim.
+# `unmaintained` was "warn" (no scope equivalent); "all" keeps every
+# unmaintained advisory visible as an error rather than dropping the
+# signal with "none" — flip to "none" if warn-only behaviour is preferred.
+unmaintained = "all"
+unsound = "all"
 yanked = "deny"
 
 [sources]
