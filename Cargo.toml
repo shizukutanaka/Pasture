@@ -8,15 +8,17 @@ description = "OpenAI-compatible local/cloud LLM routing proxy with hardware-ada
 repository = "https://github.com/shizukutanaka/pasture"
 
 [features]
-# Default build is zero-dependency. Cloud/TLS is opt-in (ADR-005) and pulls a
-# pinned TLS stack (native-tls / system OpenSSL), MSRV-1.75 compatible.
+# Default build is zero-dependency and MSRV-1.75. Cloud/TLS is opt-in
+# (ADR-005) and pulls a pinned TLS stack (native-tls / system OpenSSL);
+# the pinned openssl declares rust-version 1.80, so the `cloud` feature
+# requires Rust 1.80+ (the cloud CI job runs on stable).
 default = []
 cloud = ["dep:native-tls", "dep:openssl", "dep:openssl-sys"]
 
 [dependencies]
 native-tls = { version = "=0.2.12", optional = true }
-openssl = { version = "=0.10.64", optional = true }
-openssl-sys = { version = "=0.9.102", optional = true }
+openssl = { version = "=0.10.82", optional = true }
+openssl-sys = { version = "=0.9.118", optional = true }
 
 [[bin]]
 name = "pasture"

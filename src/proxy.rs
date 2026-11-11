@@ -661,6 +661,9 @@ impl Proxy {
             || path.starts_with("/v1/completions")
             || path.starts_with("/v1/embeddings")
             || path.starts_with("/v1/moderations")
+            // Recognised but not implemented; allow POST so the 405 vs 501 distinction is correct.
+            || path.starts_with("/v1/audio")
+            || path.starts_with("/v1/images")
         {
             Some("POST, OPTIONS")
         } else if path.starts_with("/v1/stats")
@@ -670,15 +673,11 @@ impl Proxy {
             || path.starts_with("/v1/engines")
         {
             Some("GET, HEAD, OPTIONS")
-        } else if path.starts_with("/health") {
+        } else if path.starts_with("/health") || path == "/dashboard" || path == "/" {
+            // `/health` plus the embedded dashboard (IMP-36): GET-only. The
+            // dashboard match is exact — the caller passes the query-stripped
+            // path, and "/" must not match every route.
             Some("GET, HEAD")
-        } else if path == "/dashboard" || path == "/" {
-            // Embedded dashboard (IMP-36): GET-only. Exact match — the caller
-            // passes the query-stripped path, and "/" must not match every route.
-            Some("GET, HEAD")
-        } else if path.starts_with("/v1/audio") || path.starts_with("/v1/images") {
-            // Recognised but not implemented; allow POST so the 405 vs 501 distinction is correct.
-            Some("POST, OPTIONS")
         } else {
             None
         }
