@@ -34,8 +34,11 @@ jobs:
             asset: linux-x86_64
           - os: windows-latest
             asset: windows-x86_64
-          # macos-14 is the Apple Silicon runner; Intel macOS is not built.
-          - os: macos-14
+          # macos-latest is GitHub's current macOS image and runs on Apple
+          # Silicon (arm64); Intel macOS is not built. The explicit macos-14
+          # label was rejected by the runner pool ("The configuration
+          # 'macos-14-arm64-us-default' is not supported"), so track latest.
+          - os: macos-latest
             asset: macos-aarch64
     steps:
       - name: Resolve tag
