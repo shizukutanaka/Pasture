@@ -150,11 +150,7 @@ fn compute_route_preview(
     // applies to an engine "cloud" decision when a guard is configured.
     let guard_configured = config.budget_daily_tokens > 0 || config.spike_factor > 0;
     let (route, serves_cloud, hit) = if decision.route == Route::Cloud && guard_configured {
-        let avg = if cloud_count > 0 {
-            cloud_sum / cloud_count
-        } else {
-            0
-        };
+        let avg = cloud_sum.checked_div(cloud_count).unwrap_or(0);
         let spike_hit = config.spike_factor > 0
             && est_total > 0
             && avg > 0

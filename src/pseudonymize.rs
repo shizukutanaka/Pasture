@@ -63,7 +63,7 @@ pub fn pseudonymize_messages(messages: &[Message]) -> (Vec<Message>, Mapping) {
 pub fn restore(text: &str, mapping: &[(String, String)]) -> String {
     let mut out = text.to_string();
     let mut sorted: Vec<&(String, String)> = mapping.iter().collect();
-    sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
     for (original, token) in sorted {
         out = out.replace(token.as_str(), original.as_str());
     }
