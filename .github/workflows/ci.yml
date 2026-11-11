@@ -86,8 +86,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the MSRV (1.75) for the default build, and a
+      # plain `rustup default stable` does not override it inside the repo.
+      # The cloud feature's TLS stack (openssl-sys) needs a newer rustc, so
+      # pin this job's directory override to stable. The MSRV promise covers
+      # the default zero-dependency build, not the cloud feature.
       - name: Install Rust stable
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install stable --profile minimal && rustup override set stable
       # The cloud path is feature-gated and pulls a TLS stack, so it is not
       # covered by the zero-dependency job above. It still has to compile.
       - name: cargo build --features cloud
@@ -100,8 +105,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # cargo-deny 0.20 needs a recent rustc to build from source, but the
+      # repo pin (rust-toolchain.toml, MSRV 1.75) would otherwise apply to
+      # this job too — `rustup default stable` does not beat the pin inside
+      # the repo, so use a directory override.
       - name: Install Rust stable
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install stable --profile minimal && rustup override set stable
       # Installed from source rather than via a marketplace action: this job
       # exists to reason about supply chain, so it should not add one. Slower,
       # but it is an independent job and blocks nothing else.
