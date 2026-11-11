@@ -275,14 +275,30 @@ impl ErrorCurve {
             return None;
         }
         pts.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("filtered to finite"));
+        // Pre-pool ties before PAV (issue #4 conformance): observations that
+        // share a logprob are merged into one (logprob, error_sum, count)
+        // entry — the count-weighted mean — so every observation at the same
+        // logprob receives the same fitted value. This matches the UCCI
+        // reference semantics; without it, the step lookup at a tied logprob
+        // returns whichever individual point's block happens to sort last.
+        let mut pooled: Vec<(f64, f64, usize)> = Vec::new();
+        for (lp, y) in pts {
+            match pooled.last_mut() {
+                Some((last_lp, sum, n)) if *last_lp == lp => {
+                    *sum += y;
+                    *n += 1;
+                }
+                _ => pooled.push((lp, y, 1)),
+            }
+        }
         // PAVA for a non-increasing fit: walk left to right keeping blocks of
         // (start_logprob, error_sum, count); a later block whose mean exceeds
         // its predecessor's violates monotonicity and is merged into it.
         // Equal means are merged too — same fitted function, canonical minimal
         // blocks (so the advisory printout pools ties into one honest n=).
         let mut blocks: Vec<(f64, f64, usize)> = Vec::new();
-        for (lp, y) in pts {
-            blocks.push((lp, y, 1));
+        for (lp, sum, n) in pooled {
+            blocks.push((lp, sum, n));
             while blocks.len() >= 2 {
                 let (_, last_sum, last_n) = blocks[blocks.len() - 1];
                 let (_, prev_sum, prev_n) = blocks[blocks.len() - 2];
