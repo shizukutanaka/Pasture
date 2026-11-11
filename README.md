@@ -1,10 +1,10 @@
 # Pasture
 
-> New to this? See **[GETTING_STARTED.md](GETTING_STARTED.md)** for a zero-to-running beginner guide (Japanese). Or just run `pasture doctor`.
+> New to this? See **[GETTING_STARTED.md](GETTING_STARTED.md)** (Japanese) or **[GETTING_STARTED_EN.md](GETTING_STARTED_EN.md)** (English) for a zero-to-running beginner guide. Or just run `pasture doctor`.
 
 [![CI](https://github.com/shizukutanaka/pasture/actions/workflows/ci.yml/badge.svg)](https://github.com/shizukutanaka/pasture/actions/workflows/ci.yml)
 
-**OpenAI-compatible local/cloud LLM routing proxy with hardware-adaptive thresholds. Zero dependencies.**
+**Hardware-aware LLM routing in one binary — Pasture sends each request to your local model or the cloud, based on your machine. OpenAI-compatible, zero dependencies.**
 
 All projects at a glance: [Project Portal](https://muse.ai/s/project-portal-bf6avrxu7xyfxl/6PgvpkK4Nn1DPotxc3edgYXaYZgDC5_LeWpXkf1wsrg)
 
@@ -29,7 +29,29 @@ The same prompt that goes to the cloud on a laptop stays local on a workstation 
 
 ## Install
 
-Requires Rust 1.75+ to build.
+No build needed. Download the prebuilt binary for your OS from the
+[v0.28.0 release page](https://github.com/shizukutanaka/Pasture/releases/tag/v0.28.0):
+
+- Linux (x86_64): `pasture-v0.28.0-linux-x86_64.tar.gz`
+- macOS (Apple Silicon): `pasture-v0.28.0-macos-aarch64.tar.gz`
+- Windows (x86_64): `pasture-v0.28.0-windows-x86_64.zip`
+
+```sh
+# Linux
+tar -xzf pasture-v0.28.0-linux-x86_64.tar.gz
+./pasture-v0.28.0-linux-x86_64/pasture doctor
+# macOS: extract pasture-v0.28.0-macos-aarch64.tar.gz, then run
+# ./pasture-v0.28.0-macos-aarch64/pasture doctor
+# Windows: unzip the archive, then run pasture.exe from the extracted folder
+```
+
+> Prebuilt binaries are the local-only build. To use cloud escalation
+> (OpenAI / Anthropic), build from source with the `cloud` feature below —
+> the prebuilt binary has no cloud code paths by design.
+
+### Build from source
+
+Requires Rust 1.75+.
 
 ```sh
 git clone https://github.com/shizukutanaka/pasture
@@ -93,6 +115,12 @@ base_url = http://127.0.0.1:8645/v1
 The response includes an `x_pasture_route` field telling you which way the request went.
 Errors use the OpenAI envelope `{"error":{"message","type"}}`. The full API/routing
 contract is specified in **[SPEC.md](SPEC.md)**.
+
+## Limitations
+
+- **Cloud escalation uses API keys only.** Subscription sign-ins (Claude Pro/Max, ChatGPT Plus, and similar plans) cannot be routed through Pasture — it talks to provider APIs with keys you supply, not to subscription accounts.
+- **A local engine is required for local routing.** Pasture routes and proxies; it does not itself run models. You need Ollama, LM Studio, or another OpenAI-compatible local server running for local answers.
+- **Prebuilt binaries cover three platforms**: Linux x86_64, macOS (Apple Silicon), and Windows x86_64. On anything else, build from source.
 
 ## Configuration
 
