@@ -6,7 +6,7 @@
 
 **OpenAI-compatible local/cloud LLM routing proxy with hardware-adaptive thresholds. Zero dependencies.**
 
-All projects at a glance: [Project Portal](https://muse.ai/s/xuan-guan-potaru-ja6aqxqxlpxbxnxl/DpY3e_2xwrRyU5918RAV9v0G3UfbMvPX0HeuI-0ab-s)
+All projects at a glance: [Project Portal](https://muse.ai/s/project-portal-bf6avrxu7xyfxl/6PgvpkK4Nn1DPotxc3edgYXaYZgDC5_LeWpXkf1wsrg)
 
 Pasture sits between your existing AI client (IDE plugin, chat app, Claude Code, your own scripts) and the models. It exposes an OpenAI-compatible endpoint, and for each request it decides — deterministically and based on your actual hardware — whether to answer with a **local** model (free, private, offline-capable) or escalate to a **cloud** API (for hard tasks). You point your client's `base_url` at Pasture and keep your existing workflow.
 
