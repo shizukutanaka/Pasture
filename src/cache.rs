@@ -263,14 +263,14 @@ fn jaccard_sorted(a: &[u64], b: &[u64]) -> f64 {
     }
     let (mut i, mut j, mut inter) = (0usize, 0usize, 0usize);
     while i < a.len() && j < b.len() {
-        if a[i] < b[j] {
-            i += 1;
-        } else if a[i] > b[j] {
-            j += 1;
-        } else {
-            inter += 1;
-            i += 1;
-            j += 1;
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                inter += 1;
+                i += 1;
+                j += 1;
+            }
         }
     }
     let union = a.len() + b.len() - inter;
