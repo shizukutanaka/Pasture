@@ -1717,11 +1717,23 @@ impl Proxy {
     /// wrapped counter would then dwarf any budget and silently block the cloud
     /// route for the rest of the new day. A saturating CAS loop clamps at 0 instead.
     fn release_cloud_tokens(&self, n: u64) {
-        let _ = self
-            .today_cloud_tokens
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                Some(cur.saturating_sub(n))
-            });
+        // `fetch_update` was deprecated in Rust 1.99 (renamed to `try_update`),
+        // but `try_update` is only stable since 1.95 — past this crate's MSRV
+        // (1.75). Spell out the CAS loop `fetch_update` itself performs, using
+        // only pre-1.75 primitives: identical semantics (the update closure
+        // always returns `Some`, so the loop runs until the CAS succeeds).
+        let mut cur = self.today_cloud_tokens.load(Ordering::Relaxed);
+        loop {
+            match self.today_cloud_tokens.compare_exchange_weak(
+                cur,
+                cur.saturating_sub(n),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// Live view of the daily cloud-token budget for `/metrics` and `/v1/stats`
@@ -1747,9 +1759,8 @@ impl Proxy {
         // Spike: single request far above the running average → route local instead.
         if self.spike_factor > 0 && estimated_tokens > 0 {
             let count = self.cloud_request_count.load(Ordering::Relaxed);
-            if count > 0 {
-                let sum = self.cloud_token_sum.load(Ordering::Relaxed);
-                let avg = sum / count;
+            let sum = self.cloud_token_sum.load(Ordering::Relaxed);
+            if let Some(avg) = sum.checked_div(count) {
                 if avg > 0 && estimated_tokens > self.spike_factor.saturating_mul(avg) {
                     return Some("spike detected — request exceeds average by spike_factor");
                 }
@@ -1782,9 +1793,8 @@ impl Proxy {
         self.roll_budget_day_if_needed();
         if self.spike_factor > 0 && estimated_tokens > 0 {
             let count = self.cloud_request_count.load(Ordering::Relaxed);
-            if count > 0 {
-                let sum = self.cloud_token_sum.load(Ordering::Relaxed);
-                let avg = sum / count;
+            let sum = self.cloud_token_sum.load(Ordering::Relaxed);
+            if let Some(avg) = sum.checked_div(count) {
                 if avg > 0 && estimated_tokens > self.spike_factor.saturating_mul(avg) {
                     return Some("spike detected — request exceeds average by spike_factor");
                 }
