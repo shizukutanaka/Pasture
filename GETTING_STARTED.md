@@ -43,9 +43,8 @@ pasture up
 `pasture up` は、（必要なら）Ollama を起動し、モデルが未取得なら自動でダウンロードし、そのままプロキシを起動します。起動時に、アプリに設定する接続先（base_url）も表示します。
 うまくいかないときは `pasture doctor` で状態を確認してください（`[!!]` の下に直し方が出ます）。
 
-> pasture 本体の入手: 今はソースからビルドします。
-> `git clone https://github.com/shizukutanaka/pasture && cd pasture && cargo build --release`
-> （Rust が必要です。`target/release/pasture` ができます）
+> pasture 本体の入手: [Release ページ](https://github.com/shizukutanaka/Pasture/releases/tag/v0.28.0)から OS 別のバイナリをダウンロードするのが一番かんたんです（ビルド不要・ローカル専用版）。
+> ソースからビルドする場合: `git clone https://github.com/shizukutanaka/pasture && cd pasture && cargo build --release`（Rust が必要です。`target/release/pasture` ができます。クラウド併用には `cargo build --release --features cloud`）
 
 ---
 
