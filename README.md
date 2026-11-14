@@ -27,6 +27,14 @@ The same prompt that goes to the cloud on a laptop stays local on a workstation 
 > fails, Pasture says so and leans **local** rather than assuming a weak machine;
 > set `PASTURE_RAM_MB` or `PASTURE_THRESHOLD` to make routing exact.
 
+## What Pasture never does
+
+- **No ads, no tracking.** Pasture ships no advertising and no analytics, and has no telemetry beacons — nothing about you or your usage is reported anywhere. The optional trace log is off unless you explicitly enable it, writes only to a local file you choose, and records token counts, model names and timings — never prompt content.
+- **The creator receives no data.** Pasture runs entirely on your own machine. There is no account, no sign-up, and no Pasture server that could hold your data.
+- **Your prompts go only where you point them.** By default that is a local model on your machine — the prebuilt binaries contain no cloud code paths at all. Cloud escalation exists only in a source build with the `cloud` feature, uses your own API key, and sends to the provider you chose. A prompt classified as sensitive is kept on the machine (invariant I2 in SPEC.md) — unless you explicitly switch that protection off.
+
+日本語: 広告も追跡もありません（解析やテレメトリの送信先自体がありません。任意のトレース記録も、明示的に有効にしない限り無効で、行き先は自分のマシン内のファイルだけ、記録されるのはトークン数や所要時間などで入力文そのものは含まれません）。作成者にデータが届くこともありません — アカウントも登録も、Pasture のサーバーも存在せず、すべてあなたのマシンの中で動きます。入力した文章の行き先は、あなたが指定した先だけです。既定はマシン内のローカルモデルで、配布バイナリにはクラウドへの経路自体が含まれていません。クラウドへの振り分けは、ソースから有効化した場合に、あなた自身の API キーで、あなたが選んだ事業者へ送る場合だけです。機微と判定された入力はマシンの中に留まります（あなたが明示的にその保護を切った場合を除きます）。
+
 ## Install
 
 No build needed. Download the prebuilt binary for your OS from the
