@@ -5,6 +5,32 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added
+
+- **`pasture discover`** (IMP-75, ADR-284): probes localhost for running
+  local LLM runtimes — Ollama, LM Studio, Jan, llama.cpp server, KoboldCPP,
+  GPT4All, vLLM, Open WebUI — and prints how each found runtime is used
+  with Pasture (`--json` for scripting). A runtime counts as found only
+  when it answers an HTTP request. The detection list is ported from lmm
+  in the local-LLM consolidation.
+- **Idempotency-Key replay** (IMP-74, ADR-283): a duplicate
+  `POST /v1/chat/completions` carrying the same `Idempotency-Key` header
+  replays the first successful response instead of running — and billing —
+  the completion twice. Successes only, bounded in-memory store. Ported
+  from RekAI in the local-LLM consolidation.
+- **Gemini cloud provider** (IMP-73, ADR-282): `PASTURE_CLOUD_PROVIDER=gemini`
+  (or `google`) with `PASTURE_GEMINI_API_KEY` adds Google Gemini as a cloud
+  escalation target — request/response translation including `functionCall`/
+  `functionResponse` tool turns, `systemInstruction`, and `generationConfig`
+  sampling. Streaming is served from the buffered exchange (one delta).
+  Ported from RekAI's provider set in the local-LLM consolidation.
+- **Anthropic Messages API shim** (IMP-72, ADR-281): `POST /v1/messages` accepts
+  Anthropic SDK requests — `system`, text/`tool_use`/`tool_result` content
+  parts, `tools`/`tool_choice`, `stop_sequences` — routes them through the
+  normal pipeline, and replies with a `type:"message"` object. Text-only,
+  non-streaming (same deliberate scope as the Responses shim). Ported from
+  RekAI in the local-LLM consolidation.
+
 ## [0.28.0] - 2026-08-16
 
 ### Security — prompt-injection guard hardened against real evasions (ADR-247–253)

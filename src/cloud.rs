@@ -6,6 +6,7 @@
 //! BYOK: API keys come from environment variables and are never logged (I5):
 //!   OpenAI    -> PASTURE_OPENAI_API_KEY
 //!   Anthropic -> PASTURE_ANTHROPIC_API_KEY
+//!   Gemini    -> PASTURE_GEMINI_API_KEY
 
 use crate::backend::{BackendError, CompletionRequest};
 use crate::json::{escape_string, parse, JsonValue};
@@ -15,6 +16,11 @@ use crate::json::{escape_string, parse, JsonValue};
 pub enum Provider {
     OpenAI,
     Anthropic,
+    /// Google Gemini (IMP-73, ADR-282) — ported from RekAI's provider set in
+    /// the local-LLM consolidation. Gemini's API is not OpenAI-shaped: the
+    /// model lives in the URL path and the body uses `contents`/`parts`, so
+    /// this variant has its own body builder, response parser and auth header.
+    Gemini,
 }
 
 impl Provider {
@@ -22,6 +28,7 @@ impl Provider {
         match s.to_lowercase().as_str() {
             "openai" => Some(Provider::OpenAI),
             "anthropic" | "claude" => Some(Provider::Anthropic),
+            "gemini" | "google" => Some(Provider::Gemini),
             _ => None,
         }
     }
@@ -30,6 +37,7 @@ impl Provider {
         match self {
             Provider::OpenAI => "api.openai.com",
             Provider::Anthropic => "api.anthropic.com",
+            Provider::Gemini => "generativelanguage.googleapis.com",
         }
     }
 
@@ -37,6 +45,18 @@ impl Provider {
         match self {
             Provider::OpenAI => "/v1/chat/completions",
             Provider::Anthropic => "/v1/messages",
+            // Gemini embeds the model in the path; use `request_path`.
+            Provider::Gemini => "/v1beta/models",
+        }
+    }
+
+    /// Full request path for a specific model. Only Gemini's URL carries the
+    /// model (`/v1beta/models/{model}:generateContent`); the other providers
+    /// name the model in the body and keep a static path.
+    pub fn request_path(self, model: &str) -> String {
+        match self {
+            Provider::Gemini => format!("/v1beta/models/{model}:generateContent"),
+            _ => self.path().to_string(),
         }
     }
 
@@ -44,6 +64,7 @@ impl Provider {
         match self {
             Provider::OpenAI => "PASTURE_OPENAI_API_KEY",
             Provider::Anthropic => "PASTURE_ANTHROPIC_API_KEY",
+            Provider::Gemini => "PASTURE_GEMINI_API_KEY",
         }
     }
 
@@ -215,6 +236,150 @@ impl Provider {
                     extra
                 )
             }
+            Provider::Gemini => {
+                // Gemini's generateContent shape: `contents` of role/parts,
+                // system text in `systemInstruction`, sampling in
+                // `generationConfig`. Roles: user -> "user", assistant ->
+                // "model". Tool calls become `functionCall` parts and tool
+                // results `functionResponse` parts; a functionResponse needs
+                // the function *name*, which the internal tool message does
+                // not carry — recover it from the matching assistant
+                // tool_calls entry (falling back to the call id).
+                let mut id_to_name: Vec<(String, String)> = Vec::new();
+                for m in &req.messages {
+                    if let Some(tc) = &m.tool_calls_json {
+                        if let Ok(JsonValue::Array(calls)) = parse(tc) {
+                            for c in &calls {
+                                let id = c
+                                    .get("id")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = c
+                                    .get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !id.is_empty() {
+                                    id_to_name.push((id, name));
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut system_parts: Vec<&str> = Vec::new();
+                let mut contents: Vec<String> = Vec::new();
+                for m in &req.messages {
+                    if m.role == "system" {
+                        system_parts.push(m.content.as_str());
+                    } else if m.role == "tool" {
+                        let tid = m.tool_call_id.as_deref().unwrap_or("");
+                        let name = id_to_name
+                            .iter()
+                            .find(|(id, _)| id == tid)
+                            .map(|(_, n)| n.clone())
+                            .unwrap_or_else(|| tid.to_string());
+                        let result_obj =
+                            format!("{{\"result\":\"{}\"}}", escape_string(&m.content));
+                        contents.push(format!(
+                            "{{\"role\":\"user\",\"parts\":[{{\"functionResponse\":{{\"name\":\"{}\",\"response\":{}}}}}]}}",
+                            escape_string(&name),
+                            result_obj
+                        ));
+                    } else if m.role == "assistant" {
+                        let mut parts: Vec<String> = Vec::new();
+                        if !m.content.is_empty() {
+                            parts.push(format!("{{\"text\":\"{}\"}}", escape_string(&m.content)));
+                        }
+                        if let Some(tc) = &m.tool_calls_json {
+                            if let Ok(JsonValue::Array(calls)) = parse(tc) {
+                                for c in &calls {
+                                    let (name, args) = match c.get("function") {
+                                        Some(f) => (
+                                            f.get("name")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            f.get("arguments")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or("{}")
+                                                .to_string(),
+                                        ),
+                                        None => (String::new(), "{}".to_string()),
+                                    };
+                                    let args_json = match parse(&args) {
+                                        Ok(v @ JsonValue::Object(_)) => v.to_json_string(),
+                                        _ => "{}".to_string(),
+                                    };
+                                    parts.push(format!(
+                                        "{{\"functionCall\":{{\"name\":\"{}\",\"args\":{}}}}}",
+                                        escape_string(&name),
+                                        args_json
+                                    ));
+                                }
+                            }
+                        }
+                        contents.push(format!(
+                            "{{\"role\":\"model\",\"parts\":[{}]}}",
+                            parts.join(",")
+                        ));
+                    } else {
+                        contents.push(format!(
+                            "{{\"role\":\"user\",\"parts\":[{{\"text\":\"{}\"}}]}}",
+                            escape_string(&m.content)
+                        ));
+                    }
+                }
+                let system_json = if system_parts.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ",\"systemInstruction\":{{\"parts\":[{{\"text\":\"{}\"}}]}}",
+                        escape_string(&system_parts.join("\n\n"))
+                    )
+                };
+                // generationConfig: temperature / topP / maxOutputTokens /
+                // stopSequences map across. Seed and penalties have no
+                // generateContent equivalent and are not sent.
+                let mut gen: Vec<String> = Vec::new();
+                if let Some(t) = req.sampling.temperature {
+                    gen.push(format!("\"temperature\":{t}"));
+                }
+                if let Some(p) = req.sampling.top_p {
+                    gen.push(format!("\"topP\":{p}"));
+                }
+                if let Some(mt) = req.sampling.max_tokens {
+                    gen.push(format!("\"maxOutputTokens\":{mt}"));
+                }
+                if !req.sampling.stop.is_empty() {
+                    let items: Vec<String> = req
+                        .sampling
+                        .stop
+                        .iter()
+                        .map(|s| format!("\"{}\"", escape_string(s)))
+                        .collect();
+                    gen.push(format!("\"stopSequences\":[{}]", items.join(",")));
+                }
+                let gen_json = if gen.is_empty() {
+                    String::new()
+                } else {
+                    format!(",\"generationConfig\":{{{}}}", gen.join(","))
+                };
+                let mut tools_json = String::new();
+                if let Some(tools) = &req.sampling.tools {
+                    tools_json.push_str(&translate_tools_to_gemini(tools));
+                }
+                if req.sampling.tools.is_some() {
+                    if let Some(tc) = &req.sampling.tool_choice {
+                        tools_json.push_str(&translate_tool_choice_to_gemini(tc));
+                    }
+                }
+                format!(
+                    "{{\"contents\":[{}]{system_json}{gen_json}{tools_json}}}",
+                    contents.join(",")
+                )
+            }
         }
     }
 
@@ -232,6 +397,13 @@ impl Provider {
             }
             Provider::Anthropic => {
                 s.push_str(",\"stream\":true}");
+            }
+            Provider::Gemini => {
+                // Gemini streaming is a different endpoint
+                // (:streamGenerateContent), not a body flag. The transport's
+                // stream_complete serves Gemini from the buffered exchange,
+                // so the body is returned unchanged.
+                s.push('}');
             }
         }
         s
@@ -255,6 +427,7 @@ impl Provider {
                 ("x-api-key".into(), api_key.to_string()),
                 ("anthropic-version".into(), "2023-06-01".into()),
             ],
+            Provider::Gemini => vec![("x-goog-api-key".into(), api_key.to_string())],
         }
     }
 
@@ -353,6 +526,65 @@ impl Provider {
                 // ADR-254: cached prompt tokens live in separate fields.
                 let p = anthropic_prompt_tokens(v.get("usage"));
                 let (_, c) = usage(&v, "input_tokens", "output_tokens");
+                Ok((content, tool_calls, p, c))
+            }
+            Provider::Gemini => {
+                // generateContent reply: candidates[0].content.parts[] holds
+                // text and functionCall parts. Gemini returns no call id, so
+                // synthesize a stable one per call index — the client echoes
+                // it back in later turns, where build_body's id->name lookup
+                // resolves the functionResponse name from it.
+                let cand = v
+                    .get("candidates")
+                    .and_then(JsonValue::as_array)
+                    .and_then(|a| a.first())
+                    .ok_or_else(|| BackendError::Protocol("missing candidates".into()))?;
+                let parts = cand
+                    .get("content")
+                    .and_then(|c| c.get("parts"))
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| {
+                        BackendError::Protocol("missing candidates[0].content.parts".into())
+                    })?;
+                let mut text_parts: Vec<&str> = Vec::new();
+                let mut tool_items: Vec<String> = Vec::new();
+                for (i, part) in parts.iter().enumerate() {
+                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                        text_parts.push(t);
+                    }
+                    if let Some(fc) = part.get("functionCall") {
+                        let name = fc.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                        let args = fc
+                            .get("args")
+                            .map(|a| a.to_json_string())
+                            .unwrap_or_else(|| "{}".to_string());
+                        tool_items.push(format!(
+                            "{{\"id\":\"gemini_call_{i}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
+                            escape_string(name),
+                            escape_string(&args)
+                        ));
+                    }
+                }
+                let content = text_parts.join("");
+                let tool_calls = if tool_items.is_empty() {
+                    None
+                } else {
+                    Some(format!("[{}]", tool_items.join(",")))
+                };
+                if content.is_empty() && tool_calls.is_none() {
+                    return Err(BackendError::Protocol(
+                        "missing candidates[0] text and no functionCall".into(),
+                    ));
+                }
+                let um = v.get("usageMetadata");
+                let p = um
+                    .and_then(|u| u.get("promptTokenCount"))
+                    .and_then(JsonValue::as_f64)
+                    .unwrap_or(0.0) as u64;
+                let c = um
+                    .and_then(|u| u.get("candidatesTokenCount"))
+                    .and_then(JsonValue::as_f64)
+                    .unwrap_or(0.0) as u64;
                 Ok((content, tool_calls, p, c))
             }
         }
@@ -604,6 +836,9 @@ impl Provider {
         match self {
             Provider::OpenAI => parse_openai_stream_line(line),
             Provider::Anthropic => parse_anthropic_stream_line(line),
+            // Gemini never reaches the SSE reader (stream_complete serves it
+            // from the buffered exchange, IMP-73).
+            Provider::Gemini => None,
         }
     }
 }
@@ -832,6 +1067,73 @@ fn translate_tool_choice_to_anthropic(tc: &JsonValue) -> String {
     }
 }
 
+/// Translate an OpenAI-format `tools` array to Gemini's schema (IMP-73).
+/// OpenAI: `[{"type":"function","function":{"name","description","parameters":{...}}}]`
+/// Gemini: `[{"functionDeclarations":[{"name","description","parameters":{...}}]}]`
+/// Returns a comma-prefixed `,"tools":[...]` fragment or empty if no valid tools.
+fn translate_tools_to_gemini(tools: &JsonValue) -> String {
+    let Some(arr) = tools.as_array() else {
+        return String::new();
+    };
+    let items: Vec<String> = arr
+        .iter()
+        .filter_map(|t| {
+            let func = t.get("function")?;
+            let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = func
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let schema_json = func
+                .get("parameters")
+                .map(|s| s.to_json_string())
+                .unwrap_or_else(|| "{\"type\":\"object\"}".to_string());
+            Some(format!(
+                "{{\"name\":\"{}\",\"description\":\"{}\",\"parameters\":{}}}",
+                escape_string(name),
+                escape_string(desc),
+                schema_json
+            ))
+        })
+        .collect();
+    if items.is_empty() {
+        return String::new();
+    }
+    format!(
+        ",\"tools\":[{{\"functionDeclarations\":[{}]}}]",
+        items.join(",")
+    )
+}
+
+/// Translate an OpenAI `tool_choice` to Gemini's `toolConfig` (IMP-73).
+/// Returns a comma-prefixed fragment or empty for the default (AUTO).
+fn translate_tool_choice_to_gemini(tc: &JsonValue) -> String {
+    match tc {
+        JsonValue::Str(s) => match s.as_str() {
+            "required" => {
+                ",\"toolConfig\":{\"functionCallingConfig\":{\"mode\":\"ANY\"}}".to_string()
+            }
+            "none" => ",\"toolConfig\":{\"functionCallingConfig\":{\"mode\":\"NONE\"}}".to_string(),
+            _ => String::new(), // "auto"/unknown → omit (Gemini default is AUTO)
+        },
+        JsonValue::Object(_) => {
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                return String::new();
+            }
+            format!(
+                ",\"toolConfig\":{{\"functionCallingConfig\":{{\"mode\":\"ANY\",\"allowedFunctionNames\":[\"{}\"]}}}}",
+                escape_string(name)
+            )
+        }
+        _ => String::new(),
+    }
+}
+
 /// Translate an OpenAI-format `tools` array to Anthropic's schema (ADR-179).
 /// OpenAI: `[{"type":"function","function":{"name","description","parameters":{...}}}]`
 /// Anthropic: `[{"name","description","input_schema":{...}}]`
@@ -1015,7 +1317,7 @@ mod transport {
 
         fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, BackendError> {
             let host = self.provider.host();
-            let path = self.provider.path();
+            let path = self.provider.request_path(&self.model);
             let body = self.provider.build_body_opts(req, self.cache_control);
             let mut header_lines = String::new();
             for (k, v) in self.provider.headers(&self.api_key) {
@@ -1050,8 +1352,19 @@ mod transport {
             req: &CompletionRequest,
             on_delta: &mut dyn FnMut(&str),
         ) -> Result<CompletionResponse, BackendError> {
+            // Gemini streaming is a separate endpoint with its own event
+            // shape; serve it from the buffered exchange and emit the full
+            // text as one delta (IMP-73). The reply stays correct — clients
+            // see one content chunk instead of many.
+            if self.provider == Provider::Gemini {
+                let resp = self.complete(req)?;
+                if !resp.content.is_empty() {
+                    on_delta(&resp.content);
+                }
+                return Ok(resp);
+            }
             let host = self.provider.host();
-            let path = self.provider.path();
+            let path = self.provider.request_path(&self.model);
             // build_body_opts + stream flag; OpenAI also gets stream_options so
             // the backend sends a final usage chunk (ADR-173); Anthropic already
             // sends usage in message_delta and rejects stream_options (ADR-179).
@@ -1066,6 +1379,8 @@ mod transport {
                 Provider::Anthropic => {
                     body.push_str(",\"stream\":true}");
                 }
+                // Gemini returned early above (buffered exchange).
+                Provider::Gemini => unreachable!(),
             }
             let body = body;
             let mut header_lines = String::new();
@@ -1216,6 +1531,201 @@ mod tests {
         let h = Provider::Anthropic.headers("KEY");
         assert!(h.iter().any(|(k, v)| k == "x-api-key" && v == "KEY"));
         assert!(h.iter().any(|(k, _)| k == "anthropic-version"));
+    }
+
+    #[test]
+    fn test_gemini_name_path_and_headers() {
+        assert_eq!(Provider::from_name("gemini"), Some(Provider::Gemini));
+        assert_eq!(Provider::from_name("google"), Some(Provider::Gemini));
+        assert_eq!(Provider::Gemini.host(), "generativelanguage.googleapis.com");
+        assert_eq!(
+            Provider::Gemini.request_path("gemini-2.0-flash"),
+            "/v1beta/models/gemini-2.0-flash:generateContent"
+        );
+        // The other providers keep their static paths.
+        assert_eq!(
+            Provider::OpenAI.request_path("gpt-4o"),
+            "/v1/chat/completions"
+        );
+        let h = Provider::Gemini.headers("KEY");
+        assert!(h.iter().any(|(k, v)| k == "x-goog-api-key" && v == "KEY"));
+        assert_eq!(Provider::Gemini.env_key(), "PASTURE_GEMINI_API_KEY");
+    }
+
+    #[test]
+    fn test_gemini_body_shape() {
+        let b = Provider::Gemini.build_body(&req());
+        let v = parse(&b).expect("gemini body is valid JSON");
+        let contents = v.get("contents").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(
+            contents[0].get("role").and_then(|r| r.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            contents[0]
+                .get("parts")
+                .and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str()),
+            Some("hi")
+        );
+        // The model is in the URL for Gemini, never in the body.
+        assert!(v.get("model").is_none(), "{b}");
+    }
+
+    #[test]
+    fn test_gemini_body_system_and_sampling() {
+        let mut r = req();
+        r.messages.insert(
+            0,
+            Message {
+                role: "system".to_string(),
+                content: "be terse".to_string(),
+                ..Default::default()
+            },
+        );
+        r.sampling.temperature = Some(0.5);
+        r.sampling.max_tokens = Some(77);
+        r.sampling.stop = vec!["halt".to_string()];
+        let b = Provider::Gemini.build_body(&r);
+        let v = parse(&b).expect("valid JSON");
+        assert_eq!(
+            v.get("systemInstruction")
+                .and_then(|s| s.get("parts"))
+                .and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str()),
+            Some("be terse")
+        );
+        let gen = v.get("generationConfig").expect("generationConfig");
+        assert_eq!(
+            gen.get("maxOutputTokens").and_then(|x| x.as_f64()),
+            Some(77.0)
+        );
+        assert_eq!(gen.get("temperature").and_then(|x| x.as_f64()), Some(0.5));
+        assert!(b.contains("\"stopSequences\":[\"halt\"]"), "{b}");
+    }
+
+    #[test]
+    fn test_gemini_body_tools_translation() {
+        let mut r = req();
+        r.has_tools = true;
+        r.sampling.tools = parse(
+            r#"[{"type":"function","function":{"name":"get_weather","description":"d","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]"#,
+        )
+        .ok();
+        r.sampling.tool_choice =
+            parse(r#"{"type":"function","function":{"name":"get_weather"}}"#).ok();
+        let b = Provider::Gemini.build_body(&r);
+        let v = parse(&b).expect("valid JSON");
+        let decl = v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .and_then(|a| a.first())
+            .and_then(|t| t.get("functionDeclarations"))
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .expect("functionDeclarations[0]");
+        assert_eq!(
+            decl.get("name").and_then(|x| x.as_str()),
+            Some("get_weather")
+        );
+        assert!(
+            decl.get("parameters").is_some(),
+            "parameters carried across"
+        );
+        let cfg = v
+            .get("toolConfig")
+            .and_then(|t| t.get("functionCallingConfig"))
+            .expect("functionCallingConfig");
+        assert_eq!(cfg.get("mode").and_then(|x| x.as_str()), Some("ANY"));
+    }
+
+    #[test]
+    fn test_gemini_body_tool_history() {
+        // Assistant functionCall + user functionResponse, with the response's
+        // function name recovered from the earlier call (Gemini requires it).
+        let mut r = req();
+        r.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: "weather?".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: String::new(),
+                tool_calls_json: Some(
+                    r#"[{"id":"gemini_call_0","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Osaka\"}"}}]"#
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: "sunny".to_string(),
+                tool_call_id: Some("gemini_call_0".to_string()),
+                ..Default::default()
+            },
+        ];
+        let b = Provider::Gemini.build_body(&r);
+        let v = parse(&b).expect("valid JSON");
+        let contents = v.get("contents").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(
+            contents[1].get("role").and_then(|x| x.as_str()),
+            Some("model")
+        );
+        let fc = contents[1]
+            .get("parts")
+            .and_then(|p| p.as_array())
+            .and_then(|a| a.first())
+            .and_then(|p| p.get("functionCall"))
+            .expect("functionCall part");
+        assert_eq!(fc.get("name").and_then(|x| x.as_str()), Some("get_weather"));
+        assert_eq!(
+            fc.get("args")
+                .and_then(|a| a.get("city"))
+                .and_then(|x| x.as_str()),
+            Some("Osaka")
+        );
+        let fr = contents[2]
+            .get("parts")
+            .and_then(|p| p.as_array())
+            .and_then(|a| a.first())
+            .and_then(|p| p.get("functionResponse"))
+            .expect("functionResponse part");
+        assert_eq!(fr.get("name").and_then(|x| x.as_str()), Some("get_weather"));
+        assert_eq!(
+            fr.get("response")
+                .and_then(|x| x.get("result"))
+                .and_then(|x| x.as_str()),
+            Some("sunny")
+        );
+    }
+
+    #[test]
+    fn test_parse_gemini_response() {
+        let body = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}"#;
+        let (c, tc, p, comp) = Provider::Gemini.parse_response(body).unwrap();
+        assert_eq!(c, "hello");
+        assert_eq!(tc, None);
+        assert_eq!((p, comp), (5, 3));
+    }
+
+    #[test]
+    fn test_parse_gemini_response_function_call() {
+        let body = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Osaka"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":4}}"#;
+        let (c, tc, p, comp) = Provider::Gemini.parse_response(body).unwrap();
+        assert_eq!(c, "");
+        let tc = tc.expect("tool_calls must be extracted");
+        assert!(tc.contains("\"name\":\"get_weather\""), "{tc}");
+        assert!(tc.contains("\"id\":\"gemini_call_0\""), "{tc}");
+        assert!(tc.contains("Osaka"), "{tc}");
+        assert_eq!((p, comp), (9, 4));
     }
 
     #[test]

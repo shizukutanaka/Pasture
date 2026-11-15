@@ -11,7 +11,7 @@
 //! response-building concern.
 
 use crate::backend::{CompletionResponse, EmbeddingsResponse};
-use crate::json::escape_string;
+use crate::json::{escape_string, parse, JsonValue};
 use crate::proxy::unix_now;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -446,6 +446,67 @@ pub fn build_responses_response(resp: &CompletionResponse, route_label: &str) ->
         resp.prompt_tokens,
         resp.completion_tokens,
         total,
+    )
+}
+
+/// Build an Anthropic Messages-API reply (`type:"message"`) for
+/// `POST /v1/messages` (IMP-72, ADR-281). Text goes in a `content[0]`
+/// `{"type":"text"}` block; any tool calls the model made are translated from
+/// the internal OpenAI `tool_calls` array into Anthropic `tool_use` blocks
+/// (the inverse of ADR-179's request-side translation), and `stop_reason`
+/// becomes `"tool_use"` when at least one is present. Usage uses the Anthropic
+/// names (`input_tokens`/`output_tokens`).
+pub fn build_messages_response(resp: &CompletionResponse, route_label: &str) -> String {
+    let id = next_completion_id().replace("chatcmpl-", "msg_");
+    let mut blocks: Vec<String> = Vec::new();
+    if !resp.content.is_empty() {
+        blocks.push(format!(
+            "{{\"type\":\"text\",\"text\":\"{}\"}}",
+            escape_string(&resp.content)
+        ));
+    }
+    let mut stop_reason = "end_turn";
+    if let Some(tc_json) = &resp.tool_calls {
+        if let Ok(JsonValue::Array(calls)) = parse(tc_json) {
+            for call in &calls {
+                let cid = call.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                let (name, args) = match call.get("function") {
+                    Some(f) => (
+                        f.get("name").and_then(|x| x.as_str()).unwrap_or(""),
+                        f.get("arguments").and_then(|x| x.as_str()).unwrap_or("{}"),
+                    ),
+                    None => ("", "{}"),
+                };
+                // Anthropic's `input` is a JSON object. Model-produced
+                // arguments are a JSON string; splice it verbatim when it
+                // parses as an object, else wrap it so the block stays valid.
+                let input = match parse(args) {
+                    Ok(v @ JsonValue::Object(_)) => v.to_json_string(),
+                    _ => format!("{{\"_raw\":\"{}\"}}", escape_string(args)),
+                };
+                blocks.push(format!(
+                    "{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"{}\",\"input\":{}}}",
+                    escape_string(cid),
+                    escape_string(name),
+                    input
+                ));
+                stop_reason = "tool_use";
+            }
+        }
+    }
+    if blocks.is_empty() {
+        // Anthropic requires a non-empty content array even for an empty reply.
+        blocks.push("{\"type\":\"text\",\"text\":\"\"}".to_string());
+    }
+    format!(
+        "{{\"id\":\"{id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{}\",\
+\"content\":[{}],\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":null,\
+\"x_pasture_route\":\"{route_label}\",\
+\"usage\":{{\"input_tokens\":{},\"output_tokens\":{}}}}}",
+        escape_string(&resp.model),
+        blocks.join(","),
+        resp.prompt_tokens,
+        resp.completion_tokens,
     )
 }
 

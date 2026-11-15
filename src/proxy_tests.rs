@@ -2799,6 +2799,68 @@ fn test_audio_wrong_method_returns_405() {
     assert_eq!(status, 405, "expected 405 for GET /v1/audio, got {status}");
 }
 
+// ── Idempotency-Key replay (IMP-74) ───────────────────────────────────────
+
+#[test]
+fn test_idempotency_key_replays_first_success() {
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log);
+    let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    let raw = |key: &str| {
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nIdempotency-Key: {key}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    };
+    let (s1, b1) = roundtrip_ref(&p, raw("order-123"));
+    let (s2, b2) = roundtrip_ref(&p, raw("order-123"));
+    assert_eq!((s1, s2), (200, 200));
+    assert_eq!(
+        b1, b2,
+        "the duplicate replays the first response byte-for-byte"
+    );
+    // The completion ran exactly once: one cost-log line for two requests.
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        logged.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "a replayed request must not run (or bill) the backend again"
+    );
+    // A different key is a different operation and runs for real.
+    let (s3, _) = roundtrip_ref(&p, raw("order-124"));
+    assert_eq!(s3, 200);
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        logged.lines().filter(|l| !l.trim().is_empty()).count(),
+        2,
+        "a new key runs a new completion"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_unkeyed_duplicate_runs_twice() {
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log);
+    let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    let raw = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let (s1, _) = roundtrip_ref(&p, raw.clone());
+    let (s2, _) = roundtrip_ref(&p, raw);
+    assert_eq!((s1, s2), (200, 200));
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        logged.lines().filter(|l| !l.trim().is_empty()).count(),
+        2,
+        "without a key, nothing is deduplicated"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── Content-Type: application/json validation (IMP-content-type) ──────────
 
 #[test]
@@ -5209,6 +5271,201 @@ fn test_responses_wrong_method_returns_405() {
     let (status, raw) = roundtrip(
         p,
         "GET /v1/responses HTTP/1.1\r\nConnection: close\r\n\r\n".to_string(),
+    );
+    assert_eq!(status, 405, "{raw}");
+}
+
+// ── IMP-72 Anthropic Messages API shim (ADR-281) ────────────────────────────
+
+#[test]
+fn test_build_messages_response_shape() {
+    let resp = CompletionResponse {
+        content: "hi there".to_string(),
+        model: "local-model".to_string(),
+        prompt_tokens: 5,
+        completion_tokens: 3,
+        tool_calls: None,
+    };
+    let json = build_messages_response(&resp, "local");
+    let v = crate::json::parse(&json).expect("valid JSON");
+    assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("message"));
+    assert_eq!(v.get("role").and_then(|x| x.as_str()), Some("assistant"));
+    assert_eq!(
+        v.get("stop_reason").and_then(|x| x.as_str()),
+        Some("end_turn")
+    );
+    let text = v
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|b| b.get("text"))
+        .and_then(|t| t.as_str());
+    assert_eq!(text, Some("hi there"));
+    assert_eq!(
+        v.get("usage")
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(|x| x.as_f64()),
+        Some(5.0)
+    );
+    assert_eq!(
+        v.get("usage")
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(|x| x.as_f64()),
+        Some(3.0)
+    );
+    assert!(json.starts_with("{\"id\":\"msg_"), "{json}");
+    assert!(json.contains("\"x_pasture_route\":\"local\""), "{json}");
+}
+
+#[test]
+fn test_build_messages_response_tool_use_blocks() {
+    let resp = CompletionResponse {
+        content: String::new(),
+        model: "local-model".to_string(),
+        prompt_tokens: 9,
+        completion_tokens: 4,
+        tool_calls: Some(
+            r#"[{"id":"toolu_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Osaka\"}"}}]"#
+                .to_string(),
+        ),
+    };
+    let json = build_messages_response(&resp, "cloud");
+    let v = crate::json::parse(&json).expect("valid JSON");
+    assert_eq!(
+        v.get("stop_reason").and_then(|x| x.as_str()),
+        Some("tool_use")
+    );
+    let block = v
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .expect("one content block");
+    assert_eq!(block.get("type").and_then(|x| x.as_str()), Some("tool_use"));
+    assert_eq!(
+        block.get("name").and_then(|x| x.as_str()),
+        Some("get_weather")
+    );
+    assert_eq!(
+        block
+            .get("input")
+            .and_then(|i| i.get("city"))
+            .and_then(|x| x.as_str()),
+        Some("Osaka")
+    );
+}
+
+#[test]
+fn test_parse_messages_request_system_and_text_parts() {
+    let req = Proxy::parse_messages_request(
+        r#"{"model":"m","max_tokens":64,"system":"You are terse.","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(req.messages.len(), 2);
+    assert_eq!(req.messages[0].role, "system");
+    assert_eq!(req.messages[0].content, "You are terse.");
+    assert_eq!(req.messages[1].role, "user");
+    assert_eq!(req.messages[1].content, "hi");
+    assert_eq!(req.sampling.max_tokens, Some(64));
+    assert!(!req.has_tools);
+}
+
+#[test]
+fn test_parse_messages_request_tool_round_trip_shapes() {
+    // An assistant tool_use turn followed by a user tool_result turn must map
+    // onto the internal tool_calls / role:"tool" shapes (ADR-182/183 inverse).
+    let req = Proxy::parse_messages_request(
+        r#"{"model":"m","max_tokens":64,"messages":[
+            {"role":"user","content":"weather?"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Osaka"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"sunny"}]}
+        ]}"#,
+    )
+    .unwrap();
+    let assistant = &req.messages[1];
+    let tc = assistant
+        .tool_calls_json
+        .as_deref()
+        .expect("tool_calls_json");
+    assert!(tc.contains("\"name\":\"get_weather\""), "{tc}");
+    assert!(tc.contains("Osaka"), "{tc}");
+    let tool = &req.messages[2];
+    assert_eq!(tool.role, "tool");
+    assert_eq!(tool.tool_call_id.as_deref(), Some("toolu_1"));
+    assert_eq!(tool.content, "sunny");
+}
+
+#[test]
+fn test_parse_messages_request_tools_and_choice_translation() {
+    let req = Proxy::parse_messages_request(
+        r#"{"model":"m","max_tokens":64,"messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"get_weather","description":"d","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],
+            "tool_choice":{"type":"tool","name":"get_weather"},
+            "stop_sequences":["STOP"]}"#,
+    )
+    .unwrap();
+    assert!(req.has_tools);
+    let tools = req.sampling.tools.as_ref().expect("tools carried");
+    let arr = tools.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    let f = arr[0].get("function").expect("function object");
+    assert_eq!(f.get("name").and_then(|x| x.as_str()), Some("get_weather"));
+    assert!(f.get("parameters").is_some(), "input_schema → parameters");
+    let tc = req.sampling.tool_choice.as_ref().expect("tool_choice");
+    assert_eq!(
+        tc.get("function")
+            .and_then(|x| x.get("name"))
+            .and_then(|x| x.as_str()),
+        Some("get_weather")
+    );
+    assert_eq!(req.sampling.stop, vec!["STOP".to_string()]);
+}
+
+#[test]
+fn test_messages_roundtrip_returns_200_message() {
+    let p = proxy_with(true, false, 100, "unused");
+    let body = r#"{"model":"m","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
+    let (status, resp_body) = roundtrip(p, http_post("/v1/messages", body));
+    assert_eq!(status, 200, "body: {resp_body}");
+    assert!(
+        resp_body.contains("\"type\":\"message\""),
+        "body: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"role\":\"assistant\""),
+        "body: {resp_body}"
+    );
+}
+
+#[test]
+fn test_messages_stream_true_rejected() {
+    let p = proxy_with(true, false, 100, "unused");
+    let body = r#"{"model":"m","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, resp_body) = roundtrip(p, http_post("/v1/messages", body));
+    assert_eq!(status, 400, "streaming must be rejected: {resp_body}");
+    assert!(resp_body.contains("streaming"), "body: {resp_body}");
+}
+
+#[test]
+fn test_messages_image_part_rejected() {
+    let p = proxy_with(true, false, 100, "unused");
+    let body = r#"{"model":"m","max_tokens":64,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"AA=="}}]}]}"#;
+    let (status, resp_body) = roundtrip(p, http_post("/v1/messages", body));
+    assert_eq!(status, 400, "image parts must be rejected: {resp_body}");
+}
+
+#[test]
+fn test_messages_missing_messages_returns_400() {
+    let p = proxy_with(true, false, 100, "unused");
+    let (status, _) = roundtrip(p, http_post("/v1/messages", r#"{"model":"m"}"#));
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn test_messages_wrong_method_returns_405() {
+    let p = proxy_with(true, false, 100, "unused");
+    let (status, raw) = roundtrip(
+        p,
+        "GET /v1/messages HTTP/1.1\r\nConnection: close\r\n\r\n".to_string(),
     );
     assert_eq!(status, 405, "{raw}");
 }

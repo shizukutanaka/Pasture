@@ -43,6 +43,10 @@ pub(crate) enum ReadOutcome {
         /// The `Content-Type` header value (lowercased), if present. Used to
         /// return 415 Unsupported Media Type for non-JSON POST bodies.
         content_type: Option<String>,
+        /// The `Idempotency-Key` header value, if present (IMP-74). A
+        /// duplicate keyed request replays the first success instead of
+        /// running the completion again.
+        idempotency_key: Option<String>,
     },
     /// The declared or actual body exceeded `MAX_BODY_BYTES` → 413. Always
     /// raised after the header block was parsed, so its head is known.
@@ -129,6 +133,7 @@ pub(crate) fn read_request(
     let mut connection_close = !http11; // HTTP/1.0 default = close
     let mut request_id: Option<String> = None;
     let mut content_type: Option<String> = None;
+    let mut idempotency_key: Option<String> = None;
     for (header_idx, line) in lines.enumerate() {
         if header_idx >= 1000 {
             // Too many header fields (DoS guard, ADR-097). ADR-278: the request
@@ -172,6 +177,20 @@ pub(crate) fn read_request(
                     .collect();
                 if !clean.is_empty() {
                     request_id = Some(clean);
+                }
+            }
+        } else if lower.starts_with("idempotency-key:") {
+            if let Some((_, v)) = line.split_once(':') {
+                // Same treatment as X-Request-ID, plus a length cap: the key
+                // becomes a map key, so an unbounded value is a memory lever.
+                let clean: String = v
+                    .trim()
+                    .chars()
+                    .filter(|&c| c != '\r' && c != '\n')
+                    .take(255)
+                    .collect();
+                if !clean.is_empty() {
+                    idempotency_key = Some(clean);
                 }
             }
         }
@@ -224,6 +243,7 @@ pub(crate) fn read_request(
         connection_close,
         request_id,
         content_type,
+        idempotency_key,
     })
 }
 

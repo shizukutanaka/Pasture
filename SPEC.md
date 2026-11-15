@@ -51,6 +51,7 @@ library only; the cloud (HTTPS/TLS) path is gated behind the optional `cloud` fe
 | `label --prompts <f> [--out <f>]` | answer each prompt locally and record right/wrong, producing the `{"logprob","correct"}` JSONL that `calibrate --auroc`/`--error` consume (ADR-257). Writes only the score and verdict — never prompt or answer text (I3) |
 | `models` | recommend local models for this machine |
 | `doctor` | diagnose setup and print fixes |
+| `discover [--json]` | probe localhost for running local LLM runtimes (Ollama, LM Studio, Jan, llama.cpp, KoboldCPP, GPT4All, vLLM, Open WebUI) and print how each found runtime is used with Pasture (IMP-75). A runtime counts as found only when it answers an HTTP request — an open port alone proves nothing |
 | `eval [--external <file>] [--json]` | routing accuracy on two corpora; **exits 1** on regression or I2 breach |
 | `stats [--json]` | summarize the cost log |
 | `improvements [path] [--review]` | print the self-improvement ledger (verified change history) |
@@ -124,6 +125,34 @@ Success (non-stream): `200`, `{"object":"response","status":"completed","model",
 deliberate choice over silently dropping tools (the migration failure mode where
 a tool call surfaces as raw text). Streaming Responses (`response.output_text.delta`
 SSE events) and tool use are documented follow-ups.
+
+### 3.1b `POST /v1/messages` (Anthropic Messages API shim, IMP-72)
+A compatibility shim for the Anthropic Messages API, so clients built on the
+Anthropic SDK (which POST to `/v1/messages`) work against Pasture unchanged.
+Ported from RekAI's Anthropic-compatible surface in the LLM consolidation
+(ADR-281). Translates the request into the internal chat shape and routes it
+through the **same** pipeline (routing, privacy, cache, cost log), then formats
+the reply as a Messages object.
+
+Request: `{"model", "max_tokens", "messages", …}`. The top-level `system`
+(string or array of `{"type":"text"}` parts) becomes a leading system message.
+Message `content` is a string or an array of parts: `text` parts concatenate;
+an assistant `tool_use` part becomes an internal tool call and a user
+`tool_result` part becomes a `role:"tool"` message (the inverse of the
+ADR-182/183 outbound translation). `tools` (`{name, description, input_schema}`)
+map to OpenAI tool definitions and `tool_choice` (`auto`/`any`/`tool`/`none`)
+to the OpenAI forms, so tool use works end-to-end. `stop_sequences` maps to
+`stop`.
+
+Success (non-stream): `200`, `{"id":"msg_…","type":"message","role":"assistant",`
+`"model","content":[{"type":"text","text",…}]` (plus `{"type":"tool_use",…}`
+blocks when the model called tools), `"stop_reason":"end_turn"|"tool_use",`
+`"x_pasture_route","usage":{"input_tokens","output_tokens"}}`.
+
+**Scope (v1):** text-only, non-streaming — the same deliberate scope as the
+Responses shim (§3.1a). `"stream":true` and non-text parts (e.g. `image`) are
+rejected with `400` rather than silently mishandled. Errors use the standard
+Pasture envelope (§3.5), not Anthropic's error shape.
 
 ### 3.2 `GET /v1/models`
 `200`, OpenAI list: `{"object":"list","data":[{"id","object":"model","owned_by":"pasture"}…]}`
@@ -386,6 +415,12 @@ false negative = data leak (unacceptable).
   Ollama reports per-token logprobs on `/api/chat` from v0.12.11 (2025-11-12, PR #12899) and
   Pasture requests them on scored calls (ADR-273); an older Ollama ignores the flag and
   the text heuristic in `cascade::is_low_confidence` applies instead.
+- **Idempotency** (`Idempotency-Key` request header, IMP-74): on
+  `POST /v1/chat/completions` (buffered only), the first successful response
+  for a key is stored in a bounded in-memory store (1,024 keys, FIFO) and a
+  duplicate request with the same key replays it byte-for-byte — the backend
+  does not run and nothing is billed twice. Errors are never stored, so a
+  retry after a failure gets a real attempt. Keys do not survive a restart.
 - **Cache** (`PASTURE_CACHE=<n>`, opt-in): exact-match on hash(model + messages),
   bounded FIFO. Hits skip the backend (`x_pasture_route:"cache"`, cost 0). Never
   caches sensitive prompts (I2). Applies to both buffered and `stream:true` requests
@@ -405,8 +440,10 @@ false negative = data leak (unacceptable).
   paths: an exact text match on "what's the weather today?" is still a stale
   answer. Orthogonal to routing: such prompts may still route local.
 - **Backends.** Local: Ollama (default) or any OpenAI-compatible server
-  (`PASTURE_LOCAL_BACKEND`). Cloud (`cloud` feature, BYOK): OpenAI or Anthropic over
-  HTTPS. Both support streaming. **Cloud resilience (IMP-9):** a transient failure
+  (`PASTURE_LOCAL_BACKEND`). Cloud (`cloud` feature, BYOK): OpenAI, Anthropic or
+  Gemini (IMP-73) over HTTPS. OpenAI and Anthropic support streaming; Gemini is
+  served from the buffered exchange (its streaming endpoint has a different
+  event shape) and emits the full text as one delta. **Cloud resilience (IMP-9):** a transient failure
   (connection/timeout, provider **5xx**) is retried with exponential backoff
   (`PASTURE_CLOUD_RETRY`, default 2); on final failure the request falls back to local
   when available. 4xx is not retried.
@@ -498,7 +535,7 @@ wins). Variables:
 | `PASTURE_LOCAL_OPENAI_URL` | `http://127.0.0.1:1234/v1` | OpenAI-compat local URL |
 | `PASTURE_CLOUD_PROVIDER` / `PASTURE_CLOUD_MODEL` | — / `gpt-4o-mini` | cloud provider / model |
 | `PASTURE_CLOUD_FALLBACK_PROVIDER` / `PASTURE_CLOUD_FALLBACK_MODEL` | _(off)_ | secondary cloud provider/model tried when the primary fails all retries (IMP-9) |
-| `PASTURE_OPENAI_API_KEY` / `PASTURE_ANTHROPIC_API_KEY` | — | BYOK (never logged) |
+| `PASTURE_OPENAI_API_KEY` / `PASTURE_ANTHROPIC_API_KEY` / `PASTURE_GEMINI_API_KEY` | — | BYOK (never logged) |
 | `PASTURE_RAM_MB` | _(auto)_ | override detected total RAM in MB; use when auto-detection is unavailable on your OS (§4, ADR-261) |
 | `PASTURE_GPU_VRAM_MB` | _(auto)_ | override detected GPU VRAM in MB; discrete-GPU detection is NVIDIA-only, so Apple Silicon / AMD machines tier by RAM unless this is set (§4) |
 | `PASTURE_THRESHOLD` | hardware | token length threshold override |

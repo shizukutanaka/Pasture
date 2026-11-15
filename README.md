@@ -65,12 +65,12 @@ Requires Rust 1.75+.
 git clone https://github.com/shizukutanaka/pasture
 cd pasture
 cargo build --release                 # zero-dependency, local-only
-cargo build --release --features cloud # adds OpenAI/Anthropic over HTTPS
+cargo build --release --features cloud # adds OpenAI/Anthropic/Gemini over HTTPS
 # binary at target/release/pasture
 ```
 
 Cloud is opt-in. With `--features cloud`, set a BYOK key:
-`PASTURE_OPENAI_API_KEY` or `PASTURE_ANTHROPIC_API_KEY` (and `PASTURE_CLOUD_PROVIDER`, `PASTURE_CLOUD_MODEL`). Keys are read from the environment and never logged.
+`PASTURE_OPENAI_API_KEY`, `PASTURE_ANTHROPIC_API_KEY` or `PASTURE_GEMINI_API_KEY` (and `PASTURE_CLOUD_PROVIDER`, `PASTURE_CLOUD_MODEL`). Keys are read from the environment and never logged.
 
 ## Usage
 
@@ -87,6 +87,7 @@ pasture label --prompts p.txt   # answer prompts locally and mark each right/wro
 pasture calibrate --auroc --labels labels.jsonl  # self-test: does the confidence signal predict correctness?
 pasture models             # recommended local models for your machine
 pasture doctor             # check your setup and how to fix problems
+pasture discover           # probe this machine for running local LLM runtimes
 pasture eval               # routing accuracy: regression set + held-out set (exits 1 on regression)
 pasture stats              # summarize the cost log (routes, tokens, spend)
 pasture improvements       # show the self-improvement ledger (verified change history)
@@ -112,6 +113,7 @@ base_url = http://127.0.0.1:8645/v1
 - `POST /v1/embeddings` — pass-through to the local backend (Ollama or OpenAI-compat);
   returns the standard OpenAI embeddings shape. Local-only (no cloud escalation).
 - `POST /v1/responses` — OpenAI Responses API shim (IMP-38): translates `input`→messages and routes through the same pipeline, returning an `object:"response"` reply. Text-only, non-streaming (tools/streaming rejected with a pointer to `/v1/chat/completions`).
+- `POST /v1/messages` — Anthropic Messages API shim (IMP-72): point an Anthropic SDK client at Pasture and it just works — `system`, text/`tool_use`/`tool_result` content parts, `tools`/`tool_choice` and `stop_sequences` are translated into the same routing pipeline, and the reply is a `type:"message"` object. Text-only, non-streaming (`stream:true` is rejected with a pointer to `/v1/chat/completions`).
 - `POST /v1/moderations` — compatibility stub only; **Pasture performs no moderation**. It exists so SDKs that call this endpoint unconditionally don't 404. The reply sets `x_pasture_moderated: false` and `model: "pasture-no-moderation"` — `flagged:false` means "not checked", never "checked and safe", so do not gate anything on it.
 - `GET /v1/models` — list the configured local (and cloud) model ids, OpenAI-compatible.
 - `GET /v1/models/{id}` — retrieve one configured model (or 404), OpenAI-compatible.
@@ -204,12 +206,13 @@ config file as `key = value`, using the lower-case name with the prefix dropped
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `PASTURE_CLOUD_PROVIDER` | _(none)_ | `openai` or `anthropic` |
+| `PASTURE_CLOUD_PROVIDER` | _(none)_ | `openai`, `anthropic` or `gemini` |
 | `PASTURE_CLOUD_MODEL` | `gpt-4o-mini` | cloud model id |
 | `PASTURE_OPENAI_API_KEY` | _(none)_ | BYOK; never logged |
 | `PASTURE_ANTHROPIC_API_KEY` | _(none)_ | BYOK; never logged |
+| `PASTURE_GEMINI_API_KEY` | _(none)_ | BYOK; never logged |
 | `PASTURE_CLOUD_RETRY` | `2` | retry transient cloud failures (5xx/timeouts) this many times, then fall back to local |
-| `PASTURE_CLOUD_FALLBACK_PROVIDER` | _(off)_ | secondary provider tried when the primary fails all retries (`openai` or `anthropic`) |
+| `PASTURE_CLOUD_FALLBACK_PROVIDER` | _(off)_ | secondary provider tried when the primary fails all retries (`openai`, `anthropic` or `gemini`) |
 | `PASTURE_CLOUD_FALLBACK_MODEL` | _(same as primary)_ | model to use on the fallback provider |
 
 **Serving and exposure**
@@ -242,7 +245,7 @@ The local backend talks to [Ollama](https://ollama.com) over plain HTTP. GPU acc
 
 ## Status
 
-Pasture is at v0.28.0. Working today: hardware detection, deterministic hardware-adaptive routing, the OpenAI-compatible proxy, the local Ollama backend, and a fully implemented multi-provider cloud backend (OpenAI/Anthropic, streaming, tool calls, retry + fallback-provider failover, per-backend health tracking with a circuit breaker on both the local and cloud side). Also shipped: exact-match and semantic response caching, a FrugalGPT-style local-first cascade, reversible pseudonymization for cloud-bound PII, a lightweight prompt-injection guard, budget/spike-aware routing, structured JSONL cost + routing-decision audit logs, optional OpenTelemetry GenAI tracing. See `ARCHITECTURE.md` for the full ADR history and `SPEC.md` for the complete configuration/API reference.
+Pasture is at v0.28.0. Working today: hardware detection, deterministic hardware-adaptive routing, the OpenAI-compatible proxy, the local Ollama backend, and a fully implemented multi-provider cloud backend (OpenAI/Anthropic/Gemini, streaming, tool calls, retry + fallback-provider failover, per-backend health tracking with a circuit breaker on both the local and cloud side). Also shipped: exact-match and semantic response caching, a FrugalGPT-style local-first cascade, reversible pseudonymization for cloud-bound PII, a lightweight prompt-injection guard, budget/spike-aware routing, structured JSONL cost + routing-decision audit logs, optional OpenTelemetry GenAI tracing. See `ARCHITECTURE.md` for the full ADR history and `SPEC.md` for the complete configuration/API reference.
 
 ## Privacy
 
