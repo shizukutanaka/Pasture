@@ -2799,6 +2799,68 @@ fn test_audio_wrong_method_returns_405() {
     assert_eq!(status, 405, "expected 405 for GET /v1/audio, got {status}");
 }
 
+// ── Idempotency-Key replay (IMP-74) ───────────────────────────────────────
+
+#[test]
+fn test_idempotency_key_replays_first_success() {
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log);
+    let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    let raw = |key: &str| {
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nIdempotency-Key: {key}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    };
+    let (s1, b1) = roundtrip_ref(&p, raw("order-123"));
+    let (s2, b2) = roundtrip_ref(&p, raw("order-123"));
+    assert_eq!((s1, s2), (200, 200));
+    assert_eq!(
+        b1, b2,
+        "the duplicate replays the first response byte-for-byte"
+    );
+    // The completion ran exactly once: one cost-log line for two requests.
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        logged.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "a replayed request must not run (or bill) the backend again"
+    );
+    // A different key is a different operation and runs for real.
+    let (s3, _) = roundtrip_ref(&p, raw("order-124"));
+    assert_eq!(s3, 200);
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        logged.lines().filter(|l| !l.trim().is_empty()).count(),
+        2,
+        "a new key runs a new completion"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn test_unkeyed_duplicate_runs_twice() {
+    let log = tmp_log();
+    let p = proxy_with(true, false, 100, &log);
+    let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    let raw = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let (s1, _) = roundtrip_ref(&p, raw.clone());
+    let (s2, _) = roundtrip_ref(&p, raw);
+    assert_eq!((s1, s2), (200, 200));
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        logged.lines().filter(|l| !l.trim().is_empty()).count(),
+        2,
+        "without a key, nothing is deduplicated"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── Content-Type: application/json validation (IMP-content-type) ──────────
 
 #[test]

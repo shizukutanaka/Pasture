@@ -130,6 +130,10 @@ pub struct Proxy {
     cascade: bool,
     cascade_logprob_threshold: f64,
     cache: Option<std::sync::Mutex<crate::cache::ResponseCache>>,
+    /// Stored successful responses for `Idempotency-Key` replay (IMP-74):
+    /// a duplicate keyed request returns the first success instead of
+    /// running — and billing — the completion twice.
+    idempotency: std::sync::Mutex<crate::idempotency::IdempotencyStore>,
     /// Model ids advertised on `GET /v1/models` (IMP-8). Clients commonly probe
     /// this endpoint on connect; an empty list still returns a valid response.
     models: Vec<String>,
@@ -343,6 +347,7 @@ impl Proxy {
             cascade: false,
             cascade_logprob_threshold: -1.0,
             cache: None,
+            idempotency: std::sync::Mutex::new(crate::idempotency::IdempotencyStore::default()),
             models: Vec::new(),
             cloud_retry: 0,
             fast_model: None,
@@ -3285,48 +3290,49 @@ impl Proxy {
         // Safety cap: one keep-alive connection serves at most this many requests.
         const MAX_KEEPALIVE_REQUESTS: usize = 100;
         for _ in 0..MAX_KEEPALIVE_REQUESTS {
-            let (method, path, body, auth, origin, keep_alive, request_id, content_type) =
-                match read_request(stream, &mut conn_buf, self.max_body_bytes)? {
-                    ReadOutcome::Request {
-                        method,
-                        path,
-                        body,
-                        auth,
-                        origin,
-                        connection_close,
-                        request_id,
-                        content_type,
-                    } => (
-                        method,
-                        path,
-                        body,
-                        auth,
-                        origin,
-                        !connection_close,
-                        request_id,
-                        content_type,
-                    ),
-                    ReadOutcome::TooLarge { head } => {
-                        return self.reject_early(
-                            stream,
-                            413,
-                            "request body too large",
-                            Some(head),
-                        );
-                    }
-                    ReadOutcome::TimedOut { head } => {
-                        return self.reject_early(stream, 408, "request timed out", head);
-                    }
-                    ReadOutcome::HeadersTooLarge { head } => {
-                        return self.reject_early(
-                            stream,
-                            431,
-                            "request header fields too large",
-                            head,
-                        );
-                    }
-                    ReadOutcome::Closed => return Ok(()), // normal EOF / graceful close
-                };
+            let (
+                method,
+                path,
+                body,
+                auth,
+                origin,
+                keep_alive,
+                request_id,
+                content_type,
+                idempotency_key,
+            ) = match read_request(stream, &mut conn_buf, self.max_body_bytes)? {
+                ReadOutcome::Request {
+                    method,
+                    path,
+                    body,
+                    auth,
+                    origin,
+                    connection_close,
+                    request_id,
+                    content_type,
+                    idempotency_key,
+                } => (
+                    method,
+                    path,
+                    body,
+                    auth,
+                    origin,
+                    !connection_close,
+                    request_id,
+                    content_type,
+                    idempotency_key,
+                ),
+                ReadOutcome::TooLarge { head } => {
+                    return self.reject_early(stream, 413, "request body too large", Some(head));
+                }
+                ReadOutcome::TimedOut { head } => {
+                    return self.reject_early(stream, 408, "request timed out", head);
+                }
+                ReadOutcome::HeadersTooLarge { head } => {
+                    return self.reject_early(stream, 431, "request header fields too large", head);
+                }
+                ReadOutcome::Closed => return Ok(()), // normal EOF / graceful close
+            };
             // Every response is traceable: echo the caller's X-Request-ID, or mint
             // one server-side when absent (OpenAI/LiteLLM always return x-request-id).
             let request_id = Some(request_id.unwrap_or_else(next_request_id));
@@ -3510,7 +3516,36 @@ impl Proxy {
                         }
                         return Ok(());
                     }
-                    Ok(req) => wr_result!(self.complete_buffered(&req)),
+                    Ok(req) => {
+                        // Idempotency-Key (IMP-74): a duplicate keyed request
+                        // replays the first success instead of running — and
+                        // billing — the completion twice. Only successes are
+                        // stored, so a retry after an error still gets a real
+                        // attempt. Streaming requests are not replayed.
+                        match &idempotency_key {
+                            Some(key) => {
+                                let stored = self
+                                    .idempotency
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .get(key);
+                                match stored {
+                                    Some(resp) => wr!(200, &resp, &te(), keep_alive),
+                                    None => {
+                                        let result = self.complete_buffered(&req);
+                                        if let Ok(resp) = &result {
+                                            self.idempotency
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner())
+                                                .put(key, resp.clone());
+                                        }
+                                        wr_result!(result);
+                                    }
+                                }
+                            }
+                            None => wr_result!(self.complete_buffered(&req)),
+                        }
+                    }
                     Err(e) => wr_err!(e),
                 }
             } else if method == "POST" && path.starts_with("/v1/responses") {

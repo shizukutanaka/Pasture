@@ -22,6 +22,7 @@ pub mod hardware;
 pub mod health;
 pub mod http;
 pub mod i18n;
+pub mod idempotency;
 pub mod improve;
 pub mod json;
 pub mod output_scan;

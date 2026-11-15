@@ -7,6 +7,11 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ### Added
 
+- **Idempotency-Key replay** (IMP-74, ADR-283): a duplicate
+  `POST /v1/chat/completions` carrying the same `Idempotency-Key` header
+  replays the first successful response instead of running — and billing —
+  the completion twice. Successes only, bounded in-memory store. Ported
+  from RekAI in the local-LLM consolidation.
 - **Gemini cloud provider** (IMP-73, ADR-282): `PASTURE_CLOUD_PROVIDER=gemini`
   (or `google`) with `PASTURE_GEMINI_API_KEY` adds Google Gemini as a cloud
   escalation target — request/response translation including `functionCall`/

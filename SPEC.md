@@ -414,6 +414,12 @@ false negative = data leak (unacceptable).
   Ollama reports per-token logprobs on `/api/chat` from v0.12.11 (2025-11-12, PR #12899) and
   Pasture requests them on scored calls (ADR-273); an older Ollama ignores the flag and
   the text heuristic in `cascade::is_low_confidence` applies instead.
+- **Idempotency** (`Idempotency-Key` request header, IMP-74): on
+  `POST /v1/chat/completions` (buffered only), the first successful response
+  for a key is stored in a bounded in-memory store (1,024 keys, FIFO) and a
+  duplicate request with the same key replays it byte-for-byte — the backend
+  does not run and nothing is billed twice. Errors are never stored, so a
+  retry after a failure gets a real attempt. Keys do not survive a restart.
 - **Cache** (`PASTURE_CACHE=<n>`, opt-in): exact-match on hash(model + messages),
   bounded FIFO. Hits skip the backend (`x_pasture_route:"cache"`, cost 0). Never
   caches sensitive prompts (I2). Applies to both buffered and `stream:true` requests
