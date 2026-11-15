@@ -658,6 +658,7 @@ impl Proxy {
     fn route_allowed_methods(path: &str) -> Option<&'static str> {
         if path.starts_with("/v1/chat/completions")
             || path.starts_with("/v1/responses")
+            || path.starts_with("/v1/messages")
             || path.starts_with("/v1/completions")
             || path.starts_with("/v1/embeddings")
             || path.starts_with("/v1/moderations")
@@ -2820,6 +2821,293 @@ impl Proxy {
         Ok(build_responses_response(&resp, label))
     }
 
+    /// Extract plain text from an Anthropic content value (IMP-72): a string,
+    /// or an array of `{"type":"text","text":…}` parts. Used for the top-level
+    /// `system` field and for `tool_result` bodies. A non-text part is
+    /// rejected — Pasture routes text only, same as the other shims.
+    fn extract_anthropic_text(c: &JsonValue, what: &str) -> Result<String, ProxyError> {
+        match c {
+            JsonValue::Str(s) => Ok(s.clone()),
+            JsonValue::Array(parts) => {
+                let mut out: Vec<String> = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match (
+                        part.get("type").and_then(|t| t.as_str()),
+                        part.get("text").and_then(|t| t.as_str()),
+                    ) {
+                        (Some("text"), Some(t)) => out.push(t.to_string()),
+                        (Some(other), _) => {
+                            return Err(ProxyError::BadRequest(format!(
+                                "unsupported content part '{other}' in {what}; Pasture routes text only"
+                            )));
+                        }
+                        _ => {
+                            return Err(ProxyError::BadRequest(format!(
+                                "content part in {what} missing 'text'"
+                            )));
+                        }
+                    }
+                }
+                Ok(out.join("\n"))
+            }
+            _ => Err(ProxyError::BadRequest(format!(
+                "{what} must be a string or array of text parts"
+            ))),
+        }
+    }
+
+    /// Parse a `POST /v1/messages` request (IMP-72, ADR-281) — the Anthropic
+    /// Messages API surface — into the internal chat shape. Translates:
+    /// top-level `system` (string or text parts) → a leading system message;
+    /// message content parts `text` / `tool_use` / `tool_result` → text /
+    /// assistant `tool_calls` / `role:"tool"` messages (the inverse of the
+    /// ADR-182/183 outbound translation in cloud.rs); `tools`
+    /// (`{name, description, input_schema}`) → OpenAI tool definitions;
+    /// `tool_choice` (`auto`/`any`/`tool`/`none`) → the OpenAI forms;
+    /// `stop_sequences` → `stop`. Text-only, non-streaming, mirroring the
+    /// IMP-38 Responses shim: `stream:true` is rejected with a pointer at
+    /// `/v1/chat/completions` rather than silently ignored.
+    fn parse_messages_request(body: &str) -> Result<CompletionRequest, ProxyError> {
+        let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
+        if v.get("stream")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(ProxyError::BadRequest(
+                "streaming is not supported on /v1/messages; omit \"stream\" or use POST /v1/chat/completions"
+                    .to_string(),
+            ));
+        }
+        let model = v
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("default")
+            .to_string();
+        let mut messages: Vec<Message> = Vec::new();
+        if let Some(sys) = v.get("system") {
+            let text = Self::extract_anthropic_text(sys, "'system'")?;
+            if !text.is_empty() {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: text,
+                    ..Default::default()
+                });
+            }
+        }
+        let items = v
+            .get("messages")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                ProxyError::BadRequest("missing or invalid 'messages' (expected an array)".into())
+            })?;
+        if items.is_empty() {
+            return Err(ProxyError::BadRequest("'messages' is empty".into()));
+        }
+        for item in items {
+            let role = item
+                .get("role")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("user");
+            if role != "user" && role != "assistant" {
+                return Err(ProxyError::BadRequest(format!(
+                    "unsupported role '{role}' in 'messages' (expected \"user\" or \"assistant\")"
+                )));
+            }
+            let content = item
+                .get("content")
+                .ok_or_else(|| ProxyError::BadRequest("message missing 'content'".to_string()))?;
+            match content {
+                JsonValue::Str(s) => messages.push(Message {
+                    role: role.to_string(),
+                    content: s.clone(),
+                    ..Default::default()
+                }),
+                JsonValue::Array(parts) => {
+                    let mut text_parts: Vec<String> = Vec::new();
+                    let mut tool_calls: Vec<String> = Vec::new();
+                    let mut tool_results: Vec<Message> = Vec::new();
+                    for part in parts {
+                        match part.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                let t =
+                                    part.get("text").and_then(|x| x.as_str()).ok_or_else(|| {
+                                        ProxyError::BadRequest("text part missing 'text'".into())
+                                    })?;
+                                text_parts.push(t.to_string());
+                            }
+                            Some("tool_use") => {
+                                let id = part
+                                    .get("id")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = part.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                                let input = part
+                                    .get("input")
+                                    .map(|i| i.to_json_string())
+                                    .unwrap_or_else(|| "{}".to_string());
+                                tool_calls.push(format!(
+                                    "{{\"id\":\"{}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
+                                    escape_string(&id),
+                                    escape_string(name),
+                                    escape_string(&input)
+                                ));
+                            }
+                            Some("tool_result") => {
+                                let tid = part
+                                    .get("tool_use_id")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let body = match part.get("content") {
+                                    Some(c) => {
+                                        Self::extract_anthropic_text(c, "'tool_result' content")?
+                                    }
+                                    None => String::new(),
+                                };
+                                tool_results.push(Message {
+                                    role: "tool".to_string(),
+                                    content: body,
+                                    tool_call_id: Some(tid),
+                                    ..Default::default()
+                                });
+                            }
+                            Some(other) => {
+                                return Err(ProxyError::BadRequest(format!(
+                                    "unsupported content part '{other}'; Pasture routes text only"
+                                )));
+                            }
+                            None => {
+                                return Err(ProxyError::BadRequest(
+                                    "content part missing 'type'".into(),
+                                ));
+                            }
+                        }
+                    }
+                    // Tool results answer earlier calls, so they precede any
+                    // new text in the same user turn.
+                    messages.append(&mut tool_results);
+                    messages.push(Message {
+                        role: role.to_string(),
+                        content: text_parts.join("\n"),
+                        tool_calls_json: if tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(format!("[{}]", tool_calls.join(",")))
+                        },
+                        ..Default::default()
+                    });
+                }
+                _ => {
+                    return Err(ProxyError::BadRequest(
+                        "message 'content' must be a string or array of parts".into(),
+                    ))
+                }
+            }
+        }
+        if messages.iter().all(|m| m.role == "system") {
+            return Err(ProxyError::BadRequest(
+                "'messages' produced no user/assistant message".into(),
+            ));
+        }
+        // Sampling: Anthropic names the stop list `stop_sequences`.
+        let finite = |key: &str| {
+            v.get(key)
+                .and_then(JsonValue::as_f64)
+                .filter(|x| x.is_finite())
+        };
+        let stop = match v.get("stop_sequences") {
+            Some(JsonValue::Array(a)) => a
+                .iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Tools: Anthropic {name, description, input_schema} → OpenAI
+        // {type:"function", function:{name, description, parameters}}.
+        let mut sampling = crate::backend::SamplingParams {
+            temperature: finite("temperature"),
+            top_p: finite("top_p"),
+            max_tokens: finite("max_tokens").filter(|x| *x >= 0.0).map(|x| x as u64),
+            stop,
+            ..Default::default()
+        };
+        let mut has_tools = false;
+        if let Some(JsonValue::Array(tools)) = v.get("tools") {
+            if !tools.is_empty() {
+                let mut defs: Vec<String> = Vec::with_capacity(tools.len());
+                for t in tools {
+                    let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                    let desc = t.get("description").and_then(|x| x.as_str()).unwrap_or("");
+                    let schema = t
+                        .get("input_schema")
+                        .map(|s| s.to_json_string())
+                        .unwrap_or_else(|| "{}".to_string());
+                    defs.push(format!(
+                        "{{\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"description\":\"{}\",\"parameters\":{}}}}}",
+                        escape_string(name),
+                        escape_string(desc),
+                        schema
+                    ));
+                }
+                sampling.tools = parse(&format!("[{}]", defs.join(","))).ok();
+                has_tools = sampling.tools.is_some();
+                // tool_choice: Anthropic enum → OpenAI forms.
+                sampling.tool_choice = match v.get("tool_choice") {
+                    Some(tc) => match tc.get("type").and_then(|x| x.as_str()) {
+                        Some("auto") => Some(JsonValue::Str("auto".to_string())),
+                        Some("any") => Some(JsonValue::Str("required".to_string())),
+                        Some("none") => Some(JsonValue::Str("none".to_string())),
+                        Some("tool") => {
+                            let name = tc.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                            parse(&format!(
+                                "{{\"type\":\"function\",\"function\":{{\"name\":\"{}\"}}}}",
+                                escape_string(name)
+                            ))
+                            .ok()
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                };
+            }
+        }
+        Ok(CompletionRequest {
+            model,
+            messages,
+            stream: false,
+            has_tools,
+            sampling,
+        })
+    }
+
+    /// Handle `POST /v1/messages` (IMP-72): route an Anthropic Messages-API
+    /// request through the normal pipeline and re-format the reply as a
+    /// `type:"message"` object. Mirrors the Responses shim (injection guard,
+    /// cost log) so behaviour is identical bar the translation. Ported from
+    /// RekAI's Anthropic-compatible surface in the LLM consolidation.
+    fn handle_messages(&self, body: &str) -> Result<String, ProxyError> {
+        let req = Self::parse_messages_request(body)?;
+        if self.injection_guard != "off" {
+            let text = req.guard_text();
+            if let crate::guard::InjectionRisk::Flag(label) =
+                crate::guard::classify_injection(&text)
+            {
+                if self.injection_guard == "block" {
+                    self.injection_stats.tally(&label, "blocked");
+                    return Err(ProxyError::BadRequest(format!(
+                        "request blocked by injection guard: {label}"
+                    )));
+                }
+                eprintln!("pasture: injection_flag:{label} (flag mode, messages request proceeds)");
+                self.injection_stats.tally(&label, "flagged");
+            }
+        }
+        let (resp, label, logprob, reserved) = self.run_completion(&req)?;
+        self.log_cost(label, &resp, logprob, reserved);
+        Ok(build_messages_response(&resp, label))
+    }
+
     /// Parse an OpenAI embeddings `input`: a string or an array of strings.
     fn parse_embeddings_request(body: &str) -> Result<Vec<String>, ProxyError> {
         let v = parse(body).map_err(|e| ProxyError::BadRequest(e.to_string()))?;
@@ -3229,6 +3517,12 @@ impl Proxy {
                 // OpenAI Responses API shim (IMP-38): translate input→messages,
                 // route through the same pipeline, return object:"response".
                 wr_result!(self.handle_responses(&body));
+            } else if method == "POST" && path.starts_with("/v1/messages") {
+                // Anthropic Messages API shim (IMP-72): translate the Anthropic
+                // surface (system / content parts / tools) into the internal
+                // chat shape, route through the same pipeline, and return a
+                // type:"message" reply so Anthropic SDK clients work unchanged.
+                wr_result!(self.handle_messages(&body));
             } else if method == "POST" && path.starts_with("/v1/completions") {
                 // Legacy text-completion API shim — maps prompt→chat message,
                 // routes through the same pipeline, returns object:"text_completion".

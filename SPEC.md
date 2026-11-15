@@ -125,6 +125,34 @@ deliberate choice over silently dropping tools (the migration failure mode where
 a tool call surfaces as raw text). Streaming Responses (`response.output_text.delta`
 SSE events) and tool use are documented follow-ups.
 
+### 3.1b `POST /v1/messages` (Anthropic Messages API shim, IMP-72)
+A compatibility shim for the Anthropic Messages API, so clients built on the
+Anthropic SDK (which POST to `/v1/messages`) work against Pasture unchanged.
+Ported from RekAI's Anthropic-compatible surface in the LLM consolidation
+(ADR-281). Translates the request into the internal chat shape and routes it
+through the **same** pipeline (routing, privacy, cache, cost log), then formats
+the reply as a Messages object.
+
+Request: `{"model", "max_tokens", "messages", …}`. The top-level `system`
+(string or array of `{"type":"text"}` parts) becomes a leading system message.
+Message `content` is a string or an array of parts: `text` parts concatenate;
+an assistant `tool_use` part becomes an internal tool call and a user
+`tool_result` part becomes a `role:"tool"` message (the inverse of the
+ADR-182/183 outbound translation). `tools` (`{name, description, input_schema}`)
+map to OpenAI tool definitions and `tool_choice` (`auto`/`any`/`tool`/`none`)
+to the OpenAI forms, so tool use works end-to-end. `stop_sequences` maps to
+`stop`.
+
+Success (non-stream): `200`, `{"id":"msg_…","type":"message","role":"assistant",`
+`"model","content":[{"type":"text","text",…}]` (plus `{"type":"tool_use",…}`
+blocks when the model called tools), `"stop_reason":"end_turn"|"tool_use",`
+`"x_pasture_route","usage":{"input_tokens","output_tokens"}}`.
+
+**Scope (v1):** text-only, non-streaming — the same deliberate scope as the
+Responses shim (§3.1a). `"stream":true` and non-text parts (e.g. `image`) are
+rejected with `400` rather than silently mishandled. Errors use the standard
+Pasture envelope (§3.5), not Anthropic's error shape.
+
 ### 3.2 `GET /v1/models`
 `200`, OpenAI list: `{"object":"list","data":[{"id","object":"model","owned_by":"pasture"}…]}`
 listing the configured local (and, if enabled, cloud) model ids; de-duplicated. An

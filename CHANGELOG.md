@@ -5,6 +5,15 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added
+
+- **Anthropic Messages API shim** (IMP-72, ADR-281): `POST /v1/messages` accepts
+  Anthropic SDK requests — `system`, text/`tool_use`/`tool_result` content
+  parts, `tools`/`tool_choice`, `stop_sequences` — routes them through the
+  normal pipeline, and replies with a `type:"message"` object. Text-only,
+  non-streaming (same deliberate scope as the Responses shim). Ported from
+  RekAI in the local-LLM consolidation.
+
 ## [0.28.0] - 2026-08-16
 
 ### Security — prompt-injection guard hardened against real evasions (ADR-247–253)
