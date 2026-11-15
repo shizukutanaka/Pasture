@@ -12,6 +12,12 @@ Pasture sits between your existing AI client (IDE plugin, chat app, Claude Code,
 
 It is built as a single Rust binary using only the standard library. No async runtime, no web framework, no serialization crate.
 
+## Screenshot
+
+![Pasture in a terminal: hardware detection, the doctor setup check, runtime discovery, and a dry-run routing decision](docs/terminal.png)
+
+*A real first run, captured from the current build on a machine with no local runtime installed yet: `pasture doctor` says exactly what is missing and how to fix it, `pasture discover` probes for runtimes, and `pasture route` shows a routing decision without sending anything.*
+
 ## Why
 
 Most desktop AI clients make *you* pick the model. Routing layers that automate the choice (RouteLLM, LiteLLM) are developer infrastructure that needs code and servers. Pasture aims for the gap: **zero-config, single-binary routing for individuals**, that adapts to whether your PC has a GPU or not.
