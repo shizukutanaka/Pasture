@@ -150,7 +150,7 @@ pub struct Config {
     pub otel_log: String,
     /// Fallback cloud provider tried when the primary cloud fails all retries
     /// (IMP-9 multi-provider follow-up). Empty string = disabled (default).
-    /// Set via `PASTURE_CLOUD_FALLBACK_PROVIDER` (`openai` or `anthropic`).
+    /// Set via `PASTURE_CLOUD_FALLBACK_PROVIDER` (`openai`, `anthropic` or `gemini`).
     pub cloud_fallback_provider: String,
     /// Model to use on the fallback cloud provider. Empty = same as `cloud_model`.
     /// Set via `PASTURE_CLOUD_FALLBACK_MODEL`.
@@ -241,6 +241,7 @@ pub const KNOWN_ENV: &[&str] = &[
     "PASTURE_COST_LOG",
     "PASTURE_DECISION_LOG",
     "PASTURE_FAST_THRESHOLD",
+    "PASTURE_GEMINI_API_KEY",
     "PASTURE_GPU_VRAM_MB",
     "PASTURE_HARD_PROMPTS",
     "PASTURE_HARD_THRESHOLD",

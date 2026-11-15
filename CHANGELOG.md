@@ -7,6 +7,12 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ### Added
 
+- **Gemini cloud provider** (IMP-73, ADR-282): `PASTURE_CLOUD_PROVIDER=gemini`
+  (or `google`) with `PASTURE_GEMINI_API_KEY` adds Google Gemini as a cloud
+  escalation target — request/response translation including `functionCall`/
+  `functionResponse` tool turns, `systemInstruction`, and `generationConfig`
+  sampling. Streaming is served from the buffered exchange (one delta).
+  Ported from RekAI's provider set in the local-LLM consolidation.
 - **Anthropic Messages API shim** (IMP-72, ADR-281): `POST /v1/messages` accepts
   Anthropic SDK requests — `system`, text/`tool_use`/`tool_result` content
   parts, `tools`/`tool_choice`, `stop_sequences` — routes them through the

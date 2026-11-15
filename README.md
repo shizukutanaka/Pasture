@@ -65,12 +65,12 @@ Requires Rust 1.75+.
 git clone https://github.com/shizukutanaka/pasture
 cd pasture
 cargo build --release                 # zero-dependency, local-only
-cargo build --release --features cloud # adds OpenAI/Anthropic over HTTPS
+cargo build --release --features cloud # adds OpenAI/Anthropic/Gemini over HTTPS
 # binary at target/release/pasture
 ```
 
 Cloud is opt-in. With `--features cloud`, set a BYOK key:
-`PASTURE_OPENAI_API_KEY` or `PASTURE_ANTHROPIC_API_KEY` (and `PASTURE_CLOUD_PROVIDER`, `PASTURE_CLOUD_MODEL`). Keys are read from the environment and never logged.
+`PASTURE_OPENAI_API_KEY`, `PASTURE_ANTHROPIC_API_KEY` or `PASTURE_GEMINI_API_KEY` (and `PASTURE_CLOUD_PROVIDER`, `PASTURE_CLOUD_MODEL`). Keys are read from the environment and never logged.
 
 ## Usage
 
@@ -205,12 +205,13 @@ config file as `key = value`, using the lower-case name with the prefix dropped
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `PASTURE_CLOUD_PROVIDER` | _(none)_ | `openai` or `anthropic` |
+| `PASTURE_CLOUD_PROVIDER` | _(none)_ | `openai`, `anthropic` or `gemini` |
 | `PASTURE_CLOUD_MODEL` | `gpt-4o-mini` | cloud model id |
 | `PASTURE_OPENAI_API_KEY` | _(none)_ | BYOK; never logged |
 | `PASTURE_ANTHROPIC_API_KEY` | _(none)_ | BYOK; never logged |
+| `PASTURE_GEMINI_API_KEY` | _(none)_ | BYOK; never logged |
 | `PASTURE_CLOUD_RETRY` | `2` | retry transient cloud failures (5xx/timeouts) this many times, then fall back to local |
-| `PASTURE_CLOUD_FALLBACK_PROVIDER` | _(off)_ | secondary provider tried when the primary fails all retries (`openai` or `anthropic`) |
+| `PASTURE_CLOUD_FALLBACK_PROVIDER` | _(off)_ | secondary provider tried when the primary fails all retries (`openai`, `anthropic` or `gemini`) |
 | `PASTURE_CLOUD_FALLBACK_MODEL` | _(same as primary)_ | model to use on the fallback provider |
 
 **Serving and exposure**
@@ -243,7 +244,7 @@ The local backend talks to [Ollama](https://ollama.com) over plain HTTP. GPU acc
 
 ## Status
 
-Pasture is at v0.28.0. Working today: hardware detection, deterministic hardware-adaptive routing, the OpenAI-compatible proxy, the local Ollama backend, and a fully implemented multi-provider cloud backend (OpenAI/Anthropic, streaming, tool calls, retry + fallback-provider failover, per-backend health tracking with a circuit breaker on both the local and cloud side). Also shipped: exact-match and semantic response caching, a FrugalGPT-style local-first cascade, reversible pseudonymization for cloud-bound PII, a lightweight prompt-injection guard, budget/spike-aware routing, structured JSONL cost + routing-decision audit logs, optional OpenTelemetry GenAI tracing. See `ARCHITECTURE.md` for the full ADR history and `SPEC.md` for the complete configuration/API reference.
+Pasture is at v0.28.0. Working today: hardware detection, deterministic hardware-adaptive routing, the OpenAI-compatible proxy, the local Ollama backend, and a fully implemented multi-provider cloud backend (OpenAI/Anthropic/Gemini, streaming, tool calls, retry + fallback-provider failover, per-backend health tracking with a circuit breaker on both the local and cloud side). Also shipped: exact-match and semantic response caching, a FrugalGPT-style local-first cascade, reversible pseudonymization for cloud-bound PII, a lightweight prompt-injection guard, budget/spike-aware routing, structured JSONL cost + routing-decision audit logs, optional OpenTelemetry GenAI tracing. See `ARCHITECTURE.md` for the full ADR history and `SPEC.md` for the complete configuration/API reference.
 
 ## Privacy
 

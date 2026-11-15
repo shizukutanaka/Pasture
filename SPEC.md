@@ -433,8 +433,10 @@ false negative = data leak (unacceptable).
   paths: an exact text match on "what's the weather today?" is still a stale
   answer. Orthogonal to routing: such prompts may still route local.
 - **Backends.** Local: Ollama (default) or any OpenAI-compatible server
-  (`PASTURE_LOCAL_BACKEND`). Cloud (`cloud` feature, BYOK): OpenAI or Anthropic over
-  HTTPS. Both support streaming. **Cloud resilience (IMP-9):** a transient failure
+  (`PASTURE_LOCAL_BACKEND`). Cloud (`cloud` feature, BYOK): OpenAI, Anthropic or
+  Gemini (IMP-73) over HTTPS. OpenAI and Anthropic support streaming; Gemini is
+  served from the buffered exchange (its streaming endpoint has a different
+  event shape) and emits the full text as one delta. **Cloud resilience (IMP-9):** a transient failure
   (connection/timeout, provider **5xx**) is retried with exponential backoff
   (`PASTURE_CLOUD_RETRY`, default 2); on final failure the request falls back to local
   when available. 4xx is not retried.
@@ -526,7 +528,7 @@ wins). Variables:
 | `PASTURE_LOCAL_OPENAI_URL` | `http://127.0.0.1:1234/v1` | OpenAI-compat local URL |
 | `PASTURE_CLOUD_PROVIDER` / `PASTURE_CLOUD_MODEL` | — / `gpt-4o-mini` | cloud provider / model |
 | `PASTURE_CLOUD_FALLBACK_PROVIDER` / `PASTURE_CLOUD_FALLBACK_MODEL` | _(off)_ | secondary cloud provider/model tried when the primary fails all retries (IMP-9) |
-| `PASTURE_OPENAI_API_KEY` / `PASTURE_ANTHROPIC_API_KEY` | — | BYOK (never logged) |
+| `PASTURE_OPENAI_API_KEY` / `PASTURE_ANTHROPIC_API_KEY` / `PASTURE_GEMINI_API_KEY` | — | BYOK (never logged) |
 | `PASTURE_RAM_MB` | _(auto)_ | override detected total RAM in MB; use when auto-detection is unavailable on your OS (§4, ADR-261) |
 | `PASTURE_GPU_VRAM_MB` | _(auto)_ | override detected GPU VRAM in MB; discrete-GPU detection is NVIDIA-only, so Apple Silicon / AMD machines tier by RAM unless this is set (§4) |
 | `PASTURE_THRESHOLD` | hardware | token length threshold override |
