@@ -7,6 +7,12 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ### Added
 
+- **`pasture discover`** (IMP-75, ADR-284): probes localhost for running
+  local LLM runtimes — Ollama, LM Studio, Jan, llama.cpp server, KoboldCPP,
+  GPT4All, vLLM, Open WebUI — and prints how each found runtime is used
+  with Pasture (`--json` for scripting). A runtime counts as found only
+  when it answers an HTTP request. The detection list is ported from lmm
+  in the local-LLM consolidation.
 - **Idempotency-Key replay** (IMP-74, ADR-283): a duplicate
   `POST /v1/chat/completions` carrying the same `Idempotency-Key` header
   replays the first successful response instead of running — and billing —

@@ -51,6 +51,7 @@ library only; the cloud (HTTPS/TLS) path is gated behind the optional `cloud` fe
 | `label --prompts <f> [--out <f>]` | answer each prompt locally and record right/wrong, producing the `{"logprob","correct"}` JSONL that `calibrate --auroc`/`--error` consume (ADR-257). Writes only the score and verdict — never prompt or answer text (I3) |
 | `models` | recommend local models for this machine |
 | `doctor` | diagnose setup and print fixes |
+| `discover [--json]` | probe localhost for running local LLM runtimes (Ollama, LM Studio, Jan, llama.cpp, KoboldCPP, GPT4All, vLLM, Open WebUI) and print how each found runtime is used with Pasture (IMP-75). A runtime counts as found only when it answers an HTTP request — an open port alone proves nothing |
 | `eval [--external <file>] [--json]` | routing accuracy on two corpora; **exits 1** on regression or I2 breach |
 | `stats [--json]` | summarize the cost log |
 | `improvements [path] [--review]` | print the self-improvement ledger (verified change history) |

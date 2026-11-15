@@ -16,6 +16,7 @@ USAGE:
 
 COMMANDS:
     doctor                   Check your setup and show how to fix problems
+    discover [--json]        Probe this machine for running local LLM runtimes (Ollama, LM Studio, Jan, ...)
     setup                    Beginner guide + environment check
     up                       One command: ensure model, then start the proxy
     connect [app]            Show how to point your app at pasture (openwebui/continue/cursor/lmstudio/sdk)
@@ -448,6 +449,7 @@ pub fn run(args: &[String]) -> i32 {
             run_serve(&config, addr)
         }
         "eval" => run_eval(rest),
+        "discover" => run_discover(rest),
         "stats" => run_stats(&config, rest),
         "calibrate" => run_calibrate(&config, rest),
         "label" => run_label(&config, rest),
@@ -462,6 +464,46 @@ pub fn run(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+/// `pasture discover`: probe localhost for known local LLM runtimes
+/// (IMP-75, the detection know-how ported from lmm) and print how each
+/// found runtime is used with Pasture.
+fn run_discover(args: &[String]) -> i32 {
+    let json = args.iter().any(|a| a == "--json");
+    let results =
+        crate::discover::run_discovery("127.0.0.1", std::time::Duration::from_millis(300));
+    if json {
+        let items: Vec<String> = results
+            .iter()
+            .map(|(p, found)| {
+                format!(
+                    "{{\"name\":\"{}\",\"port\":{},\"found\":{}}}",
+                    crate::json::escape_string(p.name),
+                    p.port,
+                    found
+                )
+            })
+            .collect();
+        println!("[{}]", items.join(","));
+        return 0;
+    }
+    println!("Probing 127.0.0.1 for local LLM runtimes:");
+    let mut found_any = false;
+    for (p, found) in &results {
+        if *found {
+            found_any = true;
+            println!("  ✓ {} (port {}) — {}", p.name, p.port, p.hint);
+        } else {
+            println!("  · {} (port {}) — not running", p.name, p.port);
+        }
+    }
+    if !found_any {
+        println!(
+            "Nothing found. Install Ollama (https://ollama.com) or start one of the runtimes above, then re-run `pasture discover`."
+        );
+    }
+    0
 }
 
 /// `pasture route <text>`: dry-run the routing decision for a prompt.

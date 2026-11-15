@@ -15,6 +15,7 @@ pub mod cost;
 pub mod dashboard;
 pub mod decision_log;
 pub mod difficulty;
+pub mod discover;
 pub mod doctor;
 pub mod eval;
 pub mod guard;
