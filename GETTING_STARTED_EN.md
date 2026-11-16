@@ -43,7 +43,7 @@ pasture up
 `pasture up` starts Ollama if needed, downloads the model automatically if you don't have it yet, and then starts the proxy. When it starts, it also shows the connection address (base_url) to set in your app.
 If something goes wrong, run `pasture doctor` to check your setup (how to fix it appears under `[!!]`).
 
-> Getting Pasture itself: the easiest way is to download the prebuilt binary for your OS from the [Release page](https://github.com/shizukutanaka/Pasture/releases/tag/v0.28.0) — no build needed (local-only build).
+> Getting Pasture itself: the easiest way is to download the prebuilt binary for your OS from the [Release page](https://github.com/shizukutanaka/Pasture/releases/tag/v0.28.0) — no build needed (cloud routing included).
 > To build from source: `git clone https://github.com/shizukutanaka/pasture && cd pasture && cargo build --release` (Rust is required; the binary is created at `target/release/pasture`. For cloud use, build with `cargo build --release --features cloud` instead.)
 
 ---
@@ -116,10 +116,9 @@ pasture doctor
 
 If local-only is enough for you, you can skip this section.
 
-To use automatic switching to the cloud (OpenAI / Anthropic), build with cloud support and put your own API key in an environment variable (keys are never written to logs).
+Automatic switching to the cloud (OpenAI / Anthropic) is already included in the prebuilt binaries: just put your own API key in an environment variable (keys are never written to logs). If you built from source, build with `cargo build --release --features cloud` first.
 
 ```sh
-cargo build --release --features cloud
 export PASTURE_OPENAI_API_KEY="sk-..."      # if you use OpenAI
 # or
 export PASTURE_ANTHROPIC_API_KEY="sk-ant-..."  # if you use Anthropic

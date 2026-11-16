@@ -31,6 +31,18 @@ Format follows Keep a Changelog; versioning follows SemVer.
   non-streaming (same deliberate scope as the Responses shim). Ported from
   RekAI in the local-LLM consolidation.
 
+### Changed
+
+- **Release binaries now include the `cloud` feature** (IMP-76, ADR-285):
+  `release.yml` builds the downloadable binaries with
+  `cargo build --release --features cloud` on stable Rust, so the headline
+  local/cloud routing works from the prebuilt binary as soon as you set
+  your own provider key — no source build needed. The workflow asserts
+  the shipped binary actually contains the cloud path (`pasture doctor`
+  must not print the "local-only build" line). The default source build
+  is unchanged: zero-dependency, local-only, MSRV 1.75. README and
+  GETTING_STARTED (JA/EN) updated to match.
+
 ## [0.28.0] - 2026-08-16
 
 ### Security — prompt-injection guard hardened against real evasions (ADR-247–253)

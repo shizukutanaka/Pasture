@@ -43,7 +43,7 @@ pasture up
 `pasture up` は、（必要なら）Ollama を起動し、モデルが未取得なら自動でダウンロードし、そのままプロキシを起動します。起動時に、アプリに設定する接続先（base_url）も表示します。
 うまくいかないときは `pasture doctor` で状態を確認してください（`[!!]` の下に直し方が出ます）。
 
-> pasture 本体の入手: [Release ページ](https://github.com/shizukutanaka/Pasture/releases/tag/v0.28.0)から OS 別のバイナリをダウンロードするのが一番かんたんです（ビルド不要・ローカル専用版）。
+> pasture 本体の入手: [Release ページ](https://github.com/shizukutanaka/Pasture/releases/tag/v0.28.0)から OS 別のバイナリをダウンロードするのが一番かんたんです（ビルド不要・クラウド振り分け入り）。
 > ソースからビルドする場合: `git clone https://github.com/shizukutanaka/pasture && cd pasture && cargo build --release`（Rust が必要です。`target/release/pasture` ができます。クラウド併用には `cargo build --release --features cloud`）
 
 ---
@@ -116,11 +116,11 @@ pasture doctor
 
 手元だけで十分なら、この章は読み飛ばして大丈夫です。
 
-クラウド（OpenAI / Anthropic）への自動切り替えを使うには、クラウド対応でビルドし、
-自分の API キーを環境変数に入れます（キーはログに記録されません）。
+クラウド（OpenAI / Anthropic）への自動切り替えは、配布バイナリに最初から入っています。
+自分の API キーを環境変数に入れるだけです（キーはログに記録されません）。
+ソースからビルドした場合は、先に `cargo build --release --features cloud` でビルドしてください。
 
 ```sh
-cargo build --release --features cloud
 export PASTURE_OPENAI_API_KEY="sk-..."      # OpenAI を使う場合
 # または
 export PASTURE_ANTHROPIC_API_KEY="sk-ant-..."  # Anthropic を使う場合
