@@ -4,13 +4,13 @@
 
 [![CI](https://github.com/shizukutanaka/pasture/actions/workflows/ci.yml/badge.svg)](https://github.com/shizukutanaka/pasture/actions/workflows/ci.yml)
 
-**Hardware-aware LLM routing in one binary — Pasture sends each request to your local model or the cloud, based on your machine. OpenAI-compatible, zero dependencies.**
+**Hardware-aware LLM routing in one binary — Pasture sends each request to your local model or the cloud, based on your machine. OpenAI-compatible, zero dependencies by default.**
 
 All projects at a glance: [Project Portal](https://muse.ai/s/project-portal-bf6avrxu7xyfxl/6PgvpkK4Nn1DPotxc3edgYXaYZgDC5_LeWpXkf1wsrg)
 
 Pasture sits between your existing AI client (IDE plugin, chat app, Claude Code, your own scripts) and the models. It exposes an OpenAI-compatible endpoint, and for each request it decides — deterministically and based on your actual hardware — whether to answer with a **local** model (free, private, offline-capable) or escalate to a **cloud** API (for hard tasks). You point your client's `base_url` at Pasture and keep your existing workflow.
 
-It is built as a single Rust binary using only the standard library. No async runtime, no web framework, no serialization crate.
+It is built as a single Rust binary; the default build uses only the standard library. No async runtime, no web framework, no serialization crate.
 
 ## Screenshot
 
@@ -37,9 +37,9 @@ The same prompt that goes to the cloud on a laptop stays local on a workstation 
 
 - **No ads, no tracking.** Pasture ships no advertising and no analytics, and has no telemetry beacons — nothing about you or your usage is reported anywhere. The optional trace log is off unless you explicitly enable it, writes only to a local file you choose, and records token counts, model names and timings — never prompt content.
 - **The creator receives no data.** Pasture runs entirely on your own machine. There is no account, no sign-up, and no Pasture server that could hold your data.
-- **Your prompts go only where you point them.** By default that is a local model on your machine — the prebuilt binaries contain no cloud code paths at all. Cloud escalation exists only in a source build with the `cloud` feature, uses your own API key, and sends to the provider you chose. A prompt classified as sensitive is kept on the machine (invariant I2 in SPEC.md) — unless you explicitly switch that protection off.
+- **Your prompts go only where you point them.** By default that is a local model on your machine. The prebuilt binaries do include the cloud escalation path, but it stays inactive until you set your own API key, and then sends only to the provider you chose. (A source build without the `cloud` feature contains no cloud code paths at all.) A prompt classified as sensitive is kept on the machine (invariant I2 in SPEC.md) — unless you explicitly switch that protection off.
 
-日本語: 広告も追跡もありません（解析やテレメトリの送信先自体がありません。任意のトレース記録も、明示的に有効にしない限り無効で、行き先は自分のマシン内のファイルだけ、記録されるのはトークン数や所要時間などで入力文そのものは含まれません）。作成者にデータが届くこともありません — アカウントも登録も、Pasture のサーバーも存在せず、すべてあなたのマシンの中で動きます。入力した文章の行き先は、あなたが指定した先だけです。既定はマシン内のローカルモデルで、配布バイナリにはクラウドへの経路自体が含まれていません。クラウドへの振り分けは、ソースから有効化した場合に、あなた自身の API キーで、あなたが選んだ事業者へ送る場合だけです。機微と判定された入力はマシンの中に留まります（あなたが明示的にその保護を切った場合を除きます）。
+日本語: 広告も追跡もありません（解析やテレメトリの送信先自体がありません。任意のトレース記録も、明示的に有効にしない限り無効で、行き先は自分のマシン内のファイルだけ、記録されるのはトークン数や所要時間などで入力文そのものは含まれません）。作成者にデータが届くこともありません — アカウントも登録も、Pasture のサーバーも存在せず、すべてあなたのマシンの中で動きます。入力した文章の行き先は、あなたが指定した先だけです。既定はマシン内のローカルモデルです。配布バイナリにはクラウドへの振り分け経路が含まれていますが、あなた自身の API キーを設定するまで有効にはならず、送信先はあなたが選んだ事業者だけです（ソースから `cloud` 機能なしでビルドした場合は、クラウドへの経路自体が含まれません）。機微と判定された入力はマシンの中に留まります（あなたが明示的にその保護を切った場合を除きます）。
 
 ## Install
 
@@ -59,13 +59,14 @@ tar -xzf pasture-v0.28.0-linux-x86_64.tar.gz
 # Windows: unzip the archive, then run pasture.exe from the extracted folder
 ```
 
-> Prebuilt binaries are the local-only build. To use cloud escalation
-> (OpenAI / Anthropic), build from source with the `cloud` feature below —
-> the prebuilt binary has no cloud code paths by design.
+> Prebuilt binaries include cloud escalation (OpenAI / Anthropic /
+> Gemini): set a BYOK key below and it works — no source build needed.
+> Cloud stays inactive until a key is set. Building from source without
+> `--features cloud` produces the zero-dependency, local-only build.
 
 ### Build from source
 
-Requires Rust 1.75+.
+Requires Rust 1.75+ (1.80+ for the `cloud` build — its pinned TLS stack declares that floor).
 
 ```sh
 git clone https://github.com/shizukutanaka/pasture
@@ -75,7 +76,7 @@ cargo build --release --features cloud # adds OpenAI/Anthropic/Gemini over HTTPS
 # binary at target/release/pasture
 ```
 
-Cloud is opt-in. With `--features cloud`, set a BYOK key:
+Cloud is opt-in. In the prebuilt binaries (or a source build with `--features cloud`), set a BYOK key:
 `PASTURE_OPENAI_API_KEY`, `PASTURE_ANTHROPIC_API_KEY` or `PASTURE_GEMINI_API_KEY` (and `PASTURE_CLOUD_PROVIDER`, `PASTURE_CLOUD_MODEL`). Keys are read from the environment and never logged.
 
 ## Usage

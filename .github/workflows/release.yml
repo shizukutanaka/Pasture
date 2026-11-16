@@ -50,16 +50,20 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
-      # Same approach as ci.yml's MSRV leg: the default (zero-dependency)
-      # build promises to compile on the rust-toolchain.toml pin (1.75.0),
-      # so the release binaries are built with exactly that toolchain. The
-      # cloud feature is deliberately not built here — it needs a newer
-      # rustc and pulls a TLS stack; the downloadable binary is the default
-      # zero-dependency one, same as ci.yml's gates job verifies.
-      - name: Install Rust 1.75.0
+      # The release binaries are built WITH the `cloud` feature (ADR-285):
+      # local/cloud routing is the headline behaviour — the README leads
+      # with it — so a downloadable binary that cannot escalate to the
+      # cloud makes the signage false. The MSRV promise is unchanged: it
+      # covers the DEFAULT zero-dependency source build, which ci.yml's
+      # gates job still verifies on the rust-toolchain.toml pin (1.75.0).
+      # The cloud feature's pinned openssl declares rust-version 1.80, so
+      # this job builds on stable with a directory override (the repo pin
+      # would otherwise win inside the checkout) — the same approach as
+      # ci.yml's cloud-feature job.
+      - name: Install Rust stable
         run: |
-          rustup toolchain install 1.75.0 --profile minimal
-          rustup default 1.75.0
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
           rustc --version && cargo --version
 
       - name: Cache cargo
@@ -72,8 +76,50 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
 
-      - name: cargo build --release (default features)
-        run: cargo build --release
+      # OpenSSL provisioning for openssl-sys (the cloud feature's pinned
+      # TLS stack). The Linux image ships libssl-dev — the same guarantee
+      # ci.yml's cloud-feature job relies on — so only macOS and Windows
+      # need a step. Both link statically, so the shipped binary does not
+      # depend on the end user's machine having OpenSSL installed.
+      - name: Point openssl-sys at Homebrew OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # openssl@3 is preinstalled on the macOS images but keg-only,
+          # so openssl-sys cannot find it without the explicit prefix.
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+
+      - name: Install OpenSSL via vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The Windows image ships vcpkg but no OpenSSL dev package.
+          # The static triplet keeps pasture.exe free of DLL companions.
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl:x64-windows-static
+          "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: cargo build --release (cloud feature)
+        run: cargo build --release --features cloud
+
+      # The point of building with the feature is that the shipped binary
+      # contains the cloud path — assert it, don't assume it. A non-cloud
+      # build's `doctor` prints the "local-only build" line; a cloud build
+      # prints the cloud fallback status instead. doctor's exit code
+      # reflects other checks (e.g. no Ollama on the runner), so only the
+      # output is asserted. PASTURE_LANG pins the message language.
+      - name: Verify the binary contains the cloud path
+        shell: bash
+        run: |
+          bin="target/release/pasture"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          out="$(PASTURE_LANG=en "$bin" doctor 2>&1 || true)"
+          echo "$out"
+          if echo "$out" | grep -q "local-only build"; then
+            echo "::error::release binary was built WITHOUT the cloud feature"
+            exit 1
+          fi
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
