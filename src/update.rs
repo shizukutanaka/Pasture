@@ -522,7 +522,7 @@ fn https_exchange_bytes(
     host: &str,
     _port: u16,
     _request: &[u8],
-    _out: &mut Vec<u8>,
+    _out: &mut [u8],
 ) -> Result<(), String> {
     Err(format!(
         "this build has no TLS support, so it cannot reach {host}; self-update over \
@@ -895,7 +895,7 @@ fn install_download(
 ) -> Result<UpdateOutcome, String> {
     let archive_path = workdir.join(&asset.name);
     let bytes = fetch(&asset.download_url)?;
-    std::fs::write(&archive_path, &bytes).map_err(|e| format!("cannot save the download: {e}"))?;
+    std::fs::write(&archive_path, bytes).map_err(|e| format!("cannot save the download: {e}"))?;
     let actual = sha256_file_hex(&archive_path)?;
     if !crate::http::constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
         return Err(format!(

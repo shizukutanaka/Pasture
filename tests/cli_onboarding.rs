@@ -169,8 +169,10 @@ fn ram_tier_reaches_the_routing_threshold() {
 fn hw_never_reports_zero_mb_of_ram() {
     let out = run("hw", &["hw"], &[]);
     let text = stdout(&out);
+    // Match the RAM reading itself, not any "0 MB" substring: a correct
+    // reading such as "RAM: 15700 MB" contains "0 MB" and must pass.
     assert!(
-        !text.contains("0 MB"),
+        !text.contains("RAM: 0 MB"),
         "0 MB is the bug ADR-261 fixed, not a hardware reading: {text}"
     );
 }
