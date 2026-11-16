@@ -30,6 +30,7 @@ COMMANDS:
     improvements [path]      Show the self-improvement ledger (verified change history)
     improvements --review    Show only entries the machine gate cannot auto-approve
     config                   Print the effective configuration (no secrets)
+    update [--check]         Update the prebuilt binary to the latest GitHub release (release builds only; --check only reports)
     calibrate [--target R]   Recommend PASTURE_THRESHOLD from your logged usage (R=cloud rate, default 0.2)
     calibrate --sweep         Show recommended thresholds at several target rates at once (add --logprob for cascade)
     calibrate --logprob       Recommend PASTURE_CASCADE_LOGPROB from logged cascade confidence
@@ -408,6 +409,9 @@ pub fn run(args: &[String]) -> i32 {
     for w in crate::config::env_warnings() {
         eprintln!("pasture: {w}");
     }
+    // Remove a previous binary parked by a Windows self-update (IMP-77);
+    // a no-op on other platforms and when no parked file exists.
+    crate::update::cleanup_stale_old();
 
     match command {
         "version" => {
@@ -458,6 +462,7 @@ pub fn run(args: &[String]) -> i32 {
             run_improvements(positional(rest).first().copied(), review)
         }
         "config" => run_config(&config),
+        "update" => run_update(rest),
         other => {
             eprintln!("unknown command: {other}\n");
             print!("{USAGE}");
@@ -1988,6 +1993,14 @@ fn run_calibrate_error(lang: crate::i18n::Lang, rest: &[String]) -> i32 {
         }
     }
     0
+}
+
+/// `update [--check]`: self-update for the prebuilt release binaries
+/// (IMP-77, ADR-286). The implementation lives in `update.rs`; this
+/// wrapper only parses the flag.
+fn run_update(args: &[String]) -> i32 {
+    let check_only = args.iter().any(|a| a == "--check");
+    crate::update::run_update(check_only)
 }
 
 /// `config`: print the effective configuration (resolved env + defaults).

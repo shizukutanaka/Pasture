@@ -167,6 +167,22 @@ sh install.sh          # macOS / Linux
 # Windows: powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
+## Updating to a newer version
+
+If you use the prebuilt binary, updating is one command:
+
+```sh
+pasture update          # install the newest version
+pasture update --check  # only check whether a newer version exists
+```
+
+The check runs only when you run the command (never in the background),
+and the downloaded file is verified against the checksum published with
+the release before anything is replaced — if verification fails, your
+current binary is left exactly as it was. If you built from source,
+`pasture update` will tell you so; just rebuild with the latest code
+(or re-run the install script above).
+
 ---
 
 If you're stuck, remember just one thing: `pasture doctor`.
