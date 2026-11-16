@@ -82,6 +82,23 @@ the old one; on any failure the installed binary is left untouched.
 Source builds are never self-updated: `pasture update` detects them and
 explains how to update from source instead.
 
+### No local runtime yet?
+
+The engine Pasture routes to is separate software — and installing it
+used to be the first thing a new user had to do by hand. `pasture
+engine` closes that gap: when no local runtime is running, it
+downloads the official Ollama build for this OS/architecture from
+Ollama's GitHub Releases and installs it under `~/.pasture/engines`,
+but only after the download's SHA-256 matches the checksum published
+with the release (the `sha256sum.txt` asset, or the digest the GitHub
+API reports — the same policy as `pasture update`) and the installed
+binary reports the expected version; then it starts the engine and
+waits until it answers. Source, size and verification are shown
+before any download, and — like `pasture update` — it contacts the
+network only when you run it. `--check` only reports what would be
+installed. `pasture up` offers the same bootstrap when Ollama is
+unreachable.
+
 ### Build from source
 
 Requires Rust 1.75+ (1.80+ for the `cloud` build — its pinned TLS stack declares that floor).
@@ -113,6 +130,7 @@ pasture calibrate --auroc --labels labels.jsonl  # self-test: does the confidenc
 pasture models             # recommended local models for your machine
 pasture doctor             # check your setup and how to fix problems
 pasture discover           # probe this machine for running local LLM runtimes
+pasture engine             # install and start Ollama when no local runtime is running (--check only reports)
 pasture eval               # routing accuracy: regression set + held-out set (exits 1 on regression)
 pasture stats              # summarize the cost log (routes, tokens, spend)
 pasture improvements       # show the self-improvement ledger (verified change history)
@@ -181,6 +199,8 @@ config file as `key = value`, using the lower-case name with the prefix dropped
 | `PASTURE_LOCAL_TIMEOUT` | `120` | per-request local-backend read timeout in seconds |
 | `PASTURE_LANG` | auto | force CLI language: `ja` or `en` |
 | `PASTURE_UPDATE_API_BASE` | `https://api.github.com/repos/shizukutanaka/Pasture` | base URL `pasture update` reads release metadata from; override only for a mirror or for testing |
+| `PASTURE_ENGINE_API_BASE` | `https://api.github.com/repos/ollama/ollama` | base URL `pasture engine` reads Ollama release metadata from; override only for a mirror or for testing |
+| `PASTURE_ENGINE_HOME` | `~/.pasture/engines` | directory `pasture engine` installs the downloaded engine into (versioned subdirectories) |
 
 **Routing — which way a request goes**
 

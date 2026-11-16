@@ -23,7 +23,15 @@ Follow this guide and you will have it running, even if this is your first time.
 
 ### 1. Install Ollama
 
-Install it from [https://ollama.com](https://ollama.com).
+The easiest way is to let Pasture do it. In a terminal, run:
+
+```
+pasture engine
+```
+
+It downloads Ollama from the official source, verifies it (checksum) before installing anything, and starts it for you. What will be downloaded, and its size, are shown before the download starts.
+
+To install manually instead, get it from [https://ollama.com](https://ollama.com).
 It usually starts automatically after installation. If it doesn't, run `ollama serve` in a terminal.
 
 ### 2. Download a model

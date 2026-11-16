@@ -57,6 +57,7 @@ library only; the cloud (HTTPS/TLS) path is gated behind the optional `cloud` fe
 | `improvements [path] [--review]` | print the self-improvement ledger (verified change history) |
 | `config` | print effective configuration |
 | `update [--check]` | self-update for binaries built by release.yml: check GitHub Releases and install the newest prebuilt binary, only after its SHA-256 matches the checksum published with the release (`SHA256SUMS` asset, else the API-reported digest) and the new binary reports the expected version; `--check` only reports. Source builds refuse — they update by rebuilding (IMP-77) |
+| `engine [--check]` | engine bootstrap: when discovery finds no running local runtime, download the official Ollama build for this OS/architecture from Ollama's GitHub Releases and install it under `PASTURE_ENGINE_HOME`, only after its SHA-256 matches the checksum published with the release (`sha256sum.txt` asset, else the API-reported digest; disagreement or no checksum refuses) and the installed binary reports the expected version; then start it and wait until it answers. Source, size and verification are shown before the download; contact happens only when invoked. Open WebUI does not count as an engine (it is a frontend). `--check` only reports; failures leave no partial state (IMP-78) |
 | `version` / `help` | version / usage |
 
 Global flags: `--local` / `--cloud` force a route; `--addr host:port` sets the listen
@@ -582,6 +583,8 @@ wins). Variables:
 | `PASTURE_ACCESS_LOG` | _(off)_ | path for a per-request JSONL access log (PII-free, I3) |
 | `PASTURE_OTEL_LOG` | _(off)_ | path for an OpenTelemetry GenAI trace log (§9.1, IMP-23) |
 | `PASTURE_UPDATE_API_BASE` | `https://api.github.com/repos/shizukutanaka/Pasture` | base URL `pasture update` reads release metadata from; override only for a mirror or for testing (IMP-77) |
+| `PASTURE_ENGINE_API_BASE` | `https://api.github.com/repos/ollama/ollama` | base URL `pasture engine` reads Ollama release metadata from; override only for a mirror or for testing (IMP-78) |
+| `PASTURE_ENGINE_HOME` | `~/.pasture/engines` (home = `HOME`, else `USERPROFILE`) | directory `pasture engine` installs the downloaded engine into, in versioned `ollama-<tag>` subdirectories (IMP-78) |
 
 > **Spec-drift note (this round):** earlier spec text referenced `PASTURE_PROXY_TOKEN`;
 > the implemented variable is **`PASTURE_AUTH_TOKEN`** (the only name recognised). The

@@ -5,6 +5,7 @@
 //! dependencies: standard library only (Carmack/Pike philosophy).
 
 pub mod backend;
+pub mod bootstrap;
 pub mod cache;
 pub mod calibrate;
 pub mod cascade;

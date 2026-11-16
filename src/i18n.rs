@@ -74,10 +74,10 @@ const EN: &[(&str, &str)] = &[
     (
         "welcome",
         "pasture — run AI models on your own computer, with automatic cloud fallback.\n\n\
-New here? Just three steps:\n\
-    1. Install Ollama (runs the local models):   https://ollama.com\n\
-    2. Download a model:                          ollama pull llama3.2\n\
-    3. Start everything with one command:         pasture up\n\n\
+New here? Just two steps:\n\
+    1. Install the local engine (Ollama):         pasture engine\n\
+    2. Start everything with one command:         pasture up\n\
+       (your first model downloads automatically)\n\n\
 Or check your setup first:  pasture doctor\n\
 All commands:               pasture help\n",
     ),
@@ -311,16 +311,66 @@ it is deleted automatically on the next run.",
         "update.failed",
         "[!!] Update failed: {reason} Your current binary was not changed.",
     ),
+    // IMP-78: engine bootstrap. Like update, the network is touched
+    // only when the user invokes the command.
+    ("engine.checking", "Checking for a running local engine..."),
+    (
+        "engine.found",
+        "[ok] {name} is already running on this machine. {hint}",
+    ),
+    (
+        "engine.plan",
+        "No local engine found. Installing Ollama {version} (Pasture's default backend) \\
+from its official release:\n\
+  source: {url}\n\
+  size: {size}\n\
+  verification: the download's SHA-256 must match the checksum published with the \\
+release (sha256sum.txt / the GitHub API digest) before anything is installed.",
+    ),
+    ("engine.progress", "  downloaded {done} of {total}"),
+    ("engine.progress.nototal", "  downloaded {done}"),
+    (
+        "engine.wouldinstall",
+        "[ok] No local engine is running. `pasture engine` would install Ollama {version} \\
+({size}) from {url}, verifying its SHA-256 against the checksum published with \\
+the release before installing.",
+    ),
+    (
+        "engine.notrunning",
+        "[ok] Ollama {version} is installed at {path} but is not running. \
+Run `pasture engine` to start it.",
+    ),
+    (
+        "engine.started",
+        "[ok] Ollama {version} is running at {endpoint}. It is Pasture's default \\
+backend — nothing else to configure. Next: `pasture up`.",
+    ),
+    (
+        "engine.notstarted",
+        "[!!] Ollama {version} was installed to {path}, but it did not start: {detail}. \\
+Its output is logged at {log}; start it manually with `ollama serve`, then run \\
+`pasture up`.",
+    ),
+    (
+        "engine.unsupported",
+        "Engine install is not available for this platform ({platform}): Ollama \\
+publishes no official build for it. Install Ollama manually from \\
+https://ollama.com, then run `pasture up`.",
+    ),
+    (
+        "engine.failed",
+        "[!!] Engine setup failed: {reason}",
+    ),
 ];
 
 const JA: &[(&str, &str)] = &[
     (
         "welcome",
         "pasture — 自分のパソコンで AI を動かし、必要なときだけクラウドに切り替えるツール。\n\n\
-はじめての方へ。たった3ステップ:\n\
-    1. Ollama を入れる（ローカルのモデルを動かします）: https://ollama.com\n\
-    2. モデルをダウンロード:                            ollama pull llama3.2\n\
-    3. ひとつのコマンドで起動:                          pasture up\n\n\
+はじめての方へ。たった2ステップ:\n\
+    1. ローカルエンジン（Ollama）を入れる:        pasture engine\n\
+    2. ひとつのコマンドで起動:                    pasture up\n\
+       （モデルは初回起動時に自動でダウンロードされます）\n\n\
 先に状態を確認する場合:  pasture doctor\n\
 すべてのコマンド:        pasture help\n",
     ),
@@ -560,6 +610,46 @@ const JA: &[(&str, &str)] = &[
     (
         "update.failed",
         "[!!] 更新に失敗しました: {reason} 現在のバイナリは変更されていません。",
+    ),
+    // IMP-78: エンジンの自動導入。update と同じく、ネットワークに触れるのは
+    // 利用者がコマンドを実行したときだけ。
+    ("engine.checking", "動作中のローカルエンジンを確認しています..."),
+    (
+        "engine.found",
+        "[ok] {name} はこのマシンで既に動作しています。{hint}",
+    ),
+    (
+        "engine.plan",
+        "ローカルエンジンが見つかりませんでした。公式リリースから Ollama {version}（Pasture の既定バックエンド）をインストールします:\n\
+  取得元: {url}\n\
+  サイズ: {size}\n\
+  検証: インストール前に、ダウンロードの SHA-256 がリリース付属のチェックサム（sha256sum.txt / GitHub API の digest）と一致することを確認します。",
+    ),
+    ("engine.progress", "  ダウンロード済み {done} / {total}"),
+    ("engine.progress.nototal", "  ダウンロード済み {done}"),
+    (
+        "engine.wouldinstall",
+        "[ok] 動作中のローカルエンジンはありません。`pasture engine` は {url} から Ollama {version}（{size}）を取得し、リリース付属のチェックサムで SHA-256 を照合してからインストールします。",
+    ),
+    (
+        "engine.notrunning",
+        "[ok] Ollama {version} は {path} にインストールされていますが、動作していません。`pasture engine` で起動できます。",
+    ),
+    (
+        "engine.started",
+        "[ok] Ollama {version} が {endpoint} で動作しています。Pasture の既定バックエンドなので追加の設定は不要です。次は `pasture up` を実行してください。",
+    ),
+    (
+        "engine.notstarted",
+        "[!!] Ollama {version} を {path} にインストールしましたが、起動しませんでした: {detail}。出力は {log} に記録されています。手動で `ollama serve` を起動してから `pasture up` を実行してください。",
+    ),
+    (
+        "engine.unsupported",
+        "このプラットフォーム（{platform}）ではエンジンの自動インストールを利用できません: Ollama の公式ビルドがありません。https://ollama.com から手動でインストールしてから `pasture up` を実行してください。",
+    ),
+    (
+        "engine.failed",
+        "[!!] エンジンのセットアップに失敗しました: {reason}",
     ),
 ];
 
