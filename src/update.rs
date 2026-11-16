@@ -164,8 +164,14 @@ pub fn parse_sha256sums(text: &str) -> Vec<(String, String)> {
         };
         let hash = &line[..sp];
         // After the hash: whitespace, then the name, optionally preceded
-        // by '*' (sha256sum's binary-mode marker).
-        let name = line[sp..].trim().trim_start_matches('*').trim();
+        // by '*' (sha256sum's binary-mode marker) and/or a './' prefix
+        // (Ollama's published sha256sum.txt lists `./ollama-...`; the
+        // name compared against is the bare asset name).
+        let name = line[sp..]
+            .trim()
+            .trim_start_matches('*')
+            .trim()
+            .trim_start_matches("./");
         if is_sha256_hex(hash) && !name.is_empty() {
             out.push((hash.to_ascii_lowercase(), name.to_string()));
         }
@@ -441,7 +447,7 @@ pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
 /// Resolve a redirect target against the URL that produced it. GitHub's
 /// download redirects are absolute; the relative forms are handled for
 /// completeness (and for local test servers).
-fn resolve_redirect(current: &str, location: &str) -> String {
+pub(crate) fn resolve_redirect(current: &str, location: &str) -> String {
     if location.starts_with("http://") || location.starts_with("https://") {
         return location.to_string();
     }
@@ -532,7 +538,7 @@ fn https_exchange_bytes(
 
 /// Split a URL into (scheme, host, port, path). Deliberately small: the
 /// updater only ever talks to a releases API and its download hosts.
-fn parse_url(url: &str) -> Result<(String, String, u16, String), String> {
+pub(crate) fn parse_url(url: &str) -> Result<(String, String, u16, String), String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("malformed URL: {url}"))?;
@@ -631,8 +637,15 @@ fn dechunk(body: &[u8]) -> Result<Vec<u8>, String> {
 /// on Linux, macOS and Windows 10+; bsdtar auto-detects .tar.gz and
 /// .zip, as does GNU tar for gzip). Failure is loud and leaves the
 /// installed binary untouched.
-fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+pub(crate) fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
     let output = std::process::Command::new("tar")
+        // Never restore archive ownership: extraction targets a fresh
+        // staging directory, and as root (containers, some CI) tar
+        // would otherwise try to chown to the archive's uid/gid and
+        // fail on ids the sandbox cannot grant (hit by IMP-78's smoke
+        // against a fixture with a foreign gid). Permissions — the
+        // executable bit the payload needs — are unaffected.
+        .arg("--no-same-owner")
         .arg("-xf")
         .arg(archive)
         .arg("-C")
@@ -1167,6 +1180,13 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, "a.tar.gz");
         assert!(entries[0].0.starts_with("edb5"));
+        // A './' prefix on the name is stripped (Ollama's published
+        // sha256sum.txt lists `./ollama-linux-amd64.tar.zst`; IMP-78's
+        // engine bootstrap looks the bare asset name up in it).
+        let dotted = "87bfafb2acbc89b2e6a1be0a9043de6aa75fb450696f86bc426e65fc448f788d  ./ollama-linux-amd64.tar.zst\n";
+        let entries = parse_sha256sums(dotted);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "ollama-linux-amd64.tar.zst");
     }
 
     #[test]

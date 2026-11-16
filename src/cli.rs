@@ -17,6 +17,7 @@ USAGE:
 COMMANDS:
     doctor                   Check your setup and show how to fix problems
     discover [--json]        Probe this machine for running local LLM runtimes (Ollama, LM Studio, Jan, ...)
+    engine [--check]         Install the local engine (Ollama) from its official release if none is installed, and start it (--check only reports)
     setup                    Beginner guide + environment check
     up                       One command: ensure model, then start the proxy
     connect [app]            Show how to point your app at pasture (openwebui/continue/cursor/lmstudio/sdk)
@@ -423,6 +424,7 @@ pub fn run(args: &[String]) -> i32 {
             0
         }
         "doctor" => run_doctor(&config),
+        "engine" => run_engine(rest, &config),
         "setup" => {
             print!("{}", crate::i18n::t(crate::i18n::detect(), "welcome"));
             println!("\n--- check ---\n");
@@ -1284,15 +1286,44 @@ fn run_up(config: &Config, addr: &str) -> i32 {
     // Ollama must be reachable to pull or serve through. Try to start it.
     let mut st = crate::doctor::probe_ollama(&config.ollama_host, config.ollama_port);
     if !st.reachable {
-        // A command that is not on PATH can never be spawned, so say so now
-        // instead of spawning nothing, sleeping 3 s and blaming "not running"
-        // (ADR-267).
-        if !crate::doctor::on_path("ollama") {
-            eprintln!("{}", t(lang, ollama_unreachable_key(false)));
-            return 1;
-        }
+        // The binary to spawn: the user's own install on PATH first,
+        // then Pasture's managed tree. With no binary anywhere, the
+        // old behaviour was a dead end (say so and stop, ADR-267);
+        // since IMP-78 the missing step itself is automated — install
+        // the engine, then continue. Only for a local host: installing
+        // here cannot fix an engine that is supposed to run elsewhere.
+        let ollama_bin =
+            match crate::bootstrap::resolve_ollama_binary(&crate::bootstrap::engine_home()) {
+                Some(p) => p,
+                None if !crate::bootstrap::is_loopback_host(&config.ollama_host) => {
+                    eprintln!("{}", t(lang, ollama_unreachable_key(false)));
+                    return 1;
+                }
+                None => {
+                    let plan = crate::bootstrap::BootstrapPlan::from_env(
+                        &config.ollama_host,
+                        config.ollama_port,
+                    );
+                    let mut progress = crate::bootstrap::progress_printer(lang);
+                    match crate::bootstrap::ensure_ollama_binary(
+                        &plan,
+                        &mut |line| println!("{line}"),
+                        &mut progress,
+                    ) {
+                        Ok(b) => b.path,
+                        Err(reason) => {
+                            eprintln!("{}", tf(lang, "engine.failed", &[("reason", &reason)]));
+                            // ADR-267 still applies: name the underlying
+                            // cause and the manual way out, not just the
+                            // failed automation.
+                            eprintln!("{}", t(lang, ollama_unreachable_key(false)));
+                            return 1;
+                        }
+                    }
+                }
+            };
         println!("{}", t(lang, "up.starting_ollama"));
-        if let Err(e) = std::process::Command::new("ollama")
+        if let Err(e) = std::process::Command::new(ollama_bin)
             .arg("serve")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1329,7 +1360,12 @@ fn run_up(config: &Config, addr: &str) -> i32 {
             "{}",
             tf(lang, "up.pulling", &[("model", &config.local_model)])
         );
-        let status = std::process::Command::new("ollama")
+        // Resolve again rather than assuming PATH: a managed install
+        // (IMP-78) is not on PATH, and the server above may well be
+        // running from it. Resolution only — pulling never installs.
+        let bin = crate::bootstrap::resolve_ollama_binary(&crate::bootstrap::engine_home())
+            .unwrap_or_else(|| std::path::PathBuf::from("ollama"));
+        let status = std::process::Command::new(bin)
             .arg("pull")
             .arg(&config.local_model)
             .status();
@@ -1993,6 +2029,16 @@ fn run_calibrate_error(lang: crate::i18n::Lang, rest: &[String]) -> i32 {
         }
     }
     0
+}
+
+/// `engine [--check]`: install the local inference engine (Ollama)
+/// from its official release when none is installed, and start it
+/// (IMP-78, ADR-287). The implementation lives in `bootstrap.rs`;
+/// this wrapper only parses the flag and passes the configured
+/// Ollama endpoint.
+fn run_engine(args: &[String], config: &Config) -> i32 {
+    let check_only = args.iter().any(|a| a == "--check");
+    crate::bootstrap::run_engine(check_only, &config.ollama_host, config.ollama_port)
 }
 
 /// `update [--check]`: self-update for the prebuilt release binaries

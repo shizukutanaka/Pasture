@@ -7,6 +7,21 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ### Added
 
+- **`pasture engine`** (IMP-78, ADR-287): first-run bootstrap for the
+  inference engine itself. When no local runtime is running, it
+  downloads the official Ollama build for this OS/architecture from
+  Ollama's GitHub Releases and installs it under `~/.pasture/engines`
+  — only after the download's SHA-256 matches the checksum published
+  with the release (the `sha256sum.txt` asset, or the digest the
+  GitHub API reports; the two disagreeing, or neither existing,
+  refuses — the same policy as `pasture update`) and the installed
+  binary reports the expected version — then starts it and waits
+  until it answers. Source, size and verification method are shown
+  before any download, and nothing is fetched unless the command is
+  run. `--check` only reports. Any failure leaves no partial state
+  behind and never touches an existing install. `pasture up` now runs
+  the same bootstrap instead of dead-ending when Ollama is missing,
+  and resolves the managed install for `ollama pull` afterwards.
 - **`pasture update`** (IMP-77, ADR-286): self-update for the prebuilt
   release binaries. `pasture update` checks GitHub Releases and installs
   the newest binary; `--check` only reports. The check runs only when
