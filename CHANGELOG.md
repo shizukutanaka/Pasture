@@ -7,6 +7,17 @@ Format follows Keep a Changelog; versioning follows SemVer.
 
 ### Added
 
+- **`pasture update`** (IMP-77, ADR-286): self-update for the prebuilt
+  release binaries. `pasture update` checks GitHub Releases and installs
+  the newest binary; `--check` only reports. The check runs only when
+  invoked (no background phone-home, nothing about the user is sent).
+  The download is installed only after its SHA-256 matches the checksum
+  published with the release (the `SHA256SUMS` asset, which release.yml
+  now attaches to every release, or the digest the GitHub API reports)
+  and the new binary reports the expected version; any failure leaves
+  the installed binary untouched. Source builds are detected via a
+  compile-time marker release.yml sets, and refuse with rebuild
+  instructions instead of replacing themselves.
 - **`pasture discover`** (IMP-75, ADR-284): probes localhost for running
   local LLM runtimes — Ollama, LM Studio, Jan, llama.cpp server, KoboldCPP,
   GPT4All, vLLM, Open WebUI — and prints how each found runtime is used

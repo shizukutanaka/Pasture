@@ -100,8 +100,14 @@ jobs:
           "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Append
           "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # PASTURE_RELEASE_BUILD marks the binary as a release build at
+      # compile time (ADR-286): `pasture update` (self-update) refuses to
+      # run without it, so a source build can never replace itself with a
+      # downloaded binary.
       - name: cargo build --release (cloud feature)
         run: cargo build --release --features cloud
+        env:
+          PASTURE_RELEASE_BUILD: "1"
 
       # The point of building with the feature is that the shipped binary
       # contains the cloud path — assert it, don't assume it. A non-cloud
@@ -118,6 +124,27 @@ jobs:
           echo "$out"
           if echo "$out" | grep -q "local-only build"; then
             echo "::error::release binary was built WITHOUT the cloud feature"
+            exit 1
+          fi
+
+      # Same shape for the self-update marker (ADR-286): point the
+      # updater at a dead local address. A marked binary attempts the
+      # check and fails with a network error; an unmarked one prints the
+      # built-from-source refusal instead. Assert on the output, as with
+      # doctor above.
+      - name: Verify the binary carries the release-build marker
+        shell: bash
+        run: |
+          bin="target/release/pasture"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          out="$(PASTURE_LANG=en PASTURE_UPDATE_API_BASE=http://127.0.0.1:9 "$bin" update --check 2>&1 || true)"
+          echo "$out"
+          if echo "$out" | grep -q "built from source"; then
+            echo "::error::release binary was built WITHOUT the release marker (pasture update is disabled)"
+            exit 1
+          fi
+          if ! echo "$out" | grep -q "Checking"; then
+            echo "::error::pasture update did not attempt a check"
             exit 1
           fi
 
@@ -154,3 +181,32 @@ jobs:
           gh release view "$tag" >/dev/null 2>&1 || \
             gh release create "$tag" --title "$tag" --generate-notes
           gh release upload "$tag" dist/pasture-"$tag"-${{ matrix.asset }}.* --clobber
+
+  # The project's checksum practice, automated: once every platform
+  # binary is uploaded, attach one SHA256SUMS file covering all of them.
+  # `pasture update` verifies downloads against this file when present
+  # (ADR-286). A separate job because the three binary jobs run in
+  # parallel on different runners — each could only hash its own asset.
+  checksums:
+    name: checksums (SHA256SUMS)
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and upload SHA256SUMS
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          mkdir -p dl
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --dir dl --pattern "pasture-*"
+          (cd dl && sha256sum pasture-* > SHA256SUMS)
+          cat dl/SHA256SUMS
+          gh release upload "$tag" dl/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber

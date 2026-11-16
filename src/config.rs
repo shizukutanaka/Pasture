@@ -275,6 +275,7 @@ pub const KNOWN_ENV: &[&str] = &[
     "PASTURE_STRUCTURED_LOCAL",
     "PASTURE_SYSTEM_PROMPT",
     "PASTURE_THRESHOLD",
+    "PASTURE_UPDATE_API_BASE",
 ];
 
 /// Variables whose value must parse as a number. A non-numeric value is silently

@@ -64,6 +64,24 @@ tar -xzf pasture-v0.28.0-linux-x86_64.tar.gz
 > Cloud stays inactive until a key is set. Building from source without
 > `--features cloud` produces the zero-dependency, local-only build.
 
+### Updating
+
+Prebuilt binaries update themselves:
+
+```sh
+pasture update          # check GitHub Releases and install the newest version
+pasture update --check  # only report whether a newer version exists
+```
+
+The check runs only when you run the command — there is no background
+check, and the request carries no usage data. The downloaded archive is
+installed only after its SHA-256 matches the checksum published with the
+release (the `SHA256SUMS` asset, or the digest the GitHub API reports),
+and the new binary must report the expected version before it replaces
+the old one; on any failure the installed binary is left untouched.
+Source builds are never self-updated: `pasture update` detects them and
+explains how to update from source instead.
+
 ### Build from source
 
 Requires Rust 1.75+ (1.80+ for the `cloud` build — its pinned TLS stack declares that floor).
@@ -98,6 +116,7 @@ pasture discover           # probe this machine for running local LLM runtimes
 pasture eval               # routing accuracy: regression set + held-out set (exits 1 on regression)
 pasture stats              # summarize the cost log (routes, tokens, spend)
 pasture improvements       # show the self-improvement ledger (verified change history)
+pasture update             # update the prebuilt binary to the latest release (--check only reports)
 ```
 
 Force a route on the CLI with `--local` or `--cloud`; set the proxy's listen
@@ -161,6 +180,7 @@ config file as `key = value`, using the lower-case name with the prefix dropped
 | `PASTURE_LOCAL_FAST_MODEL` | _(off)_ | second local model for simple short queries; e.g. `phi3:mini` for greetings, `llama3.2` for harder |
 | `PASTURE_LOCAL_TIMEOUT` | `120` | per-request local-backend read timeout in seconds |
 | `PASTURE_LANG` | auto | force CLI language: `ja` or `en` |
+| `PASTURE_UPDATE_API_BASE` | `https://api.github.com/repos/shizukutanaka/Pasture` | base URL `pasture update` reads release metadata from; override only for a mirror or for testing |
 
 **Routing — which way a request goes**
 

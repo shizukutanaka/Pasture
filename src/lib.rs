@@ -34,6 +34,7 @@ pub mod ratelimit;
 pub mod response;
 pub mod routing;
 pub mod telemetry;
+pub mod update;
 
 pub use backend::{Backend, BackendError, CompletionRequest, CompletionResponse, Message};
 pub use config::Config;

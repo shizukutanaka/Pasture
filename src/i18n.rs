@@ -280,6 +280,37 @@ All commands:               pasture help\n",
     ("config.title", "pasture configuration (effective):"),
     ("config.set", "set"),
     ("config.unset", "not set"),
+    // IMP-77: self-update (release builds only). The check runs only when
+    // the user invokes it; there is no background equivalent.
+    ("update.checking", "Checking GitHub Releases for the latest version..."),
+    (
+        "update.devbuild",
+        "This binary was built from source, so `pasture update` does not apply. \
+To update a source build, pull the latest code and rebuild (or re-run install.sh / install.ps1).",
+    ),
+    (
+        "update.unsupported",
+        "Self-update is not available for this platform ({platform}). \
+Download the latest release manually: https://github.com/shizukutanaka/Pasture/releases",
+    ),
+    ("update.uptodate", "[ok] pasture {version} is already the latest release."),
+    (
+        "update.available",
+        "Update available: pasture {current} -> {latest}. Run `pasture update` to install it.",
+    ),
+    (
+        "update.done",
+        "[ok] Updated pasture {current} -> {latest}. Run `pasture version` to confirm.",
+    ),
+    (
+        "update.oldfile",
+        "The previous binary was kept as {path} (it could not be removed while running); \
+it is deleted automatically on the next run.",
+    ),
+    (
+        "update.failed",
+        "[!!] Update failed: {reason} Your current binary was not changed.",
+    ),
 ];
 
 const JA: &[(&str, &str)] = &[
@@ -501,6 +532,35 @@ const JA: &[(&str, &str)] = &[
     ("config.title", "pasture 設定（実効値）:"),
     ("config.set", "設定済み"),
     ("config.unset", "未設定"),
+    // IMP-77: 自動更新（配布バイナリのみ）。確認は利用者が実行したときだけ行われる。
+    ("update.checking", "GitHub Releases で最新版を確認しています..."),
+    (
+        "update.devbuild",
+        "このバイナリはソースからビルドされたため、`pasture update` は使えません。\
+ソースビルドを更新するには、最新のコードを取得して再ビルドしてください（install.sh / install.ps1 の再実行でも可）。",
+    ),
+    (
+        "update.unsupported",
+        "このプラットフォーム（{platform}）では自動更新を利用できません。\
+最新版は https://github.com/shizukutanaka/Pasture/releases から手動でダウンロードしてください",
+    ),
+    ("update.uptodate", "[ok] pasture {version} は既に最新版です。"),
+    (
+        "update.available",
+        "新しい版があります: pasture {current} -> {latest}。`pasture update` でインストールできます。",
+    ),
+    (
+        "update.done",
+        "[ok] pasture を {current} -> {latest} に更新しました。`pasture version` で確認できます。",
+    ),
+    (
+        "update.oldfile",
+        "前のバイナリは {path} として残っています（実行中のため削除できませんでした）。次回起動時に自動で削除されます。",
+    ),
+    (
+        "update.failed",
+        "[!!] 更新に失敗しました: {reason} 現在のバイナリは変更されていません。",
+    ),
 ];
 
 #[cfg(test)]
