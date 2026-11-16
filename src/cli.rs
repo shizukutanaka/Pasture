@@ -1323,7 +1323,7 @@ fn run_up(config: &Config, addr: &str) -> i32 {
                 }
             };
         println!("{}", t(lang, "up.starting_ollama"));
-        if let Err(e) = std::process::Command::new(&ollama_bin)
+        if let Err(e) = std::process::Command::new(ollama_bin)
             .arg("serve")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1365,7 +1365,7 @@ fn run_up(config: &Config, addr: &str) -> i32 {
         // running from it. Resolution only — pulling never installs.
         let bin = crate::bootstrap::resolve_ollama_binary(&crate::bootstrap::engine_home())
             .unwrap_or_else(|| std::path::PathBuf::from("ollama"));
-        let status = std::process::Command::new(&bin)
+        let status = std::process::Command::new(bin)
             .arg("pull")
             .arg(&config.local_model)
             .status();
