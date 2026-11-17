@@ -701,7 +701,14 @@ pub fn ollama_binary_version(path: &Path) -> Option<(u64, u64, u64)> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    parse_ollama_version_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The parsing half of [`ollama_binary_version`]: scan the `--version`
+/// output text token by token and return the first token that parses
+/// as a version. Pure, so the parsing rules are unit-testable without
+/// spawning a process.
+fn parse_ollama_version_output(text: &str) -> Option<(u64, u64, u64)> {
     text.split_whitespace().find_map(|tok| {
         crate::update::parse_version(
             tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.'),
@@ -1580,22 +1587,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_ollama_binary_version_parsing() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = unique_temp_dir("ver");
-        let script = dir.join("ollama");
-        std::fs::write(&script, "#!/bin/sh\necho \"ollama version is 9.9.9\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(ollama_binary_version(&script), Some((9, 9, 9)));
+        // Feed the parser the exact text the fixture scripts used to
+        // print. This test used to write a shell script and execute it
+        // through ollama_binary_version, which flaked in CI: executing
+        // a just-written file intermittently fails with ETXTBSY under
+        // parallel test load, the spawn error became None, and the
+        // assertion failed on output that parses deterministically.
+        // The spawn half stays covered end to end by mod e2e_tests,
+        // whose fixture runs a script binary through the whole flow.
+        assert_eq!(
+            parse_ollama_version_output("ollama version is 9.9.9\n"),
+            Some((9, 9, 9))
+        );
         // A warning line before the version is tolerated.
-        std::fs::write(
-            &script,
-            "#!/bin/sh\necho \"Warning: something old\"\necho \"ollama version is 1.2.3\"\n",
-        )
-        .unwrap();
-        assert_eq!(ollama_binary_version(&script), Some((1, 2, 3)));
+        assert_eq!(
+            parse_ollama_version_output("Warning: something old\nollama version is 1.2.3\n"),
+            Some((1, 2, 3))
+        );
+        // A binary that does not exist reports no version. (Spawn of a
+        // missing path errors deterministically, unlike the ETXTBSY
+        // window above.)
+        let dir = unique_temp_dir("ver");
         assert_eq!(ollama_binary_version(&dir.join("missing")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
