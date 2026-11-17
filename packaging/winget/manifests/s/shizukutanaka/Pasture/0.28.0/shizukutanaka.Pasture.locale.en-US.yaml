@@ -1,0 +1,25 @@
+PackageIdentifier: shizukutanaka.Pasture
+PackageVersion: 0.28.0
+PackageLocale: en-US
+Publisher: shizukutanaka
+PublisherUrl: https://github.com/shizukutanaka
+PackageName: Pasture
+PackageUrl: https://github.com/shizukutanaka/Pasture
+License: MIT
+LicenseUrl: https://github.com/shizukutanaka/Pasture/blob/main/LICENSE
+ShortDescription: OpenAI-compatible local/cloud LLM routing proxy with hardware-adaptive thresholds
+Description: >-
+  Pasture is a zero-config, single-binary routing layer for individuals.
+  It sends each request to a local model or escalates it to a cloud model
+  depending on your hardware and the request, through OpenAI-compatible
+  APIs. When no local inference engine is running, `pasture engine`
+  downloads and starts the official Ollama build for your machine after
+  verifying its checksum.
+Tags:
+  - llm
+  - proxy
+  - router
+  - openai-compatible
+  - ollama
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
