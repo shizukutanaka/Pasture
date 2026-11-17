@@ -1,0 +1,24 @@
+# Installer manifest for Pasture 0.28.0 (winget-pkgs schema 1.6.0).
+# The InstallerUrl points at the real asset attached to the GitHub
+# Release v0.28.0, and InstallerSha256 is the SHA-256 measured from the
+# actually downloaded asset (verified 2026-11-15; see packaging/README.md).
+# Before submitting, re-download the asset and re-check the hash.
+PackageIdentifier: shizukutanaka.Pasture
+PackageVersion: 0.28.0
+Platform:
+  - Windows.Desktop
+# The release asset is a zip holding one folder with pasture.exe inside;
+# winget extracts it and puts the exe on PATH as a portable install.
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: pasture-v0.28.0-windows-x86_64\pasture.exe
+    PortableCommandAlias: pasture
+Scope: user
+UpgradeBehavior: install
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/shizukutanaka/Pasture/releases/download/v0.28.0/pasture-v0.28.0-windows-x86_64.zip
+    InstallerSha256: 89D38B2F78427F82C0FF5028B8BCBB8801686984037A0395BE452D5B8ED11FC9
+ManifestType: installer
+ManifestVersion: 1.6.0
