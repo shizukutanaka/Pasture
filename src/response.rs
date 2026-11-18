@@ -126,6 +126,11 @@ pub fn build_stats_response(
         Some(e) => format!("\"{}\"", escape_string(e)),
         None => "null".to_string(),
     };
+    // Counterfactual hosted-gateway fees on the recorded cloud spend
+    // (cost::gateway_fee_estimate): what credit-purchase fees the same spend
+    // would have incurred via OpenRouter / Cloudflare Unified Billing.
+    // Pasture pays providers directly (BYOK), so the actual fee is $0.
+    let fees = s.gateway_fees();
     format!(
         "{{\"object\":\"pasture.stats\",\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\
 \"cloud_rate\":{},\"cache_rate\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\
@@ -138,7 +143,8 @@ pub fn build_stats_response(
 \"local_health_last_error\":{last_error_json},\
 \"cloud_health\":\"{cloud_health}\",\"cloud_health_last_error\":{cloud_last_error_json},\
 \"input_pii_categories\":{{{}}},\"injection_guard_stats\":{{{}}},\
-\"estimated_savings_usd\":{}}}",
+\"estimated_savings_usd\":{},\"gateway_fee_avoided_openrouter_usd\":{},\
+\"gateway_fee_avoided_cloudflare_usd\":{}}}",
         s.total,
         s.local,
         s.cloud,
@@ -156,6 +162,8 @@ pub fn build_stats_response(
         } else {
             0.0
         }),
+        round4(fees.openrouter_usd),
+        round4(fees.cloudflare_usd),
     )
 }
 

@@ -253,6 +253,12 @@ impl CostSummary {
         }
     }
 
+    /// Counterfactual hosted-gateway fees on this summary's cloud spend
+    /// (see `gateway_fee_estimate`). Zero when nothing was spent on cloud.
+    pub fn gateway_fees(&self) -> GatewayFeeEstimate {
+        gateway_fee_estimate(self.cloud_cost_usd)
+    }
+
     /// Machine-readable summary for `pasture stats --json` (CI / dashboards).
     /// `cloud_cost_usd` is guaranteed finite by `summarize`.
     pub fn to_json(&self) -> String {
@@ -261,8 +267,9 @@ impl CostSummary {
         } else {
             0.0
         };
+        let fees = self.gateway_fees();
         format!(
-            "{{\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\"cloud_rate\":{:.6},\"cache_rate\":{:.6},\"prompt_tokens\":{},\"completion_tokens\":{},\"cloud_cost_usd\":{:.6}}}",
+            "{{\"total\":{},\"local\":{},\"cloud\":{},\"cache\":{},\"cloud_rate\":{:.6},\"cache_rate\":{:.6},\"prompt_tokens\":{},\"completion_tokens\":{},\"cloud_cost_usd\":{:.6},\"gateway_fee_avoided_openrouter_usd\":{:.6},\"gateway_fee_avoided_cloudflare_usd\":{:.6}}}",
             self.total,
             self.local,
             self.cloud,
@@ -271,8 +278,57 @@ impl CostSummary {
             self.cache_rate(),
             self.prompt_tokens,
             self.completion_tokens,
-            cost
+            cost,
+            fees.openrouter_usd,
+            fees.cloudflare_usd
         )
+    }
+}
+
+/// Published credit-purchase fee for OpenRouter (card payments): 5.5% of the
+/// purchase amount, with a minimum fee of $0.80 per purchase. Inference itself
+/// is passed through at provider list price — the fee is charged on buying
+/// credit. Source: OpenRouter pricing page (FAQ), measured 2026-11-18. If the
+/// published rate changes, update these constants (and the as-of note in the
+/// display strings) — nothing else derives from them.
+pub const OPENROUTER_CREDIT_FEE_RATE: f64 = 0.055;
+pub const OPENROUTER_CREDIT_FEE_MIN_USD: f64 = 0.80;
+
+/// Published credit-purchase fee for Cloudflare AI Gateway Unified Billing:
+/// 5% of the credit purchase; inference passes through at list price.
+/// Source: Cloudflare AI Gateway pricing documentation, measured 2026-11-18.
+pub const CLOUDFLARE_UNIFIED_BILLING_FEE_RATE: f64 = 0.05;
+
+/// Counterfactual estimate of the intermediation fees a hosted gateway would
+/// have charged on a given amount of cloud spend. Pasture pays providers
+/// directly with the user's own key (BYOK), so this fee is structurally $0 —
+/// the estimate exists to put a number on that difference. It is a projection
+/// from published rates, not a measurement of any actual gateway bill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayFeeEstimate {
+    pub openrouter_usd: f64,
+    pub cloudflare_usd: f64,
+}
+
+/// Estimate the hosted-gateway fees on `cloud_cost_usd` of provider spend.
+///
+/// Model: routing the same spend through a hosted gateway means buying that
+/// much credit there first, so the fee applies to the spend amount.
+/// OpenRouter's per-purchase minimum is applied once to the aggregate, so
+/// spend split into many small purchases would really incur more — this is a
+/// lower bound. Zero or non-finite spend estimates as zero fees (a corrupt
+/// log line must not poison the display).
+pub fn gateway_fee_estimate(cloud_cost_usd: f64) -> GatewayFeeEstimate {
+    if !cloud_cost_usd.is_finite() || cloud_cost_usd <= 0.0 {
+        return GatewayFeeEstimate {
+            openrouter_usd: 0.0,
+            cloudflare_usd: 0.0,
+        };
+    }
+    GatewayFeeEstimate {
+        openrouter_usd: (cloud_cost_usd * OPENROUTER_CREDIT_FEE_RATE)
+            .max(OPENROUTER_CREDIT_FEE_MIN_USD),
+        cloudflare_usd: cloud_cost_usd * CLOUDFLARE_UNIFIED_BILLING_FEE_RATE,
     }
 }
 
@@ -638,6 +694,84 @@ mod tests {
         assert_eq!(v.get("prompt_tokens").and_then(|x| x.as_f64()), Some(110.0));
         assert!((v.get("cloud_rate").and_then(|x| x.as_f64()).unwrap() - 0.5).abs() < 1e-9);
         assert!((v.get("cloud_cost_usd").and_then(|x| x.as_f64()).unwrap() - 0.0125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_gateway_fee_estimate_zero_and_non_finite() {
+        // No cloud spend -> no purchase -> no fee. Non-finite spend (corrupt
+        // log) must estimate as zero, never NaN/inf.
+        for spend in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            let f = gateway_fee_estimate(spend);
+            assert_eq!(f.openrouter_usd, 0.0, "spend {spend}");
+            assert_eq!(f.cloudflare_usd, 0.0, "spend {spend}");
+        }
+    }
+
+    #[test]
+    fn test_gateway_fee_estimate_minimum_applies_to_small_spend() {
+        // $5 of spend: 5.5% is $0.275, below OpenRouter's $0.80 per-purchase
+        // minimum, so the minimum is the fee (the report's "effective 16%"
+        // case). Cloudflare has no published minimum: a flat 5%.
+        let f = gateway_fee_estimate(5.0);
+        assert!(
+            (f.openrouter_usd - 0.80).abs() < 1e-9,
+            "{}",
+            f.openrouter_usd
+        );
+        assert!(
+            (f.cloudflare_usd - 0.25).abs() < 1e-9,
+            "{}",
+            f.cloudflare_usd
+        );
+    }
+
+    #[test]
+    fn test_gateway_fee_estimate_percentage_above_minimum() {
+        // $100 of spend: the percentage exceeds the minimum for both.
+        let f = gateway_fee_estimate(100.0);
+        assert!(
+            (f.openrouter_usd - 5.50).abs() < 1e-9,
+            "{}",
+            f.openrouter_usd
+        );
+        assert!(
+            (f.cloudflare_usd - 5.00).abs() < 1e-9,
+            "{}",
+            f.cloudflare_usd
+        );
+    }
+
+    #[test]
+    fn test_summary_to_json_includes_gateway_fee_estimates() {
+        // The comparison values ride along in `stats --json`, computed from
+        // the same cloud_cost_usd the summary already reports (additive
+        // fields; the pre-existing fields are unchanged).
+        let recs = vec![LoggedRecord {
+            ts_secs: 0,
+            route: "cloud".into(),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cost_usd: 100.0,
+            logprob: None,
+        }];
+        let v = crate::json::parse(&summarize(&recs).to_json()).unwrap();
+        assert_eq!(
+            v.get("gateway_fee_avoided_openrouter_usd")
+                .and_then(|x| x.as_f64()),
+            Some(5.5)
+        );
+        assert_eq!(
+            v.get("gateway_fee_avoided_cloudflare_usd")
+                .and_then(|x| x.as_f64()),
+            Some(5.0)
+        );
+        // Empty log: both estimates are present and zero.
+        let v0 = crate::json::parse(&summarize(&[]).to_json()).unwrap();
+        assert_eq!(
+            v0.get("gateway_fee_avoided_openrouter_usd")
+                .and_then(|x| x.as_f64()),
+            Some(0.0)
+        );
     }
 
     #[test]
