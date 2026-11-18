@@ -2629,6 +2629,13 @@ fn test_head_mirrors_get_without_body_on_every_get_route() {
     // wherever it supports GET, and §9.3.2: HEAD returns GET's header fields
     // (Content-Length included) with no content. Only /health did this; the
     // other GET routes answered 405 with a body.
+    //
+    // The cost log must be a private tmp path, not the shared "unused":
+    // /v1/stats and /v1/history derive their bodies from the log file, and
+    // parallel tests appending chat records to ./unused between this test's
+    // GET and HEAD reads change a counter's digit count, shifting the body
+    // by a byte and making the HEAD/GET comparison flaky.
+    let log = tmp_log();
     for path in [
         "/v1/models",
         "/v1/stats",
@@ -2638,11 +2645,11 @@ fn test_head_mirrors_get_without_body_on_every_get_route() {
         "/health",
     ] {
         let get = roundtrip_raw(
-            proxy_with(true, false, 100, "unused"),
+            proxy_with(true, false, 100, &log),
             format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
         );
         let head = roundtrip_raw(
-            proxy_with(true, false, 100, "unused"),
+            proxy_with(true, false, 100, &log),
             format!("HEAD {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
         );
         let (gs, gh, gb) = split_response(&get);
