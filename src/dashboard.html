@@ -158,6 +158,7 @@
       <h2>Cloud spend &amp; budget</h2>
       <div class="big">$<span id="cost">0.00</span></div>
       <div class="sub">estimated cloud cost so far · <span class="saved">saved $<span id="savings">0.00</span> local</span></div>
+      <div class="sub">gateway fees avoided (est.): OpenRouter $<span id="fee-openrouter">0.00</span> · Cloudflare $<span id="fee-cloudflare">0.00</span></div>
       <div class="bar" title="daily token budget used"><span class="fill" id="bar-budget" style="width:0%"></span></div>
       <div class="sub" id="budget-text">budget: unlimited</div>
     </div>
@@ -308,6 +309,8 @@
 
     txt("cost", (d.cloud_cost_usd || 0).toFixed(4));
     txt("savings", (d.estimated_savings_usd || 0).toFixed(4));
+    txt("fee-openrouter", (d.gateway_fee_avoided_openrouter_usd || 0).toFixed(2));
+    txt("fee-cloudflare", (d.gateway_fee_avoided_cloudflare_usd || 0).toFixed(2));
     var used = d.budget_daily_tokens_used || 0, limit = d.budget_daily_tokens_limit || 0;
     if (limit > 0) {
       $("bar-budget").style.width = Math.min(100, pct(used, limit)) + "%";

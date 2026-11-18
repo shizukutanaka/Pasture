@@ -782,6 +782,20 @@ fn run_stats(config: &Config, rest: &[String]) -> i32 {
                 s.prompt_tokens, s.completion_tokens
             );
             println!("  cloud spend: ${:.4}", s.cloud_cost_usd);
+            if s.cloud_cost_usd > 0.0 {
+                // Counterfactual: the same spend routed through a hosted
+                // gateway would first have paid that gateway's credit-
+                // purchase fee. Pasture pays providers directly (BYOK), so
+                // the fee actually paid is $0 — this prices the difference.
+                let fees = s.gateway_fees();
+                println!(
+                    "  gateway fees avoided (est.): OpenRouter ${:.2} · Cloudflare ${:.2}",
+                    fees.openrouter_usd, fees.cloudflare_usd
+                );
+                println!(
+                    "    estimate from published credit-purchase fees (OpenRouter 5.5%, min $0.80; Cloudflare Unified Billing 5%; measured 2026-11)"
+                );
+            }
             if s.cache > 0 {
                 println!("  cache saved {} backend call(s)", s.cache);
             }

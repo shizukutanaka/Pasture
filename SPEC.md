@@ -229,6 +229,8 @@ Full field list, in response order:
 | `cloud_health_last_error` | string \| null | last primary-cloud failure message; never set by the secondary/fallback provider |
 | `injection_guard_stats` | object | `"label:action"` → count tally, e.g. `"role_switch:blocked"` (IMP-20, ADR-225) |
 | `estimated_savings_usd` | float | cumulative estimated savings from local routing, 4dp (IMP-37): the local-route prompt+completion tokens priced at `PASTURE_CLOUD_PRICE_PER_1M`, i.e. what those requests would have cost on the configured cloud backend. `0` when no cloud price is set. Cache hits are excluded (ambiguous counterfactual) |
+| `gateway_fee_avoided_openrouter_usd` | float | counterfactual estimate, 4dp: the credit-purchase fee OpenRouter would have charged on `cloud_cost_usd` — 5.5% of the purchase, with the $0.80 per-purchase minimum applied once to the aggregate (a lower bound if purchases were split). Rates measured 2026-11-18 from OpenRouter's published pricing. Pasture pays providers directly (BYOK), so the fee actually paid is $0; this prices the difference |
+| `gateway_fee_avoided_cloudflare_usd` | float | same counterfactual for Cloudflare AI Gateway Unified Billing: 5% of credit purchases, measured 2026-11-18 from Cloudflare's published pricing |
 
 ### 3.2c-2 `GET /v1/history`
 `200`, per-UTC-day rollups of the cost log (IMP-48). Where §3.2c answers "what is
